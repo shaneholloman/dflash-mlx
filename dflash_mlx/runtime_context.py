@@ -126,6 +126,7 @@ def build_runtime_context(
 def build_offline_runtime_context(
     *,
     target_fa_window: int,
+    prefill_step_size: int | None = None,
     draft_sink_size: int = 64,
     draft_window_size: int = 1024,
     verify_len_cap: int = 0,
@@ -136,6 +137,7 @@ def build_offline_runtime_context(
         prefix_cache=False,
         prefix_cache_l2=False,
         target_fa_window=int(target_fa_window),
+        prefill_step_size=prefill_step_size,
         draft_sink_size=int(draft_sink_size),
         draft_window_size=int(draft_window_size),
         verify_len_cap=int(verify_len_cap),

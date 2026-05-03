@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 
 import mlx.core as mx
 import pytest
@@ -18,7 +19,10 @@ pytestmark = pytest.mark.skipif(
 )
 
 def _local_model_path() -> str:
-    repo_id = os.environ.get("DFLASH_REAL_QWEN_GDN_MODEL", "mlx-community/Qwen3.5-4B-4bit")
+    repo_id = os.environ.get(
+        "DFLASH_REAL_QWEN_GDN_MODEL",
+        "mlx-community/Qwen3.6-27B-4bit",
+    )
     try:
         from huggingface_hub import snapshot_download
     except Exception as exc:
@@ -28,6 +32,7 @@ def _local_model_path() -> str:
     except Exception as exc:
         pytest.skip(f"local Qwen hybrid model not present for {repo_id}: {exc}")
 
+@lru_cache(maxsize=1)
 def _load_model():
     from mlx_lm.utils import load
 
@@ -44,6 +49,11 @@ def _assert_close(lhs: mx.array, rhs: mx.array, *, atol: float = 1e-3) -> None:
     mx.eval(lhs, rhs)
     max_abs = float(mx.abs(lhs - rhs).max())
     assert max_abs <= atol
+
+def _argmax_token(logits: mx.array) -> int:
+    token = mx.argmax(logits[:, -1, :], axis=-1)
+    mx.eval(token)
+    return int(token.item())
 
 def test_real_qwen_gdn_target_ops_forward_cache_and_rollback_parity():
     model, tokenizer = _load_model()
@@ -106,3 +116,35 @@ def test_real_qwen_gdn_target_ops_forward_cache_and_rollback_parity():
     tx_after, _ = ops.forward_with_hidden_capture(model, input_ids=next_token, cache=tx_cache)
     clean_after, _ = ops.forward_with_hidden_capture(model, input_ids=next_token, cache=clean_cache)
     _assert_close(tx_after, clean_after, atol=2e-3)
+
+def test_real_qwen36_27b_quantized_target_kv_one_token_decode_smoke():
+    model, tokenizer = _load_model()
+    ops = resolve_target_ops(model)
+    assert isinstance(ops, QwenGdnTargetOps)
+
+    tokens = _token_ids(tokenizer)
+    prompt = tokens[:, :5]
+    next_token = tokens[:, 5:6]
+
+    fp_cache = ops.make_cache(
+        model,
+        enable_speculative_linear_cache=True,
+        quantize_kv_cache=False,
+        target_fa_window=0,
+    )
+    quant_cache = ops.make_cache(
+        model,
+        enable_speculative_linear_cache=True,
+        quantize_kv_cache=True,
+        target_fa_window=0,
+    )
+
+    ops.forward_with_hidden_capture(model, input_ids=prompt, cache=fp_cache)
+    ops.forward_with_hidden_capture(model, input_ids=prompt, cache=quant_cache)
+    fp_next, _ = ops.forward_with_hidden_capture(model, input_ids=next_token, cache=fp_cache)
+    quant_next, _ = ops.forward_with_hidden_capture(model, input_ids=next_token, cache=quant_cache)
+    mx.eval(fp_next, quant_next)
+
+    assert _argmax_token(quant_next) == _argmax_token(fp_next)
+    max_abs = float(mx.abs(quant_next[:, -1, :] - fp_next[:, -1, :]).max())
+    assert max_abs <= 2.0

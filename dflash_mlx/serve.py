@@ -82,20 +82,23 @@ def _format_metal_limit(label: str, request, bytes_value: int | None, applied: b
 
 _DFLASH_REQUEST_COUNTER = itertools.count(1)
 
-def _build_prompt_regime(args, tokenizer) -> dict[str, object]:
+def _build_prompt_regime(args, tokenizer, request=None) -> dict[str, object]:
     chat_template_args = getattr(args, "chat_template_args", None)
     if not isinstance(chat_template_args, dict):
         chat_template_args = {}
+    request_type = getattr(request, "request_type", None)
+    is_chat = request_type == "chat"
     return {
+        "request_type": request_type or "unknown",
         "request_tokenization": "mlx_lm.server",
         "runtime_prompt_input": "prompt_tokens_override",
-        "chat_template": True,
-        "chat_template_args": dict(chat_template_args),
-        "enable_thinking": bool(chat_template_args.get("enable_thinking", False)),
+        "chat_template": bool(is_chat and getattr(tokenizer, "has_chat_template", False)),
+        "chat_template_args": dict(chat_template_args) if is_chat else {},
+        "enable_thinking": bool(is_chat and chat_template_args.get("enable_thinking", False)),
         "use_default_chat_template": bool(
-            getattr(args, "use_default_chat_template", False)
+            is_chat and getattr(args, "use_default_chat_template", False)
         ),
-        "custom_chat_template": bool(getattr(args, "chat_template", None)),
+        "custom_chat_template": bool(is_chat and getattr(args, "chat_template", None)),
         "tokenizer_class": type(tokenizer).__name__,
     }
 
@@ -234,9 +237,11 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
                     cache_insert_ms=loop_result.cache_insert_ms,
                     finish_reason=loop_result.finish_reason,
                     max_tokens=args.max_tokens,
-                    prompt_regime=_build_prompt_regime(args, tokenizer),
+                    prompt_regime=_build_prompt_regime(args, tokenizer, request),
                     memory_waterfall_peak=loop_result.memory_waterfall_peak,
                     diagnostics=runtime_context.diagnostics,
+                    prefill_event=loop_result.prefill_event,
+                    runtime_config=runtime_context.runtime,
                 )
             try:
                 mlx_active_gb = float(mx.get_active_memory()) / 1e9 if hasattr(mx, "get_active_memory") else 0.0

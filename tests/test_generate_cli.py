@@ -25,6 +25,8 @@ def test_generate_cli_passes_verify_mode(monkeypatch):
                 "p",
                 "--verify-mode",
                 "off",
+                "--prefill-step-size",
+                "8192",
                 "--draft-sink-size",
                 "32",
                 "--draft-window-size",
@@ -46,6 +48,7 @@ def test_generate_cli_passes_verify_mode(monkeypatch):
             "use_chat_template": True,
             "draft_ref": None,
             "target_fa_window": 0,
+            "prefill_step_size": 8192,
             "draft_sink_size": 32,
             "draft_window_size": 512,
             "verify_len_cap": 8,
@@ -53,6 +56,23 @@ def test_generate_cli_passes_verify_mode(monkeypatch):
             "draft_quant": "w4",
         }
     ]
+
+def test_generate_cli_rejects_invalid_prefill_step_size(monkeypatch):
+    monkeypatch.setattr(generate, "apply_metal_limits", lambda: None)
+
+    with pytest.raises(SystemExit) as exc:
+        generate.main(
+            [
+                "--model",
+                "m",
+                "--prompt",
+                "p",
+                "--prefill-step-size",
+                "0",
+            ]
+        )
+
+    assert exc.value.code == "--prefill-step-size must be > 0"
 
 def test_draft_quant_parser_no_env_fallback(monkeypatch):
     monkeypatch.setenv("DFLASH_DRAFT_QUANT", "w4")

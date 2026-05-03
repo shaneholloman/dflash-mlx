@@ -7,7 +7,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-from mlx_lm.models.cache import KVCache, RotatingKVCache
+from mlx_lm.models.cache import KVCache, QuantizedKVCache, RotatingKVCache
 
 from dflash_mlx.engine.target_ops import resolve_target_ops
 from dflash_mlx.engine.target_qwen_gdn import QwenGdnTargetOps
@@ -106,6 +106,33 @@ def test_qwen_make_cache_matches_current_hybrid_cache_types(monkeypatch):
     assert isinstance(caches[0], KVCache)
     assert isinstance(caches[1], RecurrentRollbackCache)
     assert isinstance(caches[2], KVCache)
+
+def test_qwen_make_cache_quantizes_fa_only(monkeypatch):
+    monkeypatch.setattr(
+        QwenGdnTargetOps,
+        "install_speculative_hooks",
+        lambda self, _model: None,
+    )
+    caches = QwenGdnTargetOps().make_cache(
+        _FakeTarget(),
+        enable_speculative_linear_cache=True,
+        quantize_kv_cache=True,
+        target_fa_window=0,
+    )
+
+    assert isinstance(caches[0], QuantizedKVCache)
+    assert isinstance(caches[1], RecurrentRollbackCache)
+    assert isinstance(caches[2], QuantizedKVCache)
+
+def test_speculative_gdn_hook_materializes_cached_state():
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "dflash_mlx/engine/target_qwen_gdn.py").read_text()
+
+    assert (
+        "cache[0] = mx.contiguous(conv_input[:, -(self.conv_kernel_size - 1) :])"
+        in text
+    )
+    assert "cache[1] = mx.contiguous(state)" in text
 
 def test_qwen_make_cache_windows_fa_only(monkeypatch):
     monkeypatch.setattr(QwenGdnTargetOps, "install_speculative_hooks", lambda self, _model: None)

@@ -179,7 +179,7 @@ def _install_speculative_linear_cache_hook(linear_attn: Any) -> None:
         if mask is not None:
             qkv = mx.where(mask[..., None], qkv, 0)
         conv_input = mx.concatenate([conv_state, qkv], axis=1)
-        cache[0] = conv_input[:, -(self.conv_kernel_size - 1) :]
+        cache[0] = mx.contiguous(conv_input[:, -(self.conv_kernel_size - 1) :])
         conv_out = nn.silu(self.conv1d(conv_input))
 
         q, k, v = [
@@ -238,7 +238,7 @@ def _install_speculative_linear_cache_hook(linear_attn: Any) -> None:
                     qkv=qkv,
                 )
 
-        cache[1] = state
+        cache[1] = mx.contiguous(state)
         cache.advance(S)
         out = self.norm(out, z)
         out_flat = out.reshape(B, S, -1)

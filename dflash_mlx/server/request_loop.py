@@ -21,6 +21,7 @@ from dflash_mlx.server.protocol import make_response, match_stream_token
 @dataclass
 class RequestLoopResult:
     summary_event: Optional[dict[str, Any]]
+    prefill_event: Optional[dict[str, Any]]
     request_start_ns: int
     first_token_ns: Optional[int]
     prefill_done_ns: Optional[int]
@@ -60,6 +61,7 @@ def consume_dflash_events(
     first_token_flushed = False
     finish_reason: Optional[str] = None
     summary_event: Optional[dict[str, Any]] = None
+    prefill_event: Optional[dict[str, Any]] = None
     prefill_done_ns: Optional[int] = None
     first_token_ns: Optional[int] = None
     prefill_elapsed_s = 0.0
@@ -90,6 +92,8 @@ def consume_dflash_events(
                     _bench_log_cycle(trace, request_id=request_id, **memory_event)
                 continue
             if event_name in ("prefill", "prefill_progress"):
+                if event_name == "prefill":
+                    prefill_event = dict(event)
                 processed = int(
                     event.get(
                         "tokens_processed",
@@ -252,6 +256,7 @@ def consume_dflash_events(
 
     return RequestLoopResult(
         summary_event=summary_event,
+        prefill_event=prefill_event,
         request_start_ns=request_start_ns,
         first_token_ns=first_token_ns,
         prefill_done_ns=prefill_done_ns,

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
-from mlx_lm.models.cache import KVCache, RotatingKVCache
+from mlx_lm.models.cache import KVCache, QuantizedKVCache, RotatingKVCache
 
 from dflash_mlx.cache.codecs import target_cache_is_serializable
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
@@ -131,6 +131,25 @@ def test_target_cache_window_rejects_quantized_target_kv(monkeypatch):
             quantize_kv_cache=True,
             target_fa_window=2048,
         )
+
+def test_target_cache_quantized_kv_is_not_prefix_serializable(monkeypatch):
+    monkeypatch.setattr(
+        QwenGdnTargetOps,
+        "install_speculative_hooks",
+        lambda self, _model: None,
+    )
+
+    caches = QwenGdnTargetOps().make_cache(
+        _FakeTarget(),
+        enable_speculative_linear_cache=True,
+        quantize_kv_cache=True,
+        target_fa_window=0,
+    )
+
+    assert isinstance(caches[0], QuantizedKVCache)
+    assert isinstance(caches[1], RecurrentRollbackCache)
+    assert isinstance(caches[2], QuantizedKVCache)
+    assert target_cache_is_serializable(caches) is False
 
 def test_prefix_cache_fingerprint_separates_target_fa_window():
     prompt = [1, 2, 3, 4]
