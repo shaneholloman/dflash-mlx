@@ -5,11 +5,11 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 
 import mlx.core as mx
-import numpy as np
 
 from dflash_mlx.cache.prefix_l1 import DFlashPrefixCache
 from dflash_mlx.cache.prefix_l2 import (
@@ -663,41 +663,35 @@ class TestStatsHotPath:
         finally:
             l2.shutdown()
 
-class TestZeroCopyWrite:
-    def test_writer_uses_mx_save_safetensors(self, tmp_path, monkeypatch):
+class TestAsyncWriterSafety:
+    def test_async_writer_does_not_call_mx_save_safetensors(self, tmp_path, monkeypatch):
         import mlx.core as _mx
-        import numpy as _np
 
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
+            _stop_writer(l2)
+            l2._stop.clear()
+
             calls = {"n": 0}
+            threads: list[str] = []
             real_save = _mx.save_safetensors
 
             def _spy(path, arrays, metadata=None):
                 calls["n"] += 1
-
-                for v in arrays.values():
-                    assert isinstance(v, _mx.array), (
-                        f"writer must pass mx.array, got {type(v).__name__}"
-                    )
+                threads.append(threading.current_thread().name)
                 return real_save(path, arrays, metadata=metadata)
 
             monkeypatch.setattr("mlx.core.save_safetensors", _spy)
 
-            real_np_array = _np.array
-
-            def _forbid_copy(*args, **kwargs):
-                if kwargs.get("copy") is True:
-                    raise AssertionError(
-                        "L2 writer regressed: np.array(copy=True) reintroduced"
-                    )
-                return real_np_array(*args, **kwargs)
-
-            monkeypatch.setattr("numpy.array", _forbid_copy)
-
             key = _make_key()
-            l2._write_one(_make_synthetic_snapshot([1, 2, 3], key))
-            assert calls["n"] >= 1
+            l2.insert_async(_make_synthetic_snapshot([1, 2, 3], key))
+            assert l2._write_queue.qsize() == 1
+            assert calls["n"] == 1
+            assert "dflash-l2-writer" not in threads
+
+            payload = l2._write_queue.get_nowait()
+            l2._write_payload(payload)
+            assert calls["n"] == 1
             assert len(_all_snapshot_files(tmp_path)) == 1
         finally:
             l2.shutdown()

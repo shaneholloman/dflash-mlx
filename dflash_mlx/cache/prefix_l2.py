@@ -265,8 +265,7 @@ def _deserialize(arrays: dict[str, mx.array], meta: dict[str, Any]) -> DFlashPre
 
 @dataclass
 class _WritePayload:
-    arrays: dict[str, mx.array]
-    meta: dict[str, str]
+    tmp_path: Optional[Path]
     final_path: Path
     nbytes: int
     epoch: int
@@ -435,18 +434,18 @@ class DFlashPrefixL2Cache:
                 self._stats["write_drops_queue_full"] += 1
             return
         try:
-            arrays_mlx, meta = _serialize(snapshot)
-            _eval_arrays(arrays_mlx)
-            final_path = self._final_path_for(snapshot)
-            with self._lock:
-                epoch_at_submit = self._epoch
-            payload = _WritePayload(
-                arrays=arrays_mlx,
-                meta=meta,
-                final_path=final_path,
-                nbytes=int(snapshot.nbytes),
-                epoch=int(epoch_at_submit),
-            )
+            payload = self._prepare_payload(snapshot)
+        except OSError as e:
+            if e.errno in (errno.ENOSPC, errno.EDQUOT):
+                _LOG.warning("L2 write skipped (disk full): %s", e)
+                with self._lock:
+                    self._stats["write_errors"] += 1
+            else:
+                _LOG.warning("L2 materialize failed: %s", e)
+                with self._lock:
+                    self._stats["materialize_errors"] += 1
+            self._writer_slots.release()
+            return
         except Exception as e:
             _LOG.warning("L2 materialize failed: %s", e)
             with self._lock:
@@ -511,18 +510,17 @@ class DFlashPrefixL2Cache:
         if not self.writable:
             return
         try:
-            arrays_mlx, meta = _serialize(snapshot)
-            _eval_arrays(arrays_mlx)
-            final_path = self._final_path_for(snapshot)
-            with self._lock:
-                epoch = self._epoch
-            payload = _WritePayload(
-                arrays=arrays_mlx,
-                meta=meta,
-                final_path=final_path,
-                nbytes=int(snapshot.nbytes),
-                epoch=int(epoch),
-            )
+            payload = self._prepare_payload(snapshot)
+        except OSError as e:
+            if e.errno in (errno.ENOSPC, errno.EDQUOT):
+                _LOG.warning("L2 write skipped (disk full): %s", e)
+                with self._lock:
+                    self._stats["write_errors"] += 1
+            else:
+                _LOG.warning("L2 sync write materialize failed: %s", e)
+                with self._lock:
+                    self._stats["materialize_errors"] += 1
+            return
         except Exception as e:
             _LOG.warning("L2 sync write materialize failed: %s", e)
             with self._lock:
@@ -530,44 +528,80 @@ class DFlashPrefixL2Cache:
             return
         self._write_payload(payload)
 
-    def _write_payload(self, payload: _WritePayload) -> None:
-        if not self.writable:
-            return
-
+    def _prepare_payload(self, snapshot: DFlashPrefixSnapshot) -> _WritePayload:
+        arrays_mlx, meta = _serialize(snapshot)
+        _eval_arrays(arrays_mlx)
+        final_path = self._final_path_for(snapshot)
         with self._lock:
-            if payload.epoch != self._epoch:
-                self._stats["write_drops_epoch_invalidated"] += 1
-                return
-        if payload.final_path.exists():
-            with self._lock:
-                self._stats["writes"] += 1
-            return
-        payload.final_path.parent.mkdir(parents=True, exist_ok=True)
+            epoch = self._epoch
+        if final_path.exists():
+            return _WritePayload(
+                tmp_path=None,
+                final_path=final_path,
+                nbytes=int(snapshot.nbytes),
+                epoch=int(epoch),
+            )
+
+        final_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_fd, tmp_name = tempfile.mkstemp(
-            prefix=f".{payload.final_path.stem}.",
+            prefix=f".{final_path.stem}.",
             suffix=L2_TMP_SUFFIX,
-            dir=str(payload.final_path.parent),
+            dir=str(final_path.parent),
         )
         os.close(tmp_fd)
         tmp_path = Path(tmp_name)
         try:
-            mx.save_safetensors(str(tmp_path), payload.arrays, metadata=payload.meta)
-        except OSError as e:
+            mx.save_safetensors(str(tmp_path), arrays_mlx, metadata=meta)
+        except Exception:
             try:
                 tmp_path.unlink()
             except OSError:
                 pass
-            if e.errno in (errno.ENOSPC, errno.EDQUOT):
-                _LOG.warning("L2 write skipped (disk full): %s", e)
-                with self._lock:
-                    self._stats["write_errors"] += 1
-                return
             raise
+        return _WritePayload(
+            tmp_path=tmp_path,
+            final_path=final_path,
+            nbytes=int(snapshot.nbytes),
+            epoch=int(epoch),
+        )
+
+    def _write_payload(self, payload: _WritePayload) -> None:
+        if not self.writable:
+            if payload.tmp_path is not None:
+                try:
+                    payload.tmp_path.unlink()
+                except OSError:
+                    pass
+            return
+
+        with self._lock:
+            if payload.epoch != self._epoch:
+                if payload.tmp_path is not None:
+                    try:
+                        payload.tmp_path.unlink()
+                    except OSError:
+                        pass
+                self._stats["write_drops_epoch_invalidated"] += 1
+                return
+        if payload.final_path.exists():
+            if payload.tmp_path is not None:
+                try:
+                    payload.tmp_path.unlink()
+                except OSError:
+                    pass
+            with self._lock:
+                self._stats["writes"] += 1
+            return
+        if payload.tmp_path is None:
+            with self._lock:
+                self._stats["write_errors"] += 1
+            return
+        payload.final_path.parent.mkdir(parents=True, exist_ok=True)
 
         with self._lock:
             if payload.epoch != self._epoch:
                 try:
-                    tmp_path.unlink()
+                    payload.tmp_path.unlink()
                 except OSError:
                     pass
                 self._stats["write_drops_epoch_invalidated"] += 1
@@ -575,10 +609,10 @@ class DFlashPrefixL2Cache:
             try:
 
                 payload.final_path.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(str(tmp_path), str(payload.final_path))
+                os.replace(str(payload.tmp_path), str(payload.final_path))
             except OSError as e:
                 try:
-                    tmp_path.unlink()
+                    payload.tmp_path.unlink()
                 except OSError:
                     pass
                 if e.errno in (errno.ENOSPC, errno.EDQUOT):

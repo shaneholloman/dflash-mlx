@@ -455,12 +455,18 @@ class TestConcurrency:
     def test_concurrent_inserts_do_not_crash(self):
         cache = DFlashPrefixCache(max_entries=16)
         key = _make_key()
+        snapshots = {
+            base: [
+                _make_synthetic_snapshot([base, base + i], key)
+                for i in range(10)
+            ]
+            for base in (100, 200, 300)
+        }
         errors: list[Exception] = []
 
         def worker(base: int):
             try:
-                for i in range(10):
-                    snap = _make_synthetic_snapshot([base, base + i], key)
+                for i, snap in enumerate(snapshots[base]):
                     cache.insert(snap)
                     cache.lookup([base, base + i], key)
             except Exception as e:
