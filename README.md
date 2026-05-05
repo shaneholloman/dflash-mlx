@@ -6,7 +6,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple" alt="Apple Silicon">
   <img src="https://img.shields.io/badge/python-3.10%2B-blue?logo=python" alt="Python 3.10+">
-  <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
+  <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License">
   <img src="https://img.shields.io/badge/MLX-stock-red" alt="Stock MLX">
 </p>
 
@@ -226,4 +226,4 @@ Diagnostics artifacts land in `.artifacts/dflash/diagnostics/<timestamp>-serve-<
 
 ## License
 
-MIT
+Apache-2.0
