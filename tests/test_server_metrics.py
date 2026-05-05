@@ -42,6 +42,10 @@ def test_diagnostics_post_event_records_prefill_details(tmp_path):
         prefill_event={
             "event": "prefill",
             "prompt_token_count": 4096,
+            "logical_ctx_tokens": 4096,
+            "physical_prefill_tokens": 1024,
+            "prefill_tokens_restored": 3072,
+            "prefill_tokens_computed": 1024,
             "phase_cold_us": 1_900_000.0,
             "phase_seam_us": 100_000.0,
         },
@@ -66,6 +70,10 @@ def test_diagnostics_post_event_records_prefill_details(tmp_path):
     row = json.loads((tmp_path / "post_events.jsonl").read_text().splitlines()[-1])
 
     assert row["prefill_tok_s"] == 2048.0
+    assert row["logical_ctx_tokens"] == 4096
+    assert row["physical_prefill_tokens"] == 1024
+    assert row["prefill_tokens_restored"] == 3072
+    assert row["prefill_tokens_computed"] == 1024
     assert row["runtime_config"]["prefill_step_size"] == 8192
     assert row["prefill_phase_timings_us"] == {
         "phase_cold_us": 1_900_000.0,

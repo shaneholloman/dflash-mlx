@@ -141,6 +141,16 @@ def test_model_provider_adds_mlx_lm_server_boundary_defaults(monkeypatch):
             return 1
 
     monkeypatch.setattr(model_provider.mx.distributed, "init", lambda: FakeGroup())
+    monkeypatch.setattr(
+        model_provider,
+        "load_runtime_components",
+        lambda **_kwargs: (
+            SimpleNamespace(parameters=lambda: []),
+            SimpleNamespace(chat_template=None, default_chat_template=None),
+            SimpleNamespace(parameters=lambda: []),
+            "draft",
+        ),
+    )
     args = build_parser().parse_args(["--model", "m"])
     normalize_cli_args(args)
 

@@ -396,6 +396,8 @@ def stream_dflash_generate_impl(
 
         suppress_token_mask = build_suppress_token_mask(int(prefill_logits.shape[-1]), suppress_token_ids)
         staged_first = greedy_tokens_with_mask(prefill_logits[:, -1, :], suppress_token_mask).reshape(-1)
+        prefill_tokens_restored = max(0, min(int(snap_prefix_len), int(prompt_len)))
+        prefill_tokens_computed = max(0, int(prompt_len) - prefill_tokens_restored)
 
         prefill_event = {
             "event": "prefill",
@@ -403,6 +405,10 @@ def stream_dflash_generate_impl(
             "prompt_token_count": prompt_len,
             "snap_prefix_len": int(snap_prefix_len),
             "snapshot_boundary": int(snapshot_boundary),
+            "logical_ctx_tokens": int(prompt_len),
+            "physical_prefill_tokens": int(prefill_tokens_computed),
+            "prefill_tokens_restored": int(prefill_tokens_restored),
+            "prefill_tokens_computed": int(prefill_tokens_computed),
         }
         if profile_cycles:
             prefill_event.update(

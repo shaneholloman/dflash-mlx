@@ -422,7 +422,7 @@ def _write_diagnostics_bootstrap(
         f"- profile: {runtime_config.profile}",
         "",
         "Files:",
-        "- `post_events.jsonl`: request timing, throughput, cache hit tokens, and memory peak when enabled.",
+        "- `post_events.jsonl`: request timing, throughput, cache hit tokens, prefill accounting, and memory peak when enabled.",
         "- `cache_events.jsonl`: prefix-cache lookup/insert/prune events.",
     ]
     if args.diagnostics == "full":

@@ -88,6 +88,7 @@ def log_bench_post(
     cycles_completed = int((summary_event or {}).get("cycles_completed", 0) or 0)
     tokens_per_cycle = float((summary_event or {}).get("tokens_per_cycle", 0.0) or 0.0)
     prefill_phase_timings_us = _prefill_phase_timings(prefill_event)
+    prefill_accounting = _prefill_accounting(prefill_event)
     runtime_config_payload = _runtime_config_payload(runtime_config)
     _bench_log_post(
         diagnostics.trace if diagnostics is not None else None,
@@ -110,6 +111,7 @@ def log_bench_post(
         max_tokens=int(max_tokens),
         prompt_regime=prompt_regime or {},
         prefill_event=prefill_event or {},
+        **prefill_accounting,
         prefill_phase_timings_us=prefill_phase_timings_us,
         phase_timings_us=dict((summary_event or {}).get("phase_timings_us") or {}),
         runtime_config=runtime_config_payload,
@@ -185,6 +187,26 @@ def _prefill_phase_timings(prefill_event: Optional[dict[str, Any]]) -> dict[str,
                 out[key] = float(value)
             except (TypeError, ValueError):
                 pass
+    return out
+
+def _prefill_accounting(prefill_event: Optional[dict[str, Any]]) -> dict[str, int]:
+    if not prefill_event:
+        return {}
+    keys = (
+        "logical_ctx_tokens",
+        "physical_prefill_tokens",
+        "prefill_tokens_restored",
+        "prefill_tokens_computed",
+    )
+    out: dict[str, int] = {}
+    for key in keys:
+        value = prefill_event.get(key)
+        if value is None:
+            continue
+        try:
+            out[key] = int(value)
+        except (TypeError, ValueError):
+            pass
     return out
 
 def _runtime_config_payload(runtime_config: Optional[Any]) -> dict[str, Any]:

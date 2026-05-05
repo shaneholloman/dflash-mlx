@@ -72,8 +72,9 @@ waterfall samples.
 
 `post_events.jsonl`
 : Per-request summary events. These include request ids, prompt length, token
-counts, acceptance/cycle fields when applicable, cache stats, and memory summary
-fields.
+counts, acceptance/cycle fields when applicable, cache stats, prefill accounting
+(`logical_ctx_tokens`, `physical_prefill_tokens`, `prefill_tokens_restored`,
+`prefill_tokens_computed`), and memory summary fields.
 
 `summary.md`
 : Human-readable append-only request summary.

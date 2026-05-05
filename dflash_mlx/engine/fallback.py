@@ -70,6 +70,10 @@ def stream_baseline_generate(
         "event": "prefill",
         "prefill_us": prefill_ns / 1_000.0,
         "prompt_token_count": prompt_len,
+        "logical_ctx_tokens": int(prompt_len),
+        "physical_prefill_tokens": int(prompt_len),
+        "prefill_tokens_restored": 0,
+        "prefill_tokens_computed": int(prompt_len),
         "fallback_ar": True,
         "fallback_reason": fallback_reason,
     }

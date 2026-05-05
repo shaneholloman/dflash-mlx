@@ -11,6 +11,7 @@ belong to that public command, not to these lab tools.
 
 ```bash
 PYTHONPATH=$PWD python -m tools.benchmarks.agentic_trace --help
+PYTHONPATH=$PWD python -m tools.benchmarks.prefix_cache_survival_gate --help
 PYTHONPATH=$PWD python -m tools.benchmarks.prefix_cache_probe --help
 PYTHONPATH=$PWD python -m tools.benchmarks.analyze_trace --help
 ```
@@ -18,6 +19,9 @@ PYTHONPATH=$PWD python -m tools.benchmarks.analyze_trace --help
 `agentic_trace.py`
 : Agentic session/proxy trace tooling. Use it to study server behavior under a
 real client shape, not as a public speed claim by default.
+
+`prefix_cache_survival_gate.py`
+: Long-context prefix-cache correctness gate. It is not a statistical NIAH benchmark.
 
 `prefix_cache_probe.py`
 : Prefix-cache and L2 mechanism probes.
@@ -73,6 +77,7 @@ Private `_*.py` files are implementation modules for these wrappers.
 | Tool | Verdict | One-sentence question |
 | --- | --- | --- |
 | `agentic_trace.py` | KEEP | On a real OpenCode/pi loop, how many POSTs, tokens, cache hits, tok/s, and acceptance did the runtime produce? |
+| `prefix_cache_survival_gate.py` | KEEP | Does a warm prefix-cache request preserve the correct long-context record after a divergent suffix and reject a stale wrong-haystack answer? |
 | `_agentic_trace.py` | KEEP | How does the orchestrated server+proxy+client capture build the trace and compare it to a peer run? |
 | `_agentic_proxy.py` | KEEP | What exact OpenAI-compatible requests and SSE events did the client send and receive? |
 | `_agentic_session.py` | FOLD later | What did a raw OpenCode/pi client session emit without the server/proxy orchestration? |

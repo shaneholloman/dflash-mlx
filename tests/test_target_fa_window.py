@@ -266,6 +266,39 @@ def test_fallback_ar_forces_target_fa_window_zero(monkeypatch):
         }
     ]
 
+
+def test_fallback_prefill_event_reports_full_physical_prefill(monkeypatch):
+    import dflash_mlx.engine.fallback as fallback
+
+    class FakeOps:
+        def make_cache(self, target_model, **kwargs):
+            return []
+
+    class FakeTarget:
+        def __call__(self, input_ids, cache):
+            del cache
+            batch, seq_len = input_ids.shape
+            return mx.zeros((batch, seq_len, 8), dtype=mx.float32)
+
+    monkeypatch.setattr("dflash_mlx.engine.target_ops.resolve_target_ops", lambda _model: FakeOps())
+
+    events = list(
+        fallback.stream_baseline_generate(
+            target_model=FakeTarget(),
+            tokenizer=object(),
+            prompt="unused",
+            max_new_tokens=1,
+            prompt_tokens_override=[1, 2, 3, 4],
+        )
+    )
+
+    prefill_event = next(event for event in events if event.get("event") == "prefill")
+    assert prefill_event["logical_ctx_tokens"] == 4
+    assert prefill_event["physical_prefill_tokens"] == 4
+    assert prefill_event["prefill_tokens_restored"] == 0
+    assert prefill_event["prefill_tokens_computed"] == 4
+
+
 def test_rotating_kv_trim_survives_logical_positions_past_cache_length():
     cache = RotatingKVCache(max_size=8)
     cache.update_and_fetch(_keys(12), _keys(12, offset=1000))
