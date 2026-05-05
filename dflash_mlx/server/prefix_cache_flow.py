@@ -89,6 +89,9 @@ def get_dflash_prefix_cache(runtime_context: Optional[Any] = None) -> Optional[D
         _DFLASH_PREFIX_CACHE_CONFIG_KEY = config_key
     return _DFLASH_PREFIX_CACHE_SINGLETON
 
+def current_dflash_prefix_cache() -> Optional[DFlashPrefixCache]:
+    return _DFLASH_PREFIX_CACHE_SINGLETON
+
 def shutdown_dflash_prefix_cache() -> None:
     global _DFLASH_PREFIX_CACHE_CONFIG_KEY, _DFLASH_PREFIX_CACHE_SINGLETON
     with _DFLASH_PREFIX_CACHE_LOCK:

@@ -106,6 +106,21 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 Compatible with OpenCode, aider, Continue, Open WebUI, and any OpenAI-compatible client. Tool calls, streaming, and chat templates all flow through. Short responses may take the target-only fast path; pass `--fastpath-max-tokens 0` to force DFlash on every request.
 
+Inspect live server metrics:
+
+```bash
+curl http://127.0.0.1:8000/metrics
+```
+
+`prefill_tok_s_physical` counts only tokens actually computed after prefix-cache
+restore. `prefill_tok_s_apparent` uses the full logical prompt length over the
+same user-visible prefill wall time. `current_request` shows an in-flight
+prefill/decode, `recent_requests` keeps the last 32 completed requests, and
+`rss_gb` reports process resident memory. `wired_gb` stays `null` unless a true
+per-process wired-memory source is available.
+The endpoint is for live debugging and benchmark visibility; it does not create
+benchmark artifacts.
+
 Enable Qwen reasoning mode when needed:
 
 ```bash

@@ -1,12 +1,40 @@
 # Observability
 
-DFlash has two observability surfaces:
+DFlash has three observability surfaces:
 
 1. compact stderr lines that help interactive server use;
-2. structured diagnostics artifacts for debugging and benchmarking.
+2. live JSON metrics for current server state;
+3. structured diagnostics artifacts for debugging and benchmarking.
 
 Structured diagnostics are opt-in. The compact server memory line is currently
 always printed after DFlash requests.
+
+## Live Metrics
+
+`dflash serve` exposes an always-on JSON endpoint:
+
+```bash
+curl http://127.0.0.1:8000/metrics
+```
+
+The endpoint reads the in-memory server snapshot. It does not scan diagnostics
+artifacts and does not force MLX evaluation. It works before the first request
+with `last_request: null`, reports `current_request` while a request is in
+prefill/decode, and keeps the 32 latest completed requests in
+`recent_requests`.
+
+`rss_gb` is the current process resident size. `wired_gb` remains `null` unless
+the runtime has a true per-process wired-memory source; `wired_limit_gb` still
+reports the configured Metal limit.
+
+Prefill throughput is split deliberately:
+
+- `prefill_tok_s_physical`: tokens actually computed after prefix-cache restore
+  divided by user-visible prefill wall time.
+- `prefill_tok_s_apparent`: logical prompt tokens divided by the same wall time.
+
+Use live metrics for debugging, dashboards, and benchmark visibility. Use
+diagnostics artifacts when you need reproducible traces.
 
 ## Diagnostics Modes
 

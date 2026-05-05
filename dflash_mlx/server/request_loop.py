@@ -16,6 +16,7 @@ from dflash_mlx.engine.memory_waterfall import (
     merge_memory_waterfall_peak,
 )
 from dflash_mlx.server.prefix_cache_flow import PrefixCacheFlow
+from dflash_mlx.server.metrics import update_live_request
 from dflash_mlx.server.protocol import make_response, match_stream_token
 
 @dataclass
@@ -107,6 +108,14 @@ def consume_dflash_events(
                     )
                 )
                 elapsed_s = (time.perf_counter_ns() - request_start_ns) / 1e9
+                update_live_request(
+                    request_id=request_id,
+                    state="prefill" if event_name == "prefill_progress" else "decode",
+                    prefill_tokens_processed=processed,
+                    prefill_tokens_total=total,
+                    prefill_s=elapsed_s if event_name == "prefill" else None,
+                    prefill_done=event_name == "prefill",
+                )
                 if event_name == "prefill_progress":
                     sys.stderr.write(
                         f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] "
@@ -136,6 +145,13 @@ def consume_dflash_events(
             if event_name != "token":
                 if event_name == "summary":
                     summary_event = event
+                    update_live_request(
+                        request_id=request_id,
+                        state="finishing",
+                        generated_tokens=_int_or_zero(event.get("generation_tokens")),
+                        acceptance_rate=_float_or_none(event.get("acceptance_ratio")),
+                        cycles=_int_or_none(event.get("cycles_completed")),
+                    )
                     generated_token_ids = list(event.get("generated_token_ids", []) or [])
                     if generated_token_ids:
                         last_token = int(generated_token_ids[-1])
@@ -158,6 +174,13 @@ def consume_dflash_events(
             live_acceptance_pct = float(event.get("acceptance_ratio", 0.0) or 0.0) * 100.0
             elapsed_s = (time.perf_counter_ns() - request_start_ns) / 1e9
             live_tok_s = live_token_count / max(0.001, elapsed_s - prefill_elapsed_s)
+            update_live_request(
+                request_id=request_id,
+                state="decode",
+                generated_tokens=live_token_count,
+                decode_tok_s=live_tok_s,
+                acceptance_rate=live_acceptance_pct / 100.0,
+            )
             if live_token_count % 2048 == 0:
                 sys.stderr.write(
                     f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] "
@@ -270,3 +293,23 @@ def consume_dflash_events(
 
 def _context_should_stop(ctx: Any) -> bool:
     return bool(getattr(ctx, "_should_stop", False))
+
+def _int_or_none(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+def _int_or_zero(value: Any) -> int:
+    parsed = _int_or_none(value)
+    return 0 if parsed is None else parsed
+
+def _float_or_none(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None

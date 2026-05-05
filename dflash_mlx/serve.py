@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import itertools
+import json
 import logging
 import sys
 import time
@@ -45,7 +46,13 @@ from dflash_mlx.bench_logger import (
     log_post as _bench_log_post,
 )
 from dflash_mlx.server.metrics import (
-    log_bench_post as _log_bench_post,
+    clear_live_request as _clear_live_request,
+    configure_live_metrics as _configure_live_metrics,
+    get_memory_snapshot as _get_memory_snapshot,
+    get_live_metrics_payload as _get_live_metrics_payload,
+    record_request_metrics as _record_request_metrics,
+    record_target_only_request as _record_target_only_request,
+    start_live_request as _start_live_request,
     write_summary_line as _write_summary_line,
 )
 from dflash_mlx.server.model_provider import (
@@ -56,6 +63,7 @@ from dflash_mlx.runtime import get_stop_token_ids, stream_dflash_generate
 from dflash_mlx.runtime_context import with_metal_limits
 from dflash_mlx.server.prefix_cache_flow import (
     PrefixCacheFlow,
+    current_dflash_prefix_cache as _current_dflash_prefix_cache,
     get_dflash_prefix_cache as _get_dflash_prefix_cache,
     log_prefix_cache_stats,
     shutdown_dflash_prefix_cache,
@@ -123,13 +131,25 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
             sys.stderr.flush()
             saved_draft_model = self.model_provider.draft_model
             wall_t0 = time.perf_counter_ns()
+            _start_live_request(
+                request_id=request_id,
+                mode_used="ar_fastpath",
+                prompt_tokens=None,
+                max_tokens=int(args.max_tokens),
+            )
             try:
                 self.model_provider.draft_model = None
                 return super()._serve_single((rqueue, request, args))
             finally:
                 self.model_provider.draft_model = saved_draft_model
+                wall_ms = (time.perf_counter_ns() - wall_t0) / 1e6
+                _record_target_only_request(
+                    request_id=request_id,
+                    mode_used="ar_fastpath",
+                    wall_ms=wall_ms,
+                    max_tokens=int(args.max_tokens),
+                )
                 if bench_active:
-                    wall_ms = (time.perf_counter_ns() - wall_t0) / 1e6
                     _bench_log_post(
                         trace_config,
                         request_id=request_id,
@@ -183,6 +203,14 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
                 runtime_context=runtime_context,
             )
             ctx.prompt_cache_count = prefix_flow.hit_tokens
+            _start_live_request(
+                request_id=request_id,
+                mode_used="dflash",
+                prompt_tokens=len(prompt),
+                max_tokens=int(args.max_tokens),
+                cache_hit_tokens=prefix_flow.hit_tokens,
+                cache_lookup_ms=prefix_flow.lookup_ms,
+            )
 
             event_iter = stream_dflash_generate(
                 target_model=model,
@@ -222,43 +250,33 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
                     prompt_token_count=len(prompt),
                 )
 
-            if bench_active:
-                _log_bench_post(
-                    request_id=request_id,
-                    summary_event=summary_event,
-                    request_start_ns=loop_result.request_start_ns,
-                    request_done_ns=time.perf_counter_ns(),
-                    first_token_ns=loop_result.first_token_ns,
-                    prefill_done_ns=loop_result.prefill_done_ns,
-                    prompt_token_count=len(prompt),
-                    live_token_count=loop_result.live_token_count,
-                    cache_lookup_ms=loop_result.cache_lookup_ms,
-                    cache_hit_tokens=loop_result.cache_hit_tokens,
-                    cache_insert_ms=loop_result.cache_insert_ms,
-                    finish_reason=loop_result.finish_reason,
-                    max_tokens=args.max_tokens,
-                    prompt_regime=_build_prompt_regime(args, tokenizer, request),
-                    memory_waterfall_peak=loop_result.memory_waterfall_peak,
-                    diagnostics=runtime_context.diagnostics,
-                    prefill_event=loop_result.prefill_event,
-                    runtime_config=runtime_context.runtime,
-                )
+            _record_request_metrics(
+                request_id=request_id,
+                summary_event=summary_event,
+                request_start_ns=loop_result.request_start_ns,
+                request_done_ns=time.perf_counter_ns(),
+                first_token_ns=loop_result.first_token_ns,
+                prefill_done_ns=loop_result.prefill_done_ns,
+                prompt_token_count=len(prompt),
+                live_token_count=loop_result.live_token_count,
+                cache_lookup_ms=loop_result.cache_lookup_ms,
+                cache_hit_tokens=loop_result.cache_hit_tokens,
+                cache_insert_ms=loop_result.cache_insert_ms,
+                finish_reason=loop_result.finish_reason,
+                max_tokens=args.max_tokens,
+                prompt_regime=_build_prompt_regime(args, tokenizer, request),
+                memory_waterfall_peak=loop_result.memory_waterfall_peak,
+                diagnostics=runtime_context.diagnostics,
+                prefill_event=loop_result.prefill_event,
+                runtime_config=runtime_context.runtime,
+            )
             try:
-                mlx_active_gb = float(mx.get_active_memory()) / 1e9 if hasattr(mx, "get_active_memory") else 0.0
-                mlx_cache_gb = float(mx.get_cache_memory()) / 1e9 if hasattr(mx, "get_cache_memory") else 0.0
-                mlx_peak_gb = float(mx.get_peak_memory()) / 1e9 if hasattr(mx, "get_peak_memory") else 0.0
-                import os as _os, resource as _resource, subprocess as _sp
-                rusage = _resource.getrusage(_resource.RUSAGE_SELF)
-                rss_peak_gb = float(rusage.ru_maxrss) / 1e9
-                rss_now_gb = 0.0
-                try:
-                    out = _sp.check_output(
-                        ["ps", "-o", "rss=", "-p", str(_os.getpid())],
-                        stderr=_sp.DEVNULL, timeout=2,
-                    ).decode().strip()
-                    rss_now_gb = float(out) * 1024.0 / 1e9
-                except Exception:
-                    pass
+                memory = _get_memory_snapshot()
+                mlx_active_gb = float(memory.get("mlx_active_gb") or 0.0)
+                mlx_cache_gb = float(memory.get("mlx_cache_gb") or 0.0)
+                mlx_peak_gb = float(memory.get("mlx_peak_gb") or 0.0)
+                rss_now_gb = float(memory.get("rss_gb") or 0.0)
+                rss_peak_gb = float(memory.get("rss_peak_gb") or 0.0)
                 untracked_gb = max(0.0, rss_now_gb - mlx_active_gb - mlx_cache_gb)
                 sys.stderr.write(
                     f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] req#{request_id} "
@@ -270,9 +288,27 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
                 pass
             rqueue.put(None)
         except Exception as e:
+            _clear_live_request(request_id=request_id)
             rqueue.put(e)
 
 class DFlashAPIHandler(mlx_server.APIHandler):
+    def do_GET(self):
+        if self.path.split("?", 1)[0] == "/metrics":
+            self.handle_metrics_request()
+            return
+        return super().do_GET()
+
+    def handle_metrics_request(self):
+        payload = _get_live_metrics_payload(
+            prefix_cache=_current_dflash_prefix_cache(),
+        )
+        body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+        self._set_completion_headers(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+
     def handle_completion(self, request, stop_words):
         try:
             return super().handle_completion(request, stop_words)
@@ -439,6 +475,10 @@ def _run_with_dflash_server(host: str, port: int, model_provider: DFlashModelPro
     response_generator = DFlashResponseGenerator(model_provider, prompt_cache)
     if group.rank() == 0:
         _wait_for_initial_model_load(model_provider, timeout_s=300.0)
+        _configure_live_metrics(
+            version=_read_project_version(),
+            model_provider=model_provider,
+        )
         _print_startup_banner(port=port, model_provider=model_provider)
         try:
             mlx_server._run_http_server(
