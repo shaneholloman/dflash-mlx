@@ -37,7 +37,9 @@ from dflash_mlx.benchmark_suites import (
     resolve_benchmark_prompts,
     slugify_prompt_id,
 )
+from dflash_mlx.generate import resolve_optional_draft_ref
 from dflash_mlx.metal_limits import apply_metal_limits
+from dflash_mlx.engine.target_ops import bind_draft_to_target, resolve_target_ops
 from dflash_mlx.runtime import (
     get_stop_token_ids,
     load_draft_bundle,
@@ -196,18 +198,34 @@ def _finalize_benchmark_args(
         raise ValueError("--verify-len-cap must be >= 0")
     return args
 
-def _strip_generation_payload(result: dict[str, Any], *, drop_phase_timings: bool = False) -> dict[str, Any]:
+def _strip_generation_payload(result: dict[str, Any]) -> dict[str, Any]:
     cleaned = dict(result)
     cleaned.pop("generated_token_ids", None)
-    if drop_phase_timings:
-        phase_timings = dict(cleaned.pop("phase_timings_us", {}) or {})
-        if "prefill" in phase_timings and "prefill_us" not in cleaned:
-            cleaned["prefill_us"] = float(phase_timings["prefill"])
+    phase_timings = dict(cleaned.get("phase_timings_us", {}) or {})
+    if "prefill" in phase_timings and "prefill_us" not in cleaned:
+        cleaned["prefill_us"] = float(phase_timings["prefill"])
     return cleaned
+
+def _compact_phase_timings(result: dict[str, Any]) -> dict[str, float]:
+    timings = dict(result.get("phase_timings_us", {}) or {})
+    return {str(key): float(value) for key, value in timings.items()}
 
 def _format_run_entry(run: dict[str, Any]) -> dict[str, Any]:
     baseline = dict(run["baseline"])
     dflash = dict(run["dflash"])
+    dflash_entry = {
+        "ttft_ms": float(run["dflash_ttft_ms"]),
+        "generation_tps": float(run["dflash_generation_tps"]),
+        "tokens_per_cycle": float(dflash.get("tokens_per_cycle", 0.0)),
+        "cycles": int(dflash.get("cycles_completed", 0)),
+        "acceptance_ratio": float(dflash.get("acceptance_ratio", 0.0)),
+        "acceptance_first_20_avg": float(dflash.get("acceptance_first_20_avg", 0.0)),
+        "acceptance_last_20_avg": float(dflash.get("acceptance_last_20_avg", 0.0)),
+        "peak_memory_gb": dflash.get("peak_memory_gb"),
+    }
+    phase_timings_us = _compact_phase_timings(dflash)
+    if phase_timings_us:
+        dflash_entry["phase_timings_us"] = phase_timings_us
     return {
         "run": int(run["run_index"]),
         "thermal_pressure": str(run.get("thermal_pressure", "unknown")),
@@ -216,16 +234,7 @@ def _format_run_entry(run: dict[str, Any]) -> dict[str, Any]:
             "generation_tps": float(run["baseline_generation_tps"]),
             "peak_memory_gb": baseline.get("peak_memory_gb"),
         },
-        "dflash": {
-            "ttft_ms": float(run["dflash_ttft_ms"]),
-            "generation_tps": float(run["dflash_generation_tps"]),
-            "tokens_per_cycle": float(dflash.get("tokens_per_cycle", 0.0)),
-            "cycles": int(dflash.get("cycles_completed", 0)),
-            "acceptance_ratio": float(dflash.get("acceptance_ratio", 0.0)),
-            "acceptance_first_20_avg": float(dflash.get("acceptance_first_20_avg", 0.0)),
-            "acceptance_last_20_avg": float(dflash.get("acceptance_last_20_avg", 0.0)),
-            "peak_memory_gb": dflash.get("peak_memory_gb"),
-        },
+        "dflash": dflash_entry,
         "speedup": float(run["generation_speedup_vs_baseline"]) if run["generation_speedup_vs_baseline"] is not None else None,
     }
 
@@ -600,11 +609,22 @@ def _run_once_sequential(
             split_full_attention_sdpa=split_sdpa,
             verify_config=runtime_context.verify,
         )
-        draft_model, draft_meta = load_draft_bundle(
+        resolved_draft_ref = resolve_optional_draft_ref(
+            target_meta["resolved_model_ref"],
             draft_model_ref,
+        )
+        if not resolved_draft_ref:
+            raise ValueError(
+                f"No DFlash draft model found for '{target_meta['resolved_model_ref']}'. "
+                "Use --draft to specify one."
+            )
+        draft_model, draft_meta = load_draft_bundle(
+            resolved_draft_ref,
             lazy=True,
             draft_quant=draft_quant,
         )
+        target_ops = resolve_target_ops(target_model)
+        bind_draft_to_target(draft_model, target_model, target_ops=target_ops)
 
         if use_chat_template and hasattr(tokenizer, "apply_chat_template"):
             dflash_prompt_tokens = list(
@@ -651,7 +671,7 @@ def _run_once_sequential(
     dflash_generation_tps = _generation_tps_from_dflash(dflash)
     return {
         "baseline": _strip_generation_payload(baseline),
-        "dflash": _strip_generation_payload(dflash, drop_phase_timings=True),
+        "dflash": _strip_generation_payload(dflash),
         "speedup_vs_baseline": _speedup(baseline_elapsed, dflash_elapsed),
         "baseline_ttft_ms": _ttft_ms_from_baseline(baseline),
         "dflash_ttft_ms": _ttft_ms_from_dflash(dflash),
@@ -1120,7 +1140,10 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         _benchmark_label(args),
         explicit_path=args.out,
     )
-    result = benchmark_suite(prompts=prompts, args=args)
+    try:
+        result = benchmark_suite(prompts=prompts, args=args)
+    except ValueError as exc:
+        parser.error(str(exc))
     command_argv = [prog or "dflash benchmark", *argv_list] if argv is not None else list(sys.argv)
     result["invocation"] = _build_invocation(args, output_path, command_argv, result["config"])
     manifest = write_manifest(

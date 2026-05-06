@@ -87,7 +87,16 @@ dflash serve \
   --draft z-lab/Qwen3.6-27B-DFlash \
   --port 8000
 
-# Local benchmark
+# Canonical local benchmark
+dflash benchmark \
+  --model Qwen/Qwen3.5-9B \
+  --prompt "$PROMPT" \
+  --max-tokens 1024 \
+  --repeat 3 \
+  --cooldown 60 \
+  --no-eos
+
+# Quick sanity check, not a benchmark claim
 dflash benchmark --suite smoke --model Qwen/Qwen3.5-4B
 ```
 
@@ -129,7 +138,10 @@ dflash serve --model mlx-community/Qwen3.6-27B-4bit --enable-thinking
 
 ## Tested models
 
-Optimized for Qwen3.5 / Qwen3.6 hybrid GatedDeltaNet + attention targets. Qwen3 (pure attention) targets work but skip the tape-replay rollback path.
+Optimized for Qwen3.5 / Qwen3.6 hybrid GatedDeltaNet + attention targets. Qwen3
+(pure attention) targets work but skip the tape-replay rollback path. Gemma4
+targets use the Gemma4 adapter; prefix snapshots stay disabled for Gemma4 until
+snapshot parity is proven.
 
 | Target | Draft |
 |--------|-------|
@@ -141,6 +153,8 @@ Optimized for Qwen3.5 / Qwen3.6 hybrid GatedDeltaNet + attention targets. Qwen3 
 | [mlx-community/Qwen3.6-35B-A3B-4bit](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-4bit) | [z-lab/Qwen3.6-35B-A3B-DFlash](https://huggingface.co/z-lab/Qwen3.6-35B-A3B-DFlash) |
 | [Qwen/Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B) | [z-lab/Qwen3-4B-DFlash-b16](https://huggingface.co/z-lab/Qwen3-4B-DFlash-b16) |
 | [Qwen/Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) | [z-lab/Qwen3-8B-DFlash-b16](https://huggingface.co/z-lab/Qwen3-8B-DFlash-b16) |
+| [mlx-community/gemma-4-31b-it-4bit](https://huggingface.co/mlx-community/gemma-4-31b-it-4bit) | [z-lab/gemma-4-31B-it-DFlash](https://huggingface.co/z-lab/gemma-4-31B-it-DFlash) |
+| [mlx-community/gemma-4-26b-a4b-it-4bit](https://huggingface.co/mlx-community/gemma-4-26b-a4b-it-4bit) | [z-lab/gemma-4-26B-A4B-it-DFlash](https://huggingface.co/z-lab/gemma-4-26B-A4B-it-DFlash) |
 
 ```bash
 dflash models
@@ -217,9 +231,9 @@ Diagnostics artifacts land in `.artifacts/dflash/diagnostics/<timestamp>-serve-<
 ## Roadmap
 
 - **Adaptive block size** — vary draft block length per cycle based on observed acceptance regime instead of a fixed 16
-- **Architecture backends beyond Qwen GDN** — support Gemma/Llama-style targets
-  with family-specific cache layout, attention masks, logits post-processing,
-  hidden capture, rollback/trim behavior, and parity tests.
+- **More architecture backends** — add new target families only with
+  family-specific cache layout, attention masks, logits post-processing, hidden
+  capture, rollback/trim behavior, and parity tests.
 - **Kernel work where it matters** — optimize family-specific hot paths only
   after the backend contract and parity tests are stable.
 - **Tool-call regime auto-fallback** — switch to target-only AR when speculative surplus goes negative on structured outputs

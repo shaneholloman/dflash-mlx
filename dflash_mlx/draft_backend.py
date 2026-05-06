@@ -11,6 +11,7 @@ import mlx.core as mx
 from dflash_mlx.model import (
     ContextOnlyDraftKVCache,
     DFlashDraftModel,
+    FullContextDraftKVCache,
 )
 from dflash_mlx.engine.target_ops import resolve_target_ops
 
@@ -22,13 +23,20 @@ class EagerDraftBackend:
         sink_size: int,
         window_size: int,
     ) -> list[Any]:
-        return [
-            ContextOnlyDraftKVCache(
-                sink_size=sink_size,
-                window_size=window_size,
-            )
-            for _ in range(len(draft_model.layers))
-        ]
+        caches: list[Any] = []
+        layer_types = tuple(getattr(draft_model.args, "layer_types", ()) or ())
+        for index in range(len(draft_model.layers)):
+            layer_type = str(layer_types[index] if index < len(layer_types) else "")
+            if layer_type == "full_attention":
+                caches.append(FullContextDraftKVCache())
+            else:
+                caches.append(
+                    ContextOnlyDraftKVCache(
+                        sink_size=sink_size,
+                        window_size=window_size,
+                    )
+                )
+        return caches
 
     def draft_greedy(
         self,

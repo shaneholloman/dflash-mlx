@@ -22,6 +22,32 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> lis
         for index in range(num_draft_layers)
     ]
 
+_DRAFT_LAYER_TYPES = frozenset(("full_attention", "sliding_attention"))
+_GEMMA4_MODEL_TYPES = frozenset(("gemma4", "gemma4_text"))
+_GEMMA4_DEFAULT_SLIDING_WINDOW = 512
+_GEMMA4_DEFAULT_SLIDING_WINDOW_PATTERN = 5
+
+
+def _is_gemma4_model_type(model_type: str) -> bool:
+    return str(model_type or "").lower() in _GEMMA4_MODEL_TYPES
+
+
+def _default_draft_layer_types(
+    *,
+    model_type: str,
+    num_hidden_layers: int,
+    sliding_window_pattern: int | None,
+) -> tuple[str, ...]:
+    layer_count = int(num_hidden_layers)
+    if not _is_gemma4_model_type(model_type):
+        return ("full_attention",) * layer_count
+    pattern_len = int(sliding_window_pattern or _GEMMA4_DEFAULT_SLIDING_WINDOW_PATTERN)
+    pattern_len = max(1, pattern_len)
+    pattern = ("sliding_attention",) * (pattern_len - 1) + ("full_attention",)
+    repeats = (layer_count // len(pattern)) + 1
+    return (pattern * repeats)[:layer_count]
+
+
 class ContextOnlyDraftKVCache:
     def __init__(self, sink_size: int = 64, window_size: int = 1024):
         self.sink_size = int(sink_size)
@@ -118,6 +144,80 @@ class ContextOnlyDraftKVCache:
             return 0
         return int(self.keys.shape[2])
 
+
+class FullContextDraftKVCache(ContextOnlyDraftKVCache):
+    def __init__(self):
+        super().__init__(sink_size=0, window_size=0)
+        self._key_segments: list[mx.array] = []
+        self._value_segments: list[mx.array] = []
+        self._position_segments: list[mx.array] = []
+
+    def append_context(
+        self,
+        context_keys: mx.array,
+        context_values: mx.array,
+        num_positions: int,
+        *,
+        positions: Optional[mx.array] = None,
+        advance_positions: Optional[int] = None,
+    ) -> None:
+        if context_keys is None or context_values is None or int(num_positions) <= 0:
+            return
+        append_len = int(context_keys.shape[2])
+        if append_len <= 0:
+            self.offset += int(advance_positions if advance_positions is not None else num_positions)
+            return
+        if positions is None:
+            new_positions = mx.arange(
+                self.offset,
+                self.offset + append_len,
+                dtype=mx.int32,
+            )
+        else:
+            if int(positions.shape[0]) != append_len:
+                raise ValueError(
+                    f"positions length {positions.shape[0]} does not match cache append length {append_len}"
+                )
+            new_positions = positions
+        self._key_segments.append(context_keys)
+        self._value_segments.append(context_values)
+        self._position_segments.append(new_positions)
+        self.offset += int(advance_positions if advance_positions is not None else num_positions)
+
+    def context_spans_to_append(self, num_positions: int) -> list[tuple[int, int]]:
+        num_positions = int(num_positions)
+        if num_positions <= 0:
+            return []
+        return [(0, num_positions)]
+
+    def fetch(self) -> tuple[Optional[mx.array], Optional[mx.array]]:
+        if not self._key_segments:
+            return None, None
+        if len(self._key_segments) == 1:
+            return self._key_segments[0], self._value_segments[0]
+        return (
+            mx.concatenate(self._key_segments, axis=2),
+            mx.concatenate(self._value_segments, axis=2),
+        )
+
+    def segments(self) -> tuple[tuple[mx.array, ...], tuple[mx.array, ...], tuple[mx.array, ...]]:
+        return (
+            tuple(self._key_segments),
+            tuple(self._value_segments),
+            tuple(self._position_segments),
+        )
+
+    def position_indices(self) -> Optional[mx.array]:
+        if not self._position_segments:
+            return None
+        if len(self._position_segments) == 1:
+            return self._position_segments[0]
+        return mx.concatenate(self._position_segments, axis=0)
+
+    def cache_length(self) -> int:
+        return sum(int(segment.shape[2]) for segment in self._key_segments)
+
+
 @dataclass
 class DFlashDraftModelArgs:
     model_type: str
@@ -139,16 +239,56 @@ class DFlashDraftModelArgs:
     rope_scaling: Optional[dict[str, Any]] = None
     layer_types: tuple[str, ...] = ()
     sliding_window: Optional[int] = None
+    sliding_window_pattern: Optional[int] = None
     dflash_config: dict[str, Any] | None = None
 
     @classmethod
     def from_dict(cls, params: dict[str, Any]) -> "DFlashDraftModelArgs":
         data = dict(params)
-        data["layer_types"] = tuple(data.get("layer_types") or ())
+        layer_types = tuple(data.get("layer_types") or ())
+        if not layer_types and "num_hidden_layers" in data:
+            layer_types = _default_draft_layer_types(
+                model_type=str(data.get("model_type", "")),
+                num_hidden_layers=int(data["num_hidden_layers"]),
+                sliding_window_pattern=data.get("sliding_window_pattern"),
+            )
+            if (
+                _is_gemma4_model_type(str(data.get("model_type", "")))
+                and "sliding_window" not in data
+                and "sliding_attention" in layer_types
+            ):
+                data["sliding_window"] = _GEMMA4_DEFAULT_SLIDING_WINDOW
+        data["layer_types"] = layer_types
         data["dflash_config"] = dict(data.get("dflash_config") or {})
         return cls(
             **{key: value for key, value in data.items() if key in cls.__annotations__}
         )
+
+    def __post_init__(self) -> None:
+        layer_types = tuple(self.layer_types or ())
+        if not layer_types:
+            layer_types = _default_draft_layer_types(
+                model_type=self.model_type,
+                num_hidden_layers=int(self.num_hidden_layers),
+                sliding_window_pattern=self.sliding_window_pattern,
+            )
+            if (
+                _is_gemma4_model_type(self.model_type)
+                and self.sliding_window is None
+                and "sliding_attention" in layer_types
+            ):
+                self.sliding_window = _GEMMA4_DEFAULT_SLIDING_WINDOW
+        if len(layer_types) != int(self.num_hidden_layers):
+            raise ValueError(
+                "DFlash draft layer_types length must match num_hidden_layers: "
+                f"{len(layer_types)} != {int(self.num_hidden_layers)}"
+            )
+        unknown = sorted(set(layer_types) - _DRAFT_LAYER_TYPES)
+        if unknown:
+            raise ValueError(f"Unknown DFlash draft layer type(s): {', '.join(unknown)}")
+        if "sliding_attention" in layer_types and int(self.sliding_window or 0) <= 0:
+            raise ValueError("sliding_attention draft layers require a positive sliding_window")
+        self.layer_types = layer_types
 
 class DFlashAttention(nn.Module):
     def __init__(self, args: DFlashDraftModelArgs, layer_idx: int):
@@ -300,7 +440,66 @@ class DFlashAttention(nn.Module):
         ).transpose(0, 2, 1, 3)
 
         if cache is not None:
-            if isinstance(cache, ContextOnlyDraftKVCache):
+            if isinstance(cache, FullContextDraftKVCache):
+                cache_offset = int(cache.offset)
+                query_offset = cache_offset + ctx_len
+                queries = self.rope(queries, offset=query_offset)
+                context_keys, context_values, context_positions = self._rope_context_segments(
+                    context_keys,
+                    context_values,
+                    cache_offset=cache_offset,
+                    spans=context_spans,
+                )
+                noise_keys = self.rope(noise_keys, offset=query_offset)
+
+                cache.append_context(
+                    context_keys,
+                    context_values,
+                    ctx_len,
+                    positions=context_positions,
+                    advance_positions=ctx_len,
+                )
+                key_segments, value_segments, position_segments = cache.segments()
+                key_parts = [*key_segments, noise_keys]
+                value_parts = [*value_segments, noise_values]
+                keys = (
+                    key_parts[0]
+                    if len(key_parts) == 1
+                    else mx.concatenate(key_parts, axis=-2)
+                )
+                values = (
+                    value_parts[0]
+                    if len(value_parts) == 1
+                    else mx.concatenate(value_parts, axis=-2)
+                )
+                mask = None
+                if self.sliding_window is not None:
+                    noise_positions = mx.arange(
+                        query_offset,
+                        query_offset + block_len,
+                        dtype=mx.int32,
+                    )
+                    position_parts = [*position_segments, noise_positions]
+                    key_positions = (
+                        position_parts[0]
+                        if len(position_parts) == 1
+                        else mx.concatenate(position_parts, axis=0)
+                    )
+                    mask = self._attention_mask(
+                        block_len=block_len,
+                        query_offset=query_offset,
+                        key_len=int(keys.shape[-2]),
+                        key_positions=key_positions,
+                    )
+                output = scaled_dot_product_attention(
+                    queries,
+                    keys,
+                    values,
+                    cache=None,
+                    scale=self.scale,
+                    mask=mask,
+                )
+            elif isinstance(cache, ContextOnlyDraftKVCache):
                 cache_offset = int(cache.offset)
                 query_offset = cache_offset + ctx_len
                 queries = self.rope(queries, offset=query_offset)
@@ -447,6 +646,11 @@ class DFlashDraftModel(nn.Module):
         self.hidden_norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.block_size = int(args.block_size)
         self.mask_token_id = int((args.dflash_config or {}).get("mask_token_id", 0) or 0)
+        self.embed_scale = 1.0
+
+    def bind_target_model(self, target_model: Any, *, target_ops: Any) -> None:
+        text_model = target_ops.text_model(target_model)
+        self.embed_scale = getattr(text_model, "embed_scale", 1.0)
 
     def _project_target_hidden(self, target_hidden: mx.array) -> mx.array:
         return self.hidden_norm(self.fc(target_hidden))
@@ -458,7 +662,7 @@ class DFlashDraftModel(nn.Module):
         target_hidden: mx.array,
         cache: Optional[list[Any]] = None,
     ) -> mx.array:
-        hidden_states = noise_embedding
+        hidden_states = noise_embedding * self.embed_scale
         projected_hidden = self._project_target_hidden(target_hidden)
 
         if cache is None:

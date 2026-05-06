@@ -2,6 +2,7 @@
 # Licensed under the Apache License, Version 2.0 - see LICENSE file
 # Based on DFlash (arXiv:2602.06036)
 
+import json
 import re
 import sys
 import time
@@ -157,6 +158,48 @@ def _resolve_draft_quant(draft_quant: str | None) -> DraftQuantSpec | None:
         return None
     return parse_draft_quant_spec(spec)
 
+
+def _draft_lm_head_weight_names(model_path: Path) -> list[str]:
+    index_path = model_path / "model.safetensors.index.json"
+    if index_path.exists():
+        try:
+            payload = json.loads(index_path.read_text())
+            weight_map = payload.get("weight_map", {})
+            return sorted(
+                str(name)
+                for name in weight_map
+                if str(name).startswith("lm_head.")
+            )
+        except Exception:
+            return []
+    try:
+        from safetensors import safe_open
+    except Exception:
+        return []
+    names: list[str] = []
+    for path in sorted(model_path.glob("model*.safetensors")):
+        with safe_open(str(path), framework="mlx") as handle:
+            names.extend(
+                str(name)
+                for name in handle.keys()
+                if str(name).startswith("lm_head.")
+            )
+    return sorted(names)
+
+
+def _raise_if_unsupported_draft_lm_head(model_path: Path, model_ref: str) -> None:
+    lm_head_names = _draft_lm_head_weight_names(model_path)
+    if not lm_head_names:
+        return
+    sample = ", ".join(lm_head_names[:3])
+    if len(lm_head_names) > 3:
+        sample += ", ..."
+    raise ValueError(
+        f"DFlash draft checkpoint '{model_ref}' contains draft-owned lm_head weights "
+        f"({sample}), but this runtime projects draft hidden states through the target "
+        "TargetOps.logits_from_hidden(...) path and does not load a draft lm_head yet."
+    )
+
 def pack_target_model_weights_selective(
     target_model: Any,
     *,
@@ -200,6 +243,7 @@ def load_target_bundle(
     model, tokenizer, config = load(resolved_ref, lazy=lazy, return_config=True)
     target_ops = resolve_target_ops(model)
     target_family = target_ops.family(model)
+    target_capabilities = target_ops.capabilities_for(model)
     if target_family == "hybrid_gdn":
         target_ops.install_speculative_hooks(model)
         target_ops.configure_full_attention_split(
@@ -222,7 +266,10 @@ def load_target_bundle(
             pack_mlp=True,
             pack_attention=pack_attention_weights,
         )
-    verify_linear_enabled = _verify_enabled_for(config, verify_config=verify_config)
+    verify_linear_enabled = (
+        bool(getattr(target_capabilities, "supports_verify_linear", True))
+        and _verify_enabled_for(config, verify_config=verify_config)
+    )
     meta["verify_linear_enabled"] = bool(verify_linear_enabled)
     meta["verify_mode"] = (verify_config.mode if verify_config is not None else "env")
     if verify_linear_enabled:
@@ -234,11 +281,23 @@ def load_target_bundle(
         meta["verify_linear_swapped"] = n_swapped
     return model, tokenizer, meta
 
+
+def _config_value(config: Any, key: str, default: Any = None) -> Any:
+    if isinstance(config, dict):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def _text_config(config: Any) -> Any:
+    return _config_value(config, "text_config", config)
+
+
 def _verify_enabled_for(
     config: Any,
     *,
     verify_config: VerifyConfig | None = None,
 ) -> bool:
+    text_cfg = _text_config(config)
     if verify_config is not None:
         if verify_config.mode == "off":
             return False
@@ -247,12 +306,11 @@ def _verify_enabled_for(
         if override is not None:
             return override
     try:
-        text_cfg = config.get("text_config", config) if isinstance(config, dict) else config
-        num_experts = int(text_cfg.get("num_experts", 0) or 0)
-        num_layers = int(text_cfg.get("num_hidden_layers", 0) or 0)
-        hidden_size = int(text_cfg.get("hidden_size", 0) or 0)
-        num_heads = int(text_cfg.get("num_attention_heads", 0) or 0)
-        num_kv_heads = int(text_cfg.get("num_key_value_heads", 0) or 0)
+        num_experts = int(_config_value(text_cfg, "num_experts", 0) or 0)
+        num_layers = int(_config_value(text_cfg, "num_hidden_layers", 0) or 0)
+        hidden_size = int(_config_value(text_cfg, "hidden_size", 0) or 0)
+        num_heads = int(_config_value(text_cfg, "num_attention_heads", 0) or 0)
+        num_kv_heads = int(_config_value(text_cfg, "num_key_value_heads", 0) or 0)
     except Exception:
         return False
     if num_experts > 0:
@@ -279,6 +337,7 @@ def load_draft_bundle(
 ):
     resolved_ref = resolve_model_ref(model_ref, kind="draft")
     model_path = _resolve_local_model_path(resolved_ref)
+    _raise_if_unsupported_draft_lm_head(model_path, str(resolved_ref))
     model, config = load_model(
         model_path,
         lazy=lazy,

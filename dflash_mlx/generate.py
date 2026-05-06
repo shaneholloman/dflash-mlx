@@ -10,6 +10,7 @@ from collections.abc import Sequence
 from typing import Any, Optional
 
 from dflash_mlx.metal_limits import apply_metal_limits
+from dflash_mlx.engine.target_ops import bind_draft_to_target, resolve_target_ops
 from dflash_mlx.runtime import (
     VerifyConfig,
     get_stop_token_ids,
@@ -30,6 +31,8 @@ DRAFT_REGISTRY = {
     "Qwen3.6-35B-A3B": "z-lab/Qwen3.6-35B-A3B-DFlash",
     "Qwen3-4B": "z-lab/Qwen3-4B-DFlash-b16",
     "Qwen3-8B": "z-lab/Qwen3-8B-DFlash-b16",
+    "gemma-4-31b-it": "z-lab/gemma-4-31B-it-DFlash",
+    "gemma-4-26b-a4b-it": "z-lab/gemma-4-26B-A4B-it-DFlash",
 }
 
 _NORMALIZED_DRAFT_REGISTRY = {
@@ -101,10 +104,14 @@ def load_runtime_components(
     )
     try:
         draft_model, _ = load_draft_bundle(resolved_draft_ref, lazy=True, draft_quant=draft_quant)
+    except ValueError:
+        raise
     except Exception as exc:
         raise ValueError(
             f"Failed to load DFlash draft model '{resolved_draft_ref}' for '{model_ref}'."
         ) from exc
+    target_ops = resolve_target_ops(target_model)
+    bind_draft_to_target(draft_model, target_model, target_ops=target_ops)
     return target_model, tokenizer, draft_model, resolved_draft_ref
 
 def run_generate(

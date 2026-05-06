@@ -29,7 +29,7 @@ from dflash_mlx.engine.config import (
     resolve_verify_len_cap,
     verify_token_count_for_block,
 )
-from dflash_mlx.engine.target_ops import resolve_target_ops
+from dflash_mlx.engine.target_ops import bind_draft_to_target, resolve_target_ops
 from dflash_mlx.model import DFlashDraftModel
 from dflash_mlx.engine.memory_waterfall import (
     collect_memory_waterfall as _collect_memory_waterfall,
@@ -63,6 +63,11 @@ def stream_dflash_generate_impl(
         greedy_tokens_with_mask,
     )
     target_ops = resolve_target_ops(target_model)
+    bind_draft_to_target(draft_model, target_model, target_ops=target_ops)
+    target_capabilities = target_ops.capabilities_for(target_model)
+    supports_prefix_snapshot = bool(
+        getattr(target_capabilities, "supports_prefix_snapshot", True)
+    )
     if quantize_kv_cache:
         target_ops.configure_full_attention_split(target_model, enabled=False)
 
@@ -109,6 +114,8 @@ def stream_dflash_generate_impl(
     draft_backend = make_draft_backend()
 
     snap_prefix_len = _validate_prefix_snapshot(prefix_snapshot, prompt_tokens)
+    if not supports_prefix_snapshot:
+        snap_prefix_len = 0
     if snap_prefix_len > 0 and (quantize_kv_cache or target_fa_window > 0):
         snap_prefix_len = 0
     if snap_prefix_len > 0:
@@ -323,27 +330,28 @@ def stream_dflash_generate_impl(
         if hasattr(mx, "clear_cache"):
             mx.clear_cache()
 
-        _pre_yield = _yield_start()
-        yield {
-            "event": "prefill_snapshot_ready",
-            "token_ids": list(prompt_tokens[:snapshot_boundary]),
-            "target_cache": target_cache,
-            "target_hidden": target_hidden[:, :snapshot_boundary, :] if target_hidden is not None else None,
-            "last_logits": prefill_logits[:, -1, :] if prefill_logits is not None else None,
-            "from_snapshot": bool(snap_prefix_len > 0),
-            "snap_prefix_len": snap_prefix_len,
-            "snapshot_boundary": snapshot_boundary,
-        }
-        _yield_done(_pre_yield)
-        evt = _waterfall_event(
-            "after_prefill_snapshot_ready",
-            target_hidden_value=target_hidden,
-            extra={"snapshot_boundary": int(snapshot_boundary)},
-        )
-        if evt is not None:
+        if supports_prefix_snapshot:
             _pre_yield = _yield_start()
-            yield evt
+            yield {
+                "event": "prefill_snapshot_ready",
+                "token_ids": list(prompt_tokens[:snapshot_boundary]),
+                "target_cache": target_cache,
+                "target_hidden": target_hidden[:, :snapshot_boundary, :] if target_hidden is not None else None,
+                "last_logits": prefill_logits[:, -1, :] if prefill_logits is not None else None,
+                "from_snapshot": bool(snap_prefix_len > 0),
+                "snap_prefix_len": snap_prefix_len,
+                "snapshot_boundary": snapshot_boundary,
+            }
             _yield_done(_pre_yield)
+            evt = _waterfall_event(
+                "after_prefill_snapshot_ready",
+                target_hidden_value=target_hidden,
+                extra={"snapshot_boundary": int(snapshot_boundary)},
+            )
+            if evt is not None:
+                _pre_yield = _yield_start()
+                yield evt
+                _yield_done(_pre_yield)
 
         if snapshot_boundary < prompt_len:
             if profile_cycles:
@@ -390,7 +398,9 @@ def stream_dflash_generate_impl(
 
         prefill_ns = time.perf_counter_ns() - prefill_start_ns
 
-        prefill_target_hidden_for_snapshot = target_hidden
+        prefill_target_hidden_for_snapshot = (
+            target_hidden if supports_prefix_snapshot else None
+        )
         gen_hidden_chunks: list[mx.array] = []
         last_cycle_logits: Optional[mx.array] = None
 
@@ -613,7 +623,8 @@ def stream_dflash_generate_impl(
             commit_start_ns = time.perf_counter_ns()
             start += commit_count
             target_hidden = committed_hidden
-            gen_hidden_chunks.append(committed_hidden)
+            if supports_prefix_snapshot:
+                gen_hidden_chunks.append(committed_hidden)
             last_cycle_logits = verify_logits[:, acceptance_len, :]
             replay_cycle_ns = target_ops.restore_after_acceptance(
                 target_cache,
@@ -741,7 +752,8 @@ def stream_dflash_generate_impl(
                 profile_totals_ns["cycle_total"] += cycle_total_ns
 
         if (
-            generated_token_ids
+            supports_prefix_snapshot
+            and generated_token_ids
             and prefill_target_hidden_for_snapshot is not None
             and gen_hidden_chunks
         ):

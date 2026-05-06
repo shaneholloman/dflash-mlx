@@ -21,6 +21,9 @@ class _FakeTargetOps:
     def __init__(self) -> None:
         self.forward_lengths: list[int] = []
 
+    def capabilities_for(self, _target_model):
+        return SimpleNamespace(supports_prefix_snapshot=True)
+
     def make_cache(self, *_args, **_kwargs):
         return []
 

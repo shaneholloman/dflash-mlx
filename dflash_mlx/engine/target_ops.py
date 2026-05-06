@@ -19,6 +19,7 @@ class TargetCapabilities:
     supports_rotating_cache_snapshot: bool
     supports_shared_kv: bool
     supports_target_hidden_capture: bool
+    supports_verify_linear: bool = True
 
 class TargetOps(Protocol):
     backend_name: str
@@ -100,6 +101,7 @@ class TargetOps(Protocol):
 
 TARGET_BACKENDS = [
     "dflash_mlx.engine.target_qwen_gdn:QwenGdnTargetOps",
+    "dflash_mlx.engine.target_gemma4:Gemma4TargetOps",
 ]
 
 def _load_backend_class(path: str) -> type[TargetOps]:
@@ -127,3 +129,15 @@ def resolve_target_ops(target_model: Any) -> TargetOps:
         f"model_class={model_class}, "
         f"supported target backends: {supported}"
     )
+
+def bind_draft_to_target(
+    draft_model: Any,
+    target_model: Any,
+    *,
+    target_ops: TargetOps | None = None,
+) -> TargetOps:
+    resolved_ops = target_ops if target_ops is not None else resolve_target_ops(target_model)
+    bind_target = getattr(draft_model, "bind_target_model", None)
+    if bind_target is not None:
+        bind_target(target_model, target_ops=resolved_ops)
+    return resolved_ops

@@ -36,8 +36,8 @@ can optionally load a model.
 
 ## Supported Model Shape
 
-The live registry is explicit and Qwen-focused. A target must resolve to a
-matching DFlash draft through `DRAFT_REGISTRY` or through `--draft`.
+The live registry is explicit. A target must resolve to a matching DFlash draft
+through `DRAFT_REGISTRY` or through `--draft`.
 
 If no draft resolves, loading fails. This runtime does not silently become a
 generic no-draft MLX server. The server does have a short-output AR fast path for
@@ -45,14 +45,12 @@ small `max_tokens` requests, controlled by `--fastpath-max-tokens` (default
 `256`, `0` disables), but that is a serving policy after a valid runtime has
 already loaded.
 
-The current DFlash draft class is `DFlashDraftModel`, a Qwen-style draft model.
-The target verifier is owned by `engine.target_ops` and the current concrete
-implementation is `engine.target_qwen_gdn`. It is still Qwen-focused: it owns the
-Qwen/Qwen3.5/Qwen3.6 target cache layout, hidden capture, logits projection,
-GDN rollback/tape policy, and target hook installation.
+The current DFlash draft class is `DFlashDraftModel`. Target-family behavior is
+owned by `engine.target_ops`; the registered concrete implementations are
+`engine.target_qwen_gdn` and `engine.target_gemma4`.
 
-Adding Gemma or another architecture is a real adapter project, not just a new
-registry row. The required future seam for more architectures is:
+Adding another architecture is a real adapter project, not just a new registry
+row. The required seam for more architectures is:
 
 - target adapter: embeddings, layer loop, hidden capture points, logits
   post-processing, masks, and cache construction;
@@ -61,8 +59,9 @@ registry row. The required future seam for more architectures is:
 - cache adapter: active cache type, rollback behavior, and snapshot codec;
 - parity tests: adapter logits must match the model's own MLX forward path.
 
-Gemma/Llama support is not currently claimed. A future adapter must prove load
-and parity before it becomes a product-supported target.
+Gemma4 is supported through its own adapter. Prefix snapshots stay disabled for
+Gemma4 until snapshot parity is proven. Future adapters must prove load and
+parity before becoming product-supported targets.
 
 Contributor workflow for a future target family is documented in
 [`docs/model_backend.md`](model_backend.md).

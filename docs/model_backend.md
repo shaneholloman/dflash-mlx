@@ -1,8 +1,8 @@
 # Model Backend Guide
 
 This runtime keeps model-family details behind engine-level target backends. The
-current backend is Qwen-focused and lives under `dflash_mlx/engine/`; this is not
-a top-level plugin framework.
+backends live under `dflash_mlx/engine/`; this is not a top-level plugin
+framework.
 
 ## What is a TargetOps backend?
 
@@ -23,8 +23,10 @@ A backend owns:
 - rollback, trim, or no-op cache transaction behavior;
 - model-specific capability reporting through `capabilities_for(...)`.
 
-The current registered backend is `QwenGdnTargetOps` in
-`dflash_mlx/engine/target_qwen_gdn.py`.
+The current registered backends are:
+
+- `QwenGdnTargetOps` in `dflash_mlx/engine/target_qwen_gdn.py`;
+- `Gemma4TargetOps` in `dflash_mlx/engine/target_gemma4.py`.
 
 ## When do you need a new backend?
 
@@ -39,9 +41,7 @@ KV behavior, or rollback policy.
 Examples that need a real backend before product support:
 
 - Llama with sliding/full attention cache rules;
-- Gemma with logits softcap;
-- Gemma4 with sliding/full attention, shared KV, per-layer inputs, K=V variants,
-  and family-specific logits handling.
+- future Gemma variants with different cache or logits rules.
 
 ## How to add a model family
 
@@ -73,7 +73,7 @@ Examples that need a real backend before product support:
   defaults;
 - text-model unwrap, embeddings, logits, cache, hidden capture, verify, and
   rollback are implemented;
-- resolver rejects unsupported Gemma/Llama/Mistral/unknown models until their
+- resolver rejects unsupported Llama/Mistral/unknown models until their
   backend exists;
 - cache tests cover expected cache entry types;
 - parity tests pass before README or product claims change.

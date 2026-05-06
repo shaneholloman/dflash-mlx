@@ -35,6 +35,10 @@ def test_models_command_lists_draft_registry(capsys):
     out = capsys.readouterr().out
     assert "Qwen3.6-27B" in out
     assert "z-lab/Qwen3.6-27B-DFlash" in out
+    assert "gemma-4-31b-it" in out
+    assert "z-lab/gemma-4-31B-it-DFlash" in out
+    assert "gemma-4-26b-a4b-it" in out
+    assert "z-lab/gemma-4-26B-A4B-it-DFlash" in out
 
 @pytest.mark.parametrize(
     "argv,module_name,prog,forwarded",

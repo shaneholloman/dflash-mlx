@@ -21,12 +21,17 @@ def _large_dense_config() -> dict:
         "num_experts": 0,
     }
 
-def _pure_attention_ops():
+
+def _pure_attention_ops(*, supports_verify_linear: bool = True):
     return SimpleNamespace(
         family=lambda model: "pure_attention",
+        capabilities_for=lambda model: SimpleNamespace(
+            supports_verify_linear=supports_verify_linear,
+        ),
         install_speculative_hooks=lambda model: None,
         configure_full_attention_split=lambda model, **kwargs: None,
     )
+
 
 def test_verify_config_off_disables_target_verify_linears(monkeypatch):
     calls: list[bool | None] = []
@@ -107,6 +112,37 @@ def test_verify_config_none_preserves_internal_env_override(monkeypatch):
     )
 
     _, _, meta = runtime.load_target_bundle("model", verify_config=None)
+
+    assert meta["verify_linear_enabled"] is False
+    assert calls == []
+
+def test_target_capability_can_disable_verify_linear_before_parity(monkeypatch):
+    calls: list[bool | None] = []
+
+    monkeypatch.setenv("DFLASH_VERIFY_LINEAR", "1")
+    monkeypatch.setattr(
+        runtime,
+        "load",
+        lambda *args, **kwargs: (object(), object(), _large_dense_config()),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "resolve_target_ops",
+        lambda model: _pure_attention_ops(supports_verify_linear=False),
+    )
+
+    import dflash_mlx.verify_linear as verify_linear
+
+    monkeypatch.setattr(
+        verify_linear,
+        "install_verify_linears",
+        lambda model, *, enable_qmm=None, predicate=None: calls.append(enable_qmm) or 1,
+    )
+
+    _, _, meta = runtime.load_target_bundle(
+        "model",
+        verify_config=VerifyConfig.from_mode("auto"),
+    )
 
     assert meta["verify_linear_enabled"] is False
     assert calls == []

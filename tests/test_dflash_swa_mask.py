@@ -34,6 +34,7 @@ def _args(**overrides):
     base.update(overrides)
     return DFlashDraftModelArgs(**base)
 
+
 def test_dflash_attention_marks_only_sliding_layers():
     model = DFlashDraftModel(_args())
 
