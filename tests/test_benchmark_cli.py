@@ -791,6 +791,7 @@ def test_public_docs_mention_artifact_policy_and_public_commands():
     )
     assert "dflash serve --diagnostics basic" in docs
     assert "dflash serve --diagnostics full" in docs
-    assert "dflash benchmark --suite smoke" in docs
+    assert "--prompt \"$PROMPT\"" in docs
+    assert "`smoke` is a CLI sanity" in docs
     assert ".artifacts/dflash/diagnostics" in docs
     assert ".artifacts/dflash/benchmarks" in docs

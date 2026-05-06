@@ -95,9 +95,6 @@ dflash benchmark \
   --repeat 3 \
   --cooldown 60 \
   --no-eos
-
-# Quick sanity check, not a benchmark claim
-dflash benchmark --suite smoke --model Qwen/Qwen3.5-4B
 ```
 
 Send a request:

@@ -145,19 +145,28 @@ Flags:
 | `--draft-window-size INT` | draft cache rolling window tokens |
 | `--verify-len-cap INT` | max tokens per verify forward |
 
-Generate disables cross-request prefix caching. Use it for smoke tests, not for
+Generate disables cross-request prefix caching. Use it for local sanity checks, not for
 benchmark claims.
 
 ## `dflash benchmark`
 
 ```bash
-dflash benchmark --suite smoke --model Qwen/Qwen3.5-4B --max-tokens 64
+PROMPT='The function $f$ satisfies the functional equation \[ f(x) + f(y) = f(x + y) - xy - 1 \] for all real numbers $x$ and $y$. If $f(1) = 1$, then find all integers $n$ such that $f(n) = n$. Enter all such integers, separated by commas. Please reason step by step, and put your final answer within \boxed{}.'
+
+dflash benchmark \
+  --model Qwen/Qwen3.5-9B \
+  --prompt "$PROMPT" \
+  --max-tokens 1024 \
+  --repeat 3 \
+  --cooldown 60 \
+  --no-eos
 ```
 
 `dflash benchmark` measures runtime behavior only. `humaneval`, `gsm8k`, and
 `math500` load real Hugging Face datasets via the optional `datasets` package,
-but they are not official accuracy evaluations. `smoke` and `longctx` are
-local/offline. Use `--prompt-file PATH` for offline/custom prompt JSONL.
+but they are not official accuracy evaluations. `smoke` is a local CLI sanity
+check only; `longctx` is local/offline synthetic context stress. Use
+`--prompt-file PATH` for offline/custom prompt JSONL.
 
 Flags:
 

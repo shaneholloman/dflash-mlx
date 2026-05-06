@@ -162,7 +162,7 @@ def _build_turn_prompts(tokenizer: Any, n_turns: int, system_target_tokens: int)
     user_turns = [
         "User: What is a kernel in GPU programming?",
         "User: How does kernel fusion reduce memory bandwidth pressure?",
-        "User: Explain speculative decoding in one paragraph.",
+        "User: Solve the same functional equation benchmark prompt in one paragraph.",
         "User: What's the difference between prefill and decode phases?",
         "User: Show a simple Metal kernel for a vector add.",
         "User: Why do we use GQA instead of full multi-head attention?",

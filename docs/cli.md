@@ -54,12 +54,14 @@ See [runtime-flags.md](runtime-flags.md) for the full flag surface.
 One prompt, no server:
 
 ```bash
+PROMPT='The function $f$ satisfies the functional equation \[ f(x) + f(y) = f(x + y) - xy - 1 \] for all real numbers $x$ and $y$. If $f(1) = 1$, then find all integers $n$ such that $f(n) = n$. Enter all such integers, separated by commas. Please reason step by step, and put your final answer within \boxed{}.'
+
 dflash generate \
   --model Qwen/Qwen3.5-4B \
-  --prompt "Explain speculative decoding in two paragraphs."
+  --prompt "$PROMPT"
 ```
 
-This path is for smoke checks. It does not enable cross-request prefix cache and
+This path is for local sanity checks. It does not enable cross-request prefix cache and
 should not be used for public performance claims.
 
 ## Benchmark
@@ -67,10 +69,15 @@ should not be used for public performance claims.
 Public local baseline-vs-DFlash runtime benchmark:
 
 ```bash
+PROMPT='The function $f$ satisfies the functional equation \[ f(x) + f(y) = f(x + y) - xy - 1 \] for all real numbers $x$ and $y$. If $f(1) = 1$, then find all integers $n$ such that $f(n) = n$. Enter all such integers, separated by commas. Please reason step by step, and put your final answer within \boxed{}.'
+
 dflash benchmark \
-  --suite smoke \
-  --model Qwen/Qwen3.5-4B \
-  --max-tokens 64
+  --model Qwen/Qwen3.5-9B \
+  --prompt "$PROMPT" \
+  --max-tokens 1024 \
+  --repeat 3 \
+  --cooldown 60 \
+  --no-eos
 ```
 
 Outputs default to:
@@ -91,7 +98,8 @@ dflash benchmark --suite longctx --ctx-tokens 65536 --model Qwen/Qwen3.5-4B
 `humaneval`, `gsm8k`, and `math500` load real Hugging Face datasets through the
 optional `datasets` package (`pip install 'dflash-mlx[bench]'`). They are runtime
 prompt suites, not official accuracy scoring. First use may download/cache
-dataset rows. `smoke` and `longctx` are local/offline.
+dataset rows. `smoke` and `longctx` are local/offline; `smoke` is a CLI sanity
+check only, not a performance claim.
 
 Offline/custom prompts:
 
@@ -192,7 +200,7 @@ dflash serve \
   --prefix-cache-l2-dir .artifacts/dflash/prefix-l2
 ```
 
-Synthetic 64k public smoke:
+Synthetic 64k context stress:
 
 ```bash
 dflash benchmark \

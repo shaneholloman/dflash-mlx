@@ -6,7 +6,15 @@ separate from product claims.
 ## Public Runtime Benchmark
 
 ```bash
-dflash benchmark --suite smoke --model Qwen/Qwen3.5-4B
+PROMPT='The function $f$ satisfies the functional equation \[ f(x) + f(y) = f(x + y) - xy - 1 \] for all real numbers $x$ and $y$. If $f(1) = 1$, then find all integers $n$ such that $f(n) = n$. Enter all such integers, separated by commas. Please reason step by step, and put your final answer within \boxed{}.'
+
+dflash benchmark \
+  --model Qwen/Qwen3.5-9B \
+  --prompt "$PROMPT" \
+  --max-tokens 1024 \
+  --repeat 3 \
+  --cooldown 60 \
+  --no-eos
 ```
 
 Default protocol:
@@ -26,7 +34,7 @@ agentic benchmark and not an accuracy leaderboard.
 
 | Suite | Purpose | Default limit |
 | --- | --- | ---: |
-| `smoke` | cheap sanity check, closest to the original benchmark prompt | 1 |
+| `smoke` | cheap CLI sanity check only, not a performance claim | 1 |
 | `humaneval` | `openai_humaneval`, split `test`, field `prompt` | 10 |
 | `gsm8k` | `gsm8k`, config `main`, split `test`, formatted as question/answer | 10 |
 | `math500` | `HuggingFaceH4/MATH-500`, split `test`, formatted as problem/solution | 10 |
@@ -39,8 +47,9 @@ they measure DFlash speed, memory, acceptance, and cache behavior on familiar
 prompt shapes. They do not report official HumanEval pass@1, GSM8K exact match,
 Math500 accuracy, or any other accuracy score.
 
-`smoke` and `longctx` remain local/offline. No hand-written fake benchmark
-prompts are embedded for `humaneval`, `gsm8k`, or `math500`.
+`smoke` and `longctx` remain local/offline. `smoke` exists to catch broken CLI,
+model loading, tokenizer, and artifact plumbing. Do not use it for published
+performance numbers.
 
 ## Important Defaults
 
@@ -56,6 +65,11 @@ prompts are embedded for `humaneval`, `gsm8k`, or `math500`.
 | memory summary | enabled |
 | split-SDPA in benchmark | enabled |
 | output dir | `.artifacts/dflash/benchmarks/<timestamp>-<suite>-<model>` |
+
+The default `dflash benchmark` invocation uses `smoke`; that is intentionally a
+sanity check. For comparable numbers, pass an explicit `--prompt` or a real
+runtime suite, plus `--repeat`, `--cooldown`, and `--no-eos` when you need a
+fixed generation length.
 
 `--suite longctx --ctx-tokens INT` builds an approximate synthetic long-context
 prompt. It is useful for cheap stress testing, but it is not the same as a real
@@ -132,7 +146,7 @@ environment.
 
 Rules:
 
-- use `dflash benchmark` first for public smoke checks;
+- use an explicit prompt or real runtime suite for performance claims;
 - use lab harnesses to answer one specific mechanism question;
 - do not compare numbers from different harnesses as if they were one protocol;
 - do not use full cycle tracing for performance claims;
@@ -140,10 +154,18 @@ Rules:
 
 ## Good Command Patterns
 
-Small smoke:
+Canonical fixed-prompt run:
 
 ```bash
-dflash benchmark --suite smoke --model Qwen/Qwen3.5-4B --max-tokens 64
+PROMPT='The function $f$ satisfies the functional equation \[ f(x) + f(y) = f(x + y) - xy - 1 \] for all real numbers $x$ and $y$. If $f(1) = 1$, then find all integers $n$ such that $f(n) = n$. Enter all such integers, separated by commas. Please reason step by step, and put your final answer within \boxed{}.'
+
+dflash benchmark \
+  --model Qwen/Qwen3.5-9B \
+  --prompt "$PROMPT" \
+  --max-tokens 1024 \
+  --repeat 3 \
+  --cooldown 60 \
+  --no-eos
 ```
 
 HumanEval-style runtime prompts:
@@ -168,8 +190,8 @@ Fixed-length decode:
 
 ```bash
 dflash benchmark \
-  --suite smoke \
   --model Qwen/Qwen3.5-4B \
+  --prompt "$PROMPT" \
   --max-tokens 128 \
   --no-eos
 ```
@@ -202,8 +224,8 @@ Low-memory runtime check:
 
 ```bash
 dflash benchmark \
-  --suite smoke \
   --model Qwen/Qwen3.5-4B \
+  --prompt "$PROMPT" \
   --draft-sink-size 64 \
   --draft-window-size 1024 \
   --verify-len-cap 0 \

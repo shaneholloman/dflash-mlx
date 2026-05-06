@@ -13,7 +13,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-DEFAULT_PROMPT = "Explain speculative decoding in two paragraphs."
+DEFAULT_PROMPT = (
+    r"The function $f$ satisfies the functional equation \[ f(x) + f(y) = f(x + y) - xy - 1 \] "
+    r"for all real numbers $x$ and $y$. If $f(1) = 1$, then find all integers $n$ such that "
+    r"$f(n) = n$. Enter all such integers, separated by commas. Please reason step by step, "
+    r"and put your final answer within \boxed{}."
+)
 DEFAULT_CONTEXT_SEED = (
     "DFlash benchmark long-context filler. The task is to preserve distant "
     "context while generating a concise answer at the end.\n"
