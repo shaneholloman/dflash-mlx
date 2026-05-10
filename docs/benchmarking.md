@@ -57,6 +57,7 @@ performance numbers.
 | --- | --- |
 | suite | `smoke` |
 | prompt limit | `1` for `smoke`/`longctx`, `10` otherwise |
+| target model | required via `--model` |
 | chat template | enabled |
 | generated tokens | `64` |
 | block tokens | `16` |
@@ -96,7 +97,7 @@ selected row indices, and selected prompt ids.
 | `--block-tokens INT` | DFlash verify block size |
 | `--repeat INT` | measured runs |
 | `--cooldown SECONDS` | sleep between runs |
-| `--model REF_OR_PATH` | target model |
+| `--model REF_OR_PATH` | target model; required |
 | `--draft REF_OR_PATH` | draft override |
 | `--no-chat-template` | raw prompt text |
 | `--draft-quant SPEC` | draft quantization override, e.g. `w4:gs64`; use `none` to disable model defaults |

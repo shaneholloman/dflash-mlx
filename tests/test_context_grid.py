@@ -116,6 +116,7 @@ def test_render_markdown_emits_comparison_and_raw_rows():
 
 def test_run_grid_writes_incremental_rows_and_gates_diverged_compare(monkeypatch, tmp_path):
     order = []
+    bundle_kwargs = {}
     tokenizer = FakeTokenizer()
     bundle = SimpleNamespace(
         target_model=object(),
@@ -132,7 +133,11 @@ def test_run_grid_writes_incremental_rows_and_gates_diverged_compare(monkeypatch
         "_load_pristine_target_bundle",
         lambda _target: (object(), tokenizer, {"resolved_model_ref": "target"}),
     )
-    monkeypatch.setattr(context_grid, "load_runtime_bundle", lambda **_kwargs: bundle)
+    def fake_load_runtime_bundle(**kwargs):
+        bundle_kwargs.update(kwargs)
+        return bundle
+
+    monkeypatch.setattr(context_grid, "load_runtime_bundle", fake_load_runtime_bundle)
     monkeypatch.setattr(context_grid, "get_stop_token_ids", lambda _tokenizer: [0])
     release_calls = []
     monkeypatch.setattr(context_grid, "_release_loaded_models", lambda: release_calls.append("release"))
@@ -192,6 +197,9 @@ def test_run_grid_writes_incremental_rows_and_gates_diverged_compare(monkeypatch
             "--cooldown",
             "0",
             "--clear-cache-between-cases",
+            "--verify-mode",
+            "adaptive",
+            "--split-sdpa",
             "--out",
             str(tmp_path / "grid"),
         ]
@@ -215,6 +223,11 @@ def test_run_grid_writes_incremental_rows_and_gates_diverged_compare(monkeypatch
     assert summary["metadata"]["cleanup_policy"] == "clear_between_cases"
     assert summary["comparison"][0]["compare_status"] == "diverged"
     assert summary["comparison"][0]["dflash_wall_ratio"] is None
+    assert bundle_kwargs["verify_config"].mode == "adaptive"
+    assert bundle_kwargs["split_full_attention_sdpa"] is True
+    manifest = json.loads((tmp_path / "grid" / "manifest.json").read_text())
+    assert manifest["effective_config"]["verify_mode"] == "adaptive"
+    assert manifest["effective_config"]["split_sdpa"] is True
 
 
 def test_memory_sampler_ignores_first_stale_mlx_peak(monkeypatch):

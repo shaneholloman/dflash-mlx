@@ -50,6 +50,11 @@ dflash serve \
 Split-SDPA defaults are target-policy auto in both `serve` and `benchmark`; use
 `--split-sdpa` or `--no-split-sdpa` only for an explicit A/B.
 
+`POST /v1/responses` is supported as a minimal non-streaming adapter for text
+input and function-call tools. Streaming, reasoning/text/truncation controls,
+and persistent response storage are not implemented; use
+`/v1/chat/completions` for streaming.
+
 See [runtime-flags.md](runtime-flags.md) for the full flag surface.
 
 ## Generate
@@ -107,7 +112,7 @@ check only, not a performance claim.
 Offline/custom prompts:
 
 ```bash
-dflash benchmark --suite gsm8k --prompt-file data/gsm8k_sample.jsonl --limit 100
+dflash benchmark --suite gsm8k --prompt-file data/gsm8k_sample.jsonl --limit 100 --model Qwen/Qwen3.5-4B
 ```
 
 See [benchmarking.md](benchmarking.md) for protocol and artifact details.

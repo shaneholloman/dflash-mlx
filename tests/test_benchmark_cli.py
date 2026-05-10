@@ -65,7 +65,7 @@ def test_benchmark_help_documents_public_flags(capsys):
         "--cooldown SECONDS",
         "Sleep between measured runs. Default: 10.",
         "--model HF_REF_OR_PATH",
-        "Target model. Default: auto-resolved default target.",
+        "Target model. Required.",
         "--draft HF_REF_OR_PATH",
         "DFlash draft model. Default: auto-resolved from target.",
         "--no-chat-template",
@@ -136,6 +136,17 @@ def test_benchmark_cli_reports_offline_runtime_validation_cleanly(capsys):
     assert "draft_window_size" not in err
     assert "Traceback" not in err
 
+
+def test_benchmark_cli_requires_model_without_traceback(capsys):
+    with pytest.raises(SystemExit) as exc:
+        benchmark.main(["--max-tokens", "1"], prog="dflash benchmark")
+
+    err = capsys.readouterr().err
+    assert exc.value.code == 2
+    assert "--model" in err
+    assert "Traceback" not in err
+
+
 def test_benchmark_invocation_records_explicit_and_effective_values():
     parser = benchmark.build_parser()
     args = parser.parse_args(
@@ -171,6 +182,7 @@ def test_benchmark_invocation_records_explicit_and_effective_values():
     config = {
         "model": "resolved-target",
         "draft": "resolved-draft",
+        "draft_quant": "w4",
     }
     invocation = benchmark._build_invocation(
         args,
@@ -231,6 +243,7 @@ def test_benchmark_invocation_records_explicit_and_effective_values():
     assert invocation["effective"]["seed"] == 0
     assert invocation["effective"]["include_memory"] is False
     assert invocation["effective"]["use_chat_template"] is False
+    assert invocation["effective"]["draft_quant"] == "w4"
     assert invocation["effective"]["split_sdpa"] is False
 
 def test_benchmark_default_output_dir_is_artifact_root(monkeypatch, tmp_path):

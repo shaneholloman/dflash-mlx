@@ -81,26 +81,16 @@ def test_responses_message_list_and_text_blocks_map_to_chat_messages():
     ]
 
 
-def test_responses_unknown_harmless_fields_are_ignored():
+def test_responses_metadata_is_ignored():
     chat = responses_to_chat_body(
         {
             "model": "target",
             "input": "hello",
             "metadata": {"trace": "x"},
-            "reasoning": {"effort": "low"},
-            "text": {"format": {"type": "text"}},
-            "truncation": "auto",
-            "previous_response_id": "resp_old",
-            "store": False,
         }
     )
 
     assert "metadata" not in chat
-    assert "reasoning" not in chat
-    assert "text" not in chat
-    assert "truncation" not in chat
-    assert "previous_response_id" not in chat
-    assert "store" not in chat
 
 
 def test_responses_sampling_fields_passthrough():
@@ -160,9 +150,14 @@ def test_responses_function_tools_map_to_chat_tools():
     [
         ("tool_choice", "auto", "tool_choice is not implemented"),
         ("parallel_tool_calls", True, "parallel_tool_calls is not implemented"),
+        ("previous_response_id", "resp_old", "previous_response_id is not implemented"),
+        ("store", False, "store is not implemented"),
+        ("reasoning", {"effort": "low"}, "reasoning is not implemented"),
+        ("text", {"format": {"type": "text"}}, "text is not implemented"),
+        ("truncation", "auto", "truncation is not implemented"),
     ],
 )
-def test_responses_unenforced_tool_controls_are_rejected(field, value, error):
+def test_responses_unsupported_request_fields_are_rejected(field, value, error):
     body = {"model": "target", "input": "hello", field: value}
 
     with pytest.raises(ResponsesAdapterError, match=error):
@@ -500,6 +495,19 @@ def test_responses_route_missing_input_returns_json_error():
     payload = json.loads(handler.wfile.getvalue().decode())
     assert handler.statuses == [400]
     assert "requires an input" in payload["error"]
+
+
+def test_responses_route_unsupported_field_returns_json_error():
+    handler = _make_handler(
+        path="/v1/responses",
+        body={"model": "target", "input": "hello", "previous_response_id": "resp_old"},
+    )
+
+    DFlashAPIHandler.do_POST(handler)
+
+    payload = json.loads(handler.wfile.getvalue().decode())
+    assert handler.statuses == [400]
+    assert "previous_response_id is not implemented" in payload["error"]
 
 
 def _make_handler(*, path: str, body: dict) -> DFlashAPIHandler:

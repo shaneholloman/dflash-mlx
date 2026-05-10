@@ -112,6 +112,12 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 Compatible with OpenCode, aider, Continue, Open WebUI, and any OpenAI-compatible client. Tool calls, streaming, and chat templates all flow through. Short responses may take the target-only fast path; pass `--fastpath-max-tokens 0` to force DFlash on every request.
 
+`POST /v1/responses` is available as a minimal non-streaming compatibility
+adapter for text input and function-call tools. Streaming Responses,
+multimodal input, reasoning/text/truncation controls, `tool_choice`,
+`parallel_tool_calls`, and persistent `previous_response_id` / `store`
+behavior are not implemented.
+
 Inspect live server metrics:
 
 ```bash

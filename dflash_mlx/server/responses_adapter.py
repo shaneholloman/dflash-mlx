@@ -12,6 +12,14 @@ from typing import Any, Optional
 class ResponsesAdapterError(ValueError):
     pass
 
+_UNSUPPORTED_REQUEST_FIELDS = (
+    "previous_response_id",
+    "store",
+    "reasoning",
+    "text",
+    "truncation",
+)
+
 
 def responses_to_chat_body(body: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(body, dict):
@@ -24,6 +32,9 @@ def responses_to_chat_body(body: dict[str, Any]) -> dict[str, Any]:
         raise ResponsesAdapterError(
             "/v1/responses parallel_tool_calls is not implemented yet"
         )
+    for key in _UNSUPPORTED_REQUEST_FIELDS:
+        if key in body:
+            raise ResponsesAdapterError(f"/v1/responses {key} is not implemented yet")
     if "input" not in body:
         raise ResponsesAdapterError("/v1/responses requires an input field")
 

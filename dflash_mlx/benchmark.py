@@ -1089,7 +1089,7 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         "--model",
         metavar="HF_REF_OR_PATH",
         default=None,
-        help="Target model. Default: auto-resolved default target.",
+        help="Target model. Required.",
     )
     parser.add_argument(
         "--draft",
@@ -1156,7 +1156,7 @@ def _controlled_flag_values(
         "model": config.get("model", args.model),
         "draft": config.get("draft", args.draft),
         "use_chat_template": not bool(args.no_chat_template),
-        "draft_quant": args.draft_quant,
+        "draft_quant": config.get("draft_quant", args.draft_quant),
         "no_eos": bool(args.no_eos),
         "split_sdpa": _optional_bool(config["split_sdpa"])
         if "split_sdpa" in config
@@ -1209,6 +1209,8 @@ def _explicit_flag_values(
             if config is not None and "split_sdpa_requested" in config
             else args.split_sdpa
         )
+    if "draft_quant" in seen:
+        values["draft_quant"] = args.draft_quant
     return {name: values[name] for name in CONTROLLED_FLAG_NAMES if name in seen}
 
 def _build_invocation(
@@ -1245,6 +1247,8 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         args = _finalize_benchmark_args(parser.parse_args(argv_list), argv_list)
     except ValueError as exc:
         parser.error(offline_runtime_error_message(str(exc)))
+    if args.model is None:
+        parser.error("--model is required")
     prompts = resolve_benchmark_prompts(args)
     output_path = create_run_dir(
         "benchmark",
