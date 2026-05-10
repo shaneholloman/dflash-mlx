@@ -2,14 +2,18 @@
 # Licensed under the Apache License, Version 2.0 - see LICENSE file
 # Based on DFlash (arXiv:2602.06036)
 
+import json
+from types import SimpleNamespace
+
 import mlx.core as mx
 import pytest
 
-from dflash_mlx import generate
 from dflash_mlx import model as model_mod
-from dflash_mlx import runtime
+from dflash_mlx import runtime_loading
 from dflash_mlx.draft_backend import EagerDraftBackend
 from dflash_mlx.engine import spec_epoch
+from dflash_mlx.engine.config import resolve_draft_window
+from dflash_mlx.engine.target_gemma4 import Gemma4TargetOps
 from dflash_mlx.engine.target_ops import bind_draft_to_target
 from dflash_mlx.model import (
     ContextOnlyDraftKVCache,
@@ -82,7 +86,7 @@ def test_gemma4_draft_args_default_missing_layer_types_to_official_swa_pattern()
     )
 
 
-def test_non_gemma_draft_args_default_missing_layer_types_to_full_attention():
+def test_non_gemma_draft_args_keep_missing_layer_types_for_historical_cache_policy():
     args = DFlashDraftModelArgs.from_dict(
         {
             "model_type": "qwen3",
@@ -102,18 +106,130 @@ def test_non_gemma_draft_args_default_missing_layer_types_to_full_attention():
         }
     )
 
-    assert args.layer_types == ("full_attention", "full_attention", "full_attention")
+    assert args.layer_types == ()
+
+    caches = EagerDraftBackend().make_cache(
+        draft_model=SimpleNamespace(args=args, layers=[object(), object(), object()]),
+        sink_size=2,
+        window_size=3,
+    )
+
+    assert [type(cache) for cache in caches] == [
+        ContextOnlyDraftKVCache,
+        ContextOnlyDraftKVCache,
+        ContextOnlyDraftKVCache,
+    ]
+    assert not any(isinstance(cache, FullContextDraftKVCache) for cache in caches)
+    assert [cache.sink_size for cache in caches] == [2, 2, 2]
+    assert [cache.window_size for cache in caches] == [3, 3, 3]
 
 
-def test_draft_backend_allocates_mixed_cache_for_gemma4_layer_types():
-    draft_model = DFlashDraftModel(_args())
+def test_qwen_explicit_full_attention_layer_types_keep_bounded_cache_policy():
+    args = DFlashDraftModelArgs.from_dict(
+        {
+            "model_type": "qwen3",
+            "hidden_size": 32,
+            "num_hidden_layers": 2,
+            "intermediate_size": 64,
+            "num_attention_heads": 4,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 128,
+            "num_key_value_heads": 2,
+            "max_position_embeddings": 4096,
+            "rope_theta": 1_000_000.0,
+            "head_dim": 8,
+            "tie_word_embeddings": False,
+            "num_target_layers": 8,
+            "block_size": 16,
+            "layer_types": ("full_attention", "full_attention"),
+        }
+    )
+
+    caches = EagerDraftBackend().make_cache(
+        draft_model=SimpleNamespace(args=args, layers=[object(), object()]),
+        sink_size=2,
+        window_size=3,
+    )
+
+    assert args.layer_types == ("full_attention", "full_attention")
+    assert [type(cache) for cache in caches] == [
+        ContextOnlyDraftKVCache,
+        ContextOnlyDraftKVCache,
+    ]
+    assert not any(isinstance(cache, FullContextDraftKVCache) for cache in caches)
+    assert [cache.sink_size for cache in caches] == [2, 2]
+    assert [cache.window_size for cache in caches] == [3, 3]
+
+
+def test_qwen_explicit_full_attention_resolve_draft_window_stays_bounded():
+    draft_model = DFlashDraftModel(
+        _args(
+            model_type="qwen3",
+            num_hidden_layers=2,
+            layer_types=("full_attention", "full_attention"),
+            sliding_window=None,
+        )
+    )
+    runtime_config = SimpleNamespace(draft_sink_size=2, draft_window_size=3)
+
+    assert (
+        resolve_draft_window(
+            runtime_config,
+            draft_model,
+            context_len=100,
+            allow_full_attention_context=False,
+        )
+        == (2, 3)
+    )
+
+
+def test_full_context_capability_can_expand_explicit_full_attention_draft_window():
+    draft_model = DFlashDraftModel(
+        _args(
+            model_type="qwen3",
+            num_hidden_layers=2,
+            layer_types=("full_attention", "full_attention"),
+            sliding_window=None,
+        )
+    )
+    runtime_config = SimpleNamespace(draft_sink_size=2, draft_window_size=3)
+
+    assert (
+        resolve_draft_window(
+            runtime_config,
+            draft_model,
+            context_len=100,
+            allow_full_attention_context=True,
+        )
+        == (2, 100)
+    )
+
+
+def test_real_zlab_gemma4_draft_shape_allocates_full_context_from_target_capability():
+    target_model = SimpleNamespace(
+        args=SimpleNamespace(
+            model_type="gemma4",
+            layer_types=("sliding_attention", "full_attention"),
+            num_kv_shared_layers=0,
+        ),
+        model=SimpleNamespace(layers=[object()], embed_tokens=object()),
+    )
+    target_ops = Gemma4TargetOps()
+    assert target_ops.supports_model(target_model)
+    allow_full_context = target_ops.capabilities_for(
+        target_model
+    ).supports_full_context_draft_layers
+    draft_model = DFlashDraftModel(_args(model_type="qwen3"))
 
     caches = EagerDraftBackend().make_cache(
         draft_model=draft_model,
         sink_size=2,
         window_size=3,
+        allow_full_context_layers=allow_full_context,
     )
 
+    assert draft_model.args.model_type == "qwen3"
+    assert allow_full_context is True
     assert [type(cache) for cache in caches] == [
         ContextOnlyDraftKVCache,
         ContextOnlyDraftKVCache,
@@ -226,7 +342,7 @@ def test_load_draft_bundle_rejects_future_draft_owned_lm_head(tmp_path):
     )
 
     try:
-        runtime.load_draft_bundle(tmp_path)
+        runtime_loading.load_draft_bundle(tmp_path)
     except ValueError as exc:
         message = str(exc)
         assert "contains draft-owned lm_head weights" in message
@@ -235,26 +351,39 @@ def test_load_draft_bundle_rejects_future_draft_owned_lm_head(tmp_path):
         raise AssertionError("draft checkpoints with lm_head weights must fail fast")
 
 
-def test_generate_preserves_specific_draft_load_value_error(monkeypatch):
-    monkeypatch.setattr(generate, "resolve_optional_draft_ref", lambda *_args: "draft")
-    monkeypatch.setattr(
-        generate,
-        "load_target_bundle",
-        lambda *args, **kwargs: (object(), object(), {}),
+def test_load_draft_bundle_rejects_malformed_safetensors_index(tmp_path):
+    (tmp_path / "model.safetensors.index.json").write_text("{not-json")
+
+    with pytest.raises(ValueError, match="Invalid draft safetensors index JSON"):
+        runtime_loading.load_draft_bundle(tmp_path)
+
+
+def test_load_draft_bundle_rejects_non_object_safetensors_index(tmp_path):
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps([]))
+
+    with pytest.raises(ValueError, match="Invalid draft safetensors index payload"):
+        runtime_loading.load_draft_bundle(tmp_path)
+
+
+def test_load_draft_bundle_rejects_non_object_safetensors_weight_map(tmp_path):
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": []})
     )
-    monkeypatch.setattr(
-        generate,
-        "load_draft_bundle",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            ValueError("contains draft-owned lm_head weights")
-        ),
+
+    with pytest.raises(ValueError, match="Invalid draft safetensors index weight_map"):
+        runtime_loading.load_draft_bundle(tmp_path)
+
+
+def test_load_draft_bundle_rejects_index_declared_draft_owned_lm_head(tmp_path):
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"lm_head.weight": "model-00001-of-00001.safetensors"}})
     )
 
     with pytest.raises(ValueError, match="contains draft-owned lm_head weights"):
-        generate.load_runtime_components(model_ref="target", draft_ref=None)
+        runtime_loading.load_draft_bundle(tmp_path)
 
 
-def test_mask_token_id_can_be_generated(monkeypatch):
+def test_mask_token_id_can_be_generated():
     mask_token_id = 5
 
     class _TargetOps:
@@ -313,8 +442,8 @@ def test_mask_token_id_can_be_generated(monkeypatch):
         def make_cache(self, **_kwargs):
             return []
 
-    monkeypatch.setattr(spec_epoch, "resolve_target_ops", lambda _model: _TargetOps())
-    monkeypatch.setattr(spec_epoch, "make_draft_backend", lambda: _DraftBackend())
+    target_ops = _TargetOps()
+    draft_backend = _DraftBackend()
     context = build_runtime_context(
         runtime_config_from_profile(
             profile="balanced",
@@ -333,8 +462,10 @@ def test_mask_token_id_can_be_generated(monkeypatch):
     events = list(
         spec_epoch.stream_dflash_generate_impl(
             target_model=object(),
+            target_ops=target_ops,
             tokenizer=object(),
             draft_model=draft_model,
+            draft_backend=draft_backend,
             prompt="unused",
             max_new_tokens=1,
             prompt_tokens_override=[1],
@@ -418,8 +549,8 @@ def test_prefix_snapshot_capability_disables_snapshot_events(monkeypatch):
             return []
 
     monkeypatch.setattr(spec_epoch.mx, "concatenate", tracked_concatenate)
-    monkeypatch.setattr(spec_epoch, "resolve_target_ops", lambda _model: _TargetOps())
-    monkeypatch.setattr(spec_epoch, "make_draft_backend", lambda: _DraftBackend())
+    target_ops = _TargetOps()
+    draft_backend = _DraftBackend()
     context = build_runtime_context(
         runtime_config_from_profile(
             profile="balanced",
@@ -436,8 +567,10 @@ def test_prefix_snapshot_capability_disables_snapshot_events(monkeypatch):
     events = list(
         spec_epoch.stream_dflash_generate_impl(
             target_model=object(),
+            target_ops=target_ops,
             tokenizer=object(),
             draft_model=_DraftModel(),
+            draft_backend=draft_backend,
             prompt="unused",
             max_new_tokens=1,
             prompt_tokens_override=[1],

@@ -30,8 +30,25 @@ class _FakeEmbed:
     pass
 
 class _FakeTarget:
-    def __init__(self, *, model_type: str = "qwen3_5") -> None:
-        self.args = SimpleNamespace(model_type=model_type, tie_word_embeddings=True)
+    def __init__(
+        self,
+        *,
+        model_type: str = "qwen3_5",
+        num_hidden_layers: int = 64,
+        hidden_size: int | None = 5120,
+        num_attention_heads: int | None = 40,
+        num_key_value_heads: int | None = 8,
+        num_experts: int = 0,
+    ) -> None:
+        self.args = SimpleNamespace(
+            model_type=model_type,
+            tie_word_embeddings=True,
+            num_hidden_layers=num_hidden_layers,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            num_key_value_heads=num_key_value_heads,
+            num_experts=num_experts,
+        )
         self.model = SimpleNamespace(
             layers=[_FakeFaLayer(), _FakeGdnLayer(), _FakeFaLayer()],
             embed_tokens=_FakeEmbed(),
@@ -206,6 +223,53 @@ def test_capabilities_for_distinguishes_hybrid_and_pure_attention():
     assert pure.supports_kv_trim is True
     assert pure.supports_rotating_cache_snapshot is False
     assert pure.supports_shared_kv is False
+
+
+def test_qwen_verify_linear_capability_owns_qwen_shape_policy():
+    ops = QwenGdnTargetOps()
+
+    excluded_moe = ops.capabilities_for(
+        _FakeTarget(
+            num_hidden_layers=40,
+            hidden_size=2048,
+            num_attention_heads=16,
+            num_key_value_heads=2,
+            num_experts=128,
+        )
+    )
+    supported_moe = ops.capabilities_for(
+        _FakeTarget(
+            num_hidden_layers=40,
+            hidden_size=5120,
+            num_attention_heads=40,
+            num_key_value_heads=8,
+            num_experts=128,
+        )
+    )
+    small_dense = ops.capabilities_for(_FakeTarget(num_hidden_layers=32))
+
+    assert excluded_moe.supports_verify_linear is False
+    assert supported_moe.supports_verify_linear is True
+    assert small_dense.supports_verify_linear is False
+
+
+def test_qwen_verify_linear_capability_rejects_incomplete_moe_shape():
+    ops = QwenGdnTargetOps()
+
+    try:
+        ops.capabilities_for(
+            _FakeTarget(
+                num_hidden_layers=40,
+                hidden_size=None,
+                num_attention_heads=16,
+                num_key_value_heads=2,
+                num_experts=128,
+            )
+        )
+    except ValueError as exc:
+        assert "Missing Qwen target config field hidden_size" in str(exc)
+    else:
+        raise AssertionError("incomplete Qwen MoE verify config must fail closed")
 
 def test_gemma4_capabilities_disable_prefix_snapshot_initially():
     caps = Gemma4TargetOps().capabilities_for(_FakeGemmaTarget())

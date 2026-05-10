@@ -18,7 +18,7 @@ from tools.benchmarks.analyze_trace import (
 from dflash_mlx.engine.memory_waterfall import (
     collect_memory_waterfall,
     draft_cache_bytes,
-    prefix_cache_bytes,
+    prefix_cache_memory_bytes,
     target_cache_bytes,
 )
 
@@ -47,36 +47,6 @@ class FakeRecurrentRollbackCache:
         self._tape_qkv = mx.zeros((1, 2), dtype=mx.float16)
         self._snapshot = None
 
-class FakeSnapshot:
-    nbytes = 100
-
-    def nbytes_breakdown(self):
-        return {
-            "fa_kv": 10,
-            "gdn_state": 20,
-            "target_hidden": 30,
-            "last_logits": 40,
-        }
-
-class FakePrefixCache:
-    def __init__(self):
-        self._entries = {1: FakeSnapshot()}
-        self._lock = None
-
-    def stats(self):
-        return {
-            "current_bytes": 100,
-            "prefix_prunes": 2,
-            "cross_kind_prunes": 3,
-            "byte_budget_evictions": 4,
-            "l2_hits": 5,
-            "l2_misses": 6,
-            "l2": {
-                "current_bytes": 700,
-                "writes": 8,
-            },
-        }
-
 def test_target_cache_bytes_splits_fa_gdn_and_tape():
     out = target_cache_bytes([FakeKVCache(), FakeRecurrentRollbackCache()])
     assert out["target_fa_kv_bytes"] == 96
@@ -87,8 +57,23 @@ def test_draft_cache_bytes_counts_keys_values_and_state():
     out = draft_cache_bytes([FakeKVCache(), FakeStateKVCache()])
     assert out["draft_kv_bytes"] == 192
 
-def test_prefix_cache_bytes_breakdown_and_stats():
-    out = prefix_cache_bytes(FakePrefixCache())
+def test_prefix_cache_memory_bytes_breakdown_and_stats():
+    out = prefix_cache_memory_bytes(
+        {
+            "l1_snapshot_bytes": 100,
+            "l1_snapshot_fa_kv_bytes": 10,
+            "l1_snapshot_gdn_state_bytes": 20,
+            "l1_snapshot_target_hidden_bytes": 30,
+            "l1_snapshot_last_logits_bytes": 40,
+            "l2_disk_bytes": 700,
+            "prefix_prunes": 2,
+            "cross_kind_prunes": 3,
+            "byte_budget_evictions": 4,
+            "l2_hits": 5,
+            "l2_misses": 6,
+            "l2_writes": 8,
+        }
+    )
     assert out["l1_snapshot_bytes"] == 100
     assert out["l1_snapshot_fa_kv_bytes"] == 10
     assert out["l1_snapshot_gdn_state_bytes"] == 20
@@ -108,7 +93,7 @@ def test_collect_memory_waterfall_handles_missing_fields():
         draft_cache=None,
         target_hidden=None,
         gen_hidden_chunks=None,
-        prefix_cache=None,
+        prefix_cache_memory=None,
     )
     assert out["memory_phase"] == "test"
     assert out["target_fa_kv_gb"] == 0.0

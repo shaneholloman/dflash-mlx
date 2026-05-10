@@ -37,16 +37,14 @@ from dflash_mlx.benchmark_suites import (
     resolve_benchmark_prompts,
     slugify_prompt_id,
 )
-from dflash_mlx.generate import resolve_optional_draft_ref
+from dflash_mlx.draft_backend import DraftBackend
 from dflash_mlx.metal_limits import apply_metal_limits
-from dflash_mlx.engine.target_ops import bind_draft_to_target, resolve_target_ops
 from dflash_mlx.runtime import (
     get_stop_token_ids,
-    load_draft_bundle,
-    load_target_bundle,
-    resolve_model_ref,
     stream_dflash_generate,
 )
+from dflash_mlx.runtime_bundle import load_runtime_bundle
+from dflash_mlx.runtime_loading import resolve_model_ref
 from dflash_mlx.runtime_context import (
     RuntimeContext,
     build_offline_runtime_context,
@@ -481,8 +479,10 @@ def _generate_stock_baseline_once(
 def _generate_dflash_stream_once(
     *,
     target_model: Any,
+    target_ops: Any,
     tokenizer: Any,
     draft_model: Any,
+    draft_backend: DraftBackend,
     prompt: str,
     max_new_tokens: int,
     use_chat_template: bool,
@@ -503,8 +503,10 @@ def _generate_dflash_stream_once(
     summary: dict[str, Any] | None = None
     stream = stream_dflash_generate(
         target_model=target_model,
+        target_ops=target_ops,
         tokenizer=tokenizer,
         draft_model=draft_model,
+        draft_backend=draft_backend,
         prompt=prompt,
         max_new_tokens=max_new_tokens,
         use_chat_template=use_chat_template,
@@ -603,28 +605,20 @@ def _run_once_sequential(
             draft_window_size=draft_window_size,
             verify_len_cap=verify_len_cap,
         )
-        target_model, tokenizer, target_meta = load_target_bundle(
-            target_model_ref,
-            lazy=True,
-            split_full_attention_sdpa=split_sdpa,
-            verify_config=runtime_context.verify,
-        )
-        resolved_draft_ref = resolve_optional_draft_ref(
-            target_meta["resolved_model_ref"],
-            draft_model_ref,
-        )
-        if not resolved_draft_ref:
-            raise ValueError(
-                f"No DFlash draft model found for '{target_meta['resolved_model_ref']}'. "
-                "Use --draft to specify one."
-            )
-        draft_model, draft_meta = load_draft_bundle(
-            resolved_draft_ref,
-            lazy=True,
+        bundle = load_runtime_bundle(
+            model_ref=target_model_ref,
+            draft_ref=draft_model_ref,
             draft_quant=draft_quant,
+            verify_config=runtime_context.verify,
+            split_full_attention_sdpa=split_sdpa,
         )
-        target_ops = resolve_target_ops(target_model)
-        bind_draft_to_target(draft_model, target_model, target_ops=target_ops)
+        target_model = bundle.target_model
+        tokenizer = bundle.tokenizer
+        target_meta = bundle.target_meta
+        draft_model = bundle.draft_model
+        draft_meta = bundle.draft_meta
+        draft_backend = bundle.draft_backend
+        target_ops = bundle.target_ops
 
         if use_chat_template and hasattr(tokenizer, "apply_chat_template"):
             dflash_prompt_tokens = list(
@@ -645,8 +639,10 @@ def _run_once_sequential(
         dflash_suppress_token_ids = dflash_eos_token_ids if no_eos else None
         dflash = _generate_dflash_stream_once(
             target_model=target_model,
+            target_ops=target_ops,
             tokenizer=tokenizer,
             draft_model=draft_model,
+            draft_backend=draft_backend,
             prompt=prompt,
             max_new_tokens=max_new_tokens,
             use_chat_template=use_chat_template,

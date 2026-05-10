@@ -23,6 +23,26 @@ from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
 _EXACT_SMALL_PROJ_PAD_M = 16
 _HYBRID_SDPA_EXACT_KV_THRESHOLD = 1024
 
+
+def _int_attr(obj: Any, name: str) -> int:
+    value = getattr(obj, name, 0)
+    if value is None:
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid Qwen target config field {name}: {value!r}") from None
+
+
+def _required_positive_int_attr(obj: Any, name: str) -> int:
+    value = getattr(obj, name, None)
+    if value is None:
+        raise ValueError(f"Missing Qwen target config field {name}")
+    parsed = _int_attr(obj, name)
+    if parsed <= 0:
+        raise ValueError(f"Invalid Qwen target config field {name}: {value!r}")
+    return parsed
+
 class _ExactSmallProjPad(nn.Module):
     def __init__(self, linear: nn.Module, *, pad_m: int = _EXACT_SMALL_PROJ_PAD_M):
         super().__init__()
@@ -429,7 +449,27 @@ class QwenGdnTargetOps:
             supports_rotating_cache_snapshot=False,
             supports_shared_kv=False,
             supports_target_hidden_capture=True,
+            supports_verify_linear=self._supports_verify_linear(target_model),
         )
+
+    def _supports_verify_linear(self, target_model: Any) -> bool:
+        wrapper = self.text_wrapper(target_model)
+        args = getattr(wrapper, "args", None)
+        num_experts = _int_attr(args, "num_experts")
+        num_layers = _int_attr(args, "num_hidden_layers")
+        if num_layers <= 0:
+            num_layers = len(getattr(self.text_model(target_model), "layers", []))
+        if num_experts > 0:
+            hidden_size = _required_positive_int_attr(args, "hidden_size")
+            num_heads = _required_positive_int_attr(args, "num_attention_heads")
+            num_kv_heads = _required_positive_int_attr(args, "num_key_value_heads")
+            return not (
+                num_layers == 40
+                and hidden_size == 2048
+                and num_heads == 16
+                and num_kv_heads == 2
+            )
+        return num_layers >= 40
 
     def extract_context_feature(
         self,

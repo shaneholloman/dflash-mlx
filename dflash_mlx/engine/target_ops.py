@@ -19,7 +19,8 @@ class TargetCapabilities:
     supports_rotating_cache_snapshot: bool
     supports_shared_kv: bool
     supports_target_hidden_capture: bool
-    supports_verify_linear: bool = True
+    supports_verify_linear: bool = False
+    supports_full_context_draft_layers: bool = False
 
 class TargetOps(Protocol):
     backend_name: str
@@ -134,10 +135,9 @@ def bind_draft_to_target(
     draft_model: Any,
     target_model: Any,
     *,
-    target_ops: TargetOps | None = None,
+    target_ops: TargetOps,
 ) -> TargetOps:
-    resolved_ops = target_ops if target_ops is not None else resolve_target_ops(target_model)
     bind_target = getattr(draft_model, "bind_target_model", None)
     if bind_target is not None:
-        bind_target(target_model, target_ops=resolved_ops)
-    return resolved_ops
+        bind_target(target_model, target_ops=target_ops)
+    return target_ops

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 
+from dflash_mlx.cache.codecs import PrefixSnapshotBuilder
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
 from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
 from dflash_mlx.engine import spec_epoch
@@ -55,10 +56,40 @@ class _FakeDraftBackend:
         return []
 
 
-def test_runtime_prefill_chunks_use_configured_step_size(monkeypatch):
+def test_yield_pause_tracker_records_enabled_pause(monkeypatch):
+    ticks = iter([10, 17, 100, 140])
+    monkeypatch.setattr(spec_epoch.time, "perf_counter_ns", lambda: next(ticks))
+
+    tracker = spec_epoch._YieldPauseTracker(enabled=True)
+
+    mark = tracker.mark()
+    tracker.done(mark)
+    assert tracker.pause_ns == 7
+
+    mark = tracker.mark()
+    tracker.done(mark)
+    assert tracker.pause_ns == 47
+
+
+def test_yield_pause_tracker_disabled_noops(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        spec_epoch.time,
+        "perf_counter_ns",
+        lambda: calls.append("called") or 1,
+    )
+
+    tracker = spec_epoch._YieldPauseTracker(enabled=False)
+
+    assert tracker.mark() == 0
+    tracker.done(10)
+    assert tracker.pause_ns == 0
+    assert calls == []
+
+
+def test_runtime_prefill_chunks_use_configured_step_size():
     target_ops = _FakeTargetOps()
-    monkeypatch.setattr(spec_epoch, "resolve_target_ops", lambda _model: target_ops)
-    monkeypatch.setattr(spec_epoch, "make_draft_backend", lambda: _FakeDraftBackend())
+    draft_backend = _FakeDraftBackend()
 
     context = build_runtime_context(
         runtime_config_from_profile(
@@ -77,8 +108,10 @@ def test_runtime_prefill_chunks_use_configured_step_size(monkeypatch):
     events = list(
         spec_epoch.stream_dflash_generate_impl(
             target_model=object(),
+            target_ops=target_ops,
             tokenizer=object(),
             draft_model=draft_model,
+            draft_backend=draft_backend,
             prompt="unused",
             max_new_tokens=0,
             prompt_tokens_override=list(range(10)),
@@ -100,10 +133,9 @@ def test_runtime_prefill_chunks_use_configured_step_size(monkeypatch):
     assert events[-1]["event"] == "summary"
 
 
-def test_runtime_prefill_accounting_reports_warm_restore(monkeypatch):
+def test_runtime_prefill_accounting_reports_warm_restore():
     target_ops = _FakeTargetOps()
-    monkeypatch.setattr(spec_epoch, "resolve_target_ops", lambda _model: target_ops)
-    monkeypatch.setattr(spec_epoch, "make_draft_backend", lambda: _FakeDraftBackend())
+    draft_backend = _FakeDraftBackend()
 
     context = build_runtime_context(
         runtime_config_from_profile(
@@ -139,8 +171,10 @@ def test_runtime_prefill_accounting_reports_warm_restore(monkeypatch):
     events = list(
         spec_epoch.stream_dflash_generate_impl(
             target_model=object(),
+            target_ops=target_ops,
             tokenizer=object(),
             draft_model=draft_model,
+            draft_backend=draft_backend,
             prompt="unused",
             max_new_tokens=0,
             prompt_tokens_override=list(range(10)),
@@ -156,3 +190,135 @@ def test_runtime_prefill_accounting_reports_warm_restore(monkeypatch):
     assert prefill_event["physical_prefill_tokens"] == 4
     assert prefill_event["prefill_tokens_restored"] == 6
     assert prefill_event["prefill_tokens_computed"] == 4
+
+
+def test_prefill_snapshot_event_carries_snapshot_not_live_arrays():
+    target_ops = _FakeTargetOps()
+    draft_backend = _FakeDraftBackend()
+
+    context = build_runtime_context(
+        runtime_config_from_profile(
+            profile="balanced",
+            prefill_step_size=4,
+            prefix_cache=False,
+            prefix_cache_l2=False,
+        )
+    )
+    draft_model = SimpleNamespace(
+        target_layer_ids=[0],
+        block_size=4,
+        mask_token_id=0,
+    )
+    key = DFlashPrefixKey(
+        target_model_id="target",
+        draft_model_id="draft",
+        capture_layer_ids=(0,),
+        draft_sink_size=64,
+        draft_window_size=1024,
+        target_fa_window=0,
+    )
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=draft_model,
+            draft_backend=draft_backend,
+            prompt="unused",
+            max_new_tokens=0,
+            prompt_tokens_override=[1, 2],
+            prefix_snapshot_builder=PrefixSnapshotBuilder(
+                key=key,
+                draft_model=draft_model,
+                draft_sink_size=64,
+                draft_window_size=1024,
+            ),
+            runtime_context=context,
+        )
+    )
+
+    snapshot_event = next(
+        event for event in events if event.get("event") == "prefill_snapshot_ready"
+    )
+    assert snapshot_event["snapshot"].key == key
+    assert snapshot_event["snapshot"].token_ids == (1, 2)
+    assert "target_cache" not in snapshot_event
+    assert "target_hidden" not in snapshot_event
+    assert "last_logits" not in snapshot_event
+
+
+def test_prefill_snapshot_event_requires_builder():
+    target_ops = _FakeTargetOps()
+    draft_backend = _FakeDraftBackend()
+
+    context = build_runtime_context(
+        runtime_config_from_profile(
+            profile="balanced",
+            prefill_step_size=4,
+            prefix_cache=False,
+            prefix_cache_l2=False,
+        )
+    )
+    draft_model = SimpleNamespace(
+        target_layer_ids=[0],
+        block_size=4,
+        mask_token_id=0,
+    )
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=draft_model,
+            draft_backend=draft_backend,
+            prompt="unused",
+            max_new_tokens=0,
+            prompt_tokens_override=[1, 2],
+            runtime_context=context,
+        )
+    )
+
+    assert "prefill_snapshot_ready" not in {
+        event.get("event") for event in events
+    }
+
+
+def test_active_prefix_cache_requires_snapshot_builder():
+    target_ops = _FakeTargetOps()
+    draft_backend = _FakeDraftBackend()
+
+    context = build_runtime_context(
+        runtime_config_from_profile(
+            profile="balanced",
+            prefill_step_size=4,
+            prefix_cache=False,
+            prefix_cache_l2=False,
+        )
+    )
+    draft_model = SimpleNamespace(
+        target_layer_ids=[0],
+        block_size=4,
+        mask_token_id=0,
+    )
+
+    try:
+        list(
+            spec_epoch.stream_dflash_generate_impl(
+                target_model=object(),
+                target_ops=target_ops,
+                tokenizer=object(),
+                draft_model=draft_model,
+                draft_backend=draft_backend,
+                prompt="unused",
+                max_new_tokens=0,
+                prompt_tokens_override=[1, 2],
+                prefix_cache_active=True,
+                runtime_context=context,
+            )
+        )
+    except ValueError as exc:
+        assert "prefix_snapshot_builder is required" in str(exc)
+    else:
+        raise AssertionError("active prefix cache without snapshot builder must fail")

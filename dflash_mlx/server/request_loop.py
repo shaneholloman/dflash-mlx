@@ -14,6 +14,7 @@ from dflash_mlx.engine.memory_waterfall import (
     collect_memory_waterfall,
     format_memory_waterfall_summary,
     merge_memory_waterfall_peak,
+    prefix_cache_memory_fields,
 )
 from dflash_mlx.server.prefix_cache_flow import PrefixCacheFlow
 from dflash_mlx.server.metrics import update_live_request
@@ -88,6 +89,7 @@ def consume_dflash_events(
                 continue
             if event_name == "memory_waterfall":
                 memory_event = {k: v for k, v in event.items() if k != "event"}
+                memory_event = _with_prefix_cache_memory(memory_event, prefix_flow)
                 memory_peak = merge_memory_waterfall_peak(memory_peak, memory_event)
                 if bench_active:
                     _bench_log_cycle(trace, request_id=request_id, **memory_event)
@@ -136,11 +138,11 @@ def consume_dflash_events(
                 continue
             if event_name == "prefill_snapshot_ready":
                 if prefix_flow is not None:
-                    prefix_flow.handle_prefill_snapshot(event)
+                    prefix_flow.handle_prefill_snapshot(event["snapshot"])
                 continue
             if event_name == "generation_snapshot_ready":
                 if prefix_flow is not None:
-                    prefix_flow.handle_generation_snapshot(event)
+                    prefix_flow.handle_generation_snapshot(event["snapshot"])
                 continue
             if event_name != "token":
                 if event_name == "summary":
@@ -251,7 +253,11 @@ def consume_dflash_events(
         if memory_enabled:
             memory_event = collect_memory_waterfall(
                 phase="after_cleanup",
-                prefix_cache=prefix_flow.cache if prefix_flow is not None else None,
+                prefix_cache_memory=(
+                    prefix_flow.prefix_cache_memory_bytes()
+                    if prefix_flow is not None
+                    else None
+                ),
             )
             memory_peak = merge_memory_waterfall_peak(memory_peak, memory_event)
             if bench_active:
@@ -290,6 +296,17 @@ def consume_dflash_events(
         cache_insert_ms=prefix_flow.insert_ms if prefix_flow is not None else 0.0,
         memory_waterfall_peak=memory_peak,
     )
+
+def _with_prefix_cache_memory(
+    event: dict[str, Any],
+    prefix_flow: Optional[PrefixCacheFlow],
+) -> dict[str, Any]:
+    if prefix_flow is None:
+        return event
+    prefix_memory = prefix_flow.prefix_cache_memory_bytes()
+    if prefix_memory is None:
+        return event
+    return {**event, **prefix_cache_memory_fields(prefix_memory)}
 
 def _context_should_stop(ctx: Any) -> bool:
     return bool(getattr(ctx, "_should_stop", False))

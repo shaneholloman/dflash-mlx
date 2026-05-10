@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -27,6 +28,7 @@ def _resolve_effective_trim_window(
     *,
     draft_sink_size: int = 64,
     draft_window_size: int = 1024,
+    allow_full_attention_context: bool = False,
 ) -> tuple[int, int]:
     sink = int(draft_sink_size)
     requested = int(draft_window_size)
@@ -36,7 +38,7 @@ def _resolve_effective_trim_window(
         draft_model,
         requested,
         context_len=int(total_len),
-        allow_full_attention_context=True,
+        allow_full_attention_context=allow_full_attention_context,
     )
     return max(0, int(sink)), max(0, int(effective))
 
@@ -47,6 +49,7 @@ def _build_target_hidden_chunks(
     trim_target_hidden: bool = True,
     draft_sink_size: int = 64,
     draft_window_size: int = 1024,
+    allow_full_attention_context: bool = False,
 ) -> tuple[tuple[mx.array, ...], tuple[tuple[int, int], ...], int]:
     total_len = int(target_hidden.shape[1])
     if not trim_target_hidden:
@@ -58,6 +61,7 @@ def _build_target_hidden_chunks(
         total_len,
         draft_sink_size=draft_sink_size,
         draft_window_size=draft_window_size,
+        allow_full_attention_context=allow_full_attention_context,
     )
     if total_len <= sink + window or sink + window == 0:
         full = _clone_array(target_hidden)
@@ -162,6 +166,7 @@ def build_snapshot(
     trim_target_hidden: bool = True,
     draft_sink_size: int = 64,
     draft_window_size: int = 1024,
+    allow_full_attention_context: bool = False,
 ) -> DFlashPrefixSnapshot:
     fa, gdn = serialize_target_cache(target_cache)
     chunks, spans, total_len = _build_target_hidden_chunks(
@@ -170,6 +175,7 @@ def build_snapshot(
         trim_target_hidden=trim_target_hidden,
         draft_sink_size=draft_sink_size,
         draft_window_size=draft_window_size,
+        allow_full_attention_context=allow_full_attention_context,
     )
     cloned_logits = _clone_array(last_logits) if last_logits is not None else None
     return DFlashPrefixSnapshot(
@@ -183,3 +189,34 @@ def build_snapshot(
         key=key,
         kind=kind,
     )
+
+
+@dataclass(frozen=True)
+class PrefixSnapshotBuilder:
+    key: DFlashPrefixKey
+    draft_model: Optional[Any] = None
+    draft_sink_size: int = 64
+    draft_window_size: int = 1024
+
+    def build(
+        self,
+        *,
+        token_ids: list[int],
+        target_cache: list[Any],
+        target_hidden: mx.array,
+        last_logits: Optional[mx.array],
+        kind: str,
+        allow_full_attention_context: bool = False,
+    ) -> DFlashPrefixSnapshot:
+        return build_snapshot(
+            token_ids=token_ids,
+            target_cache=target_cache,
+            target_hidden=target_hidden,
+            last_logits=last_logits,
+            key=self.key,
+            kind=kind,
+            draft_model=self.draft_model,
+            draft_sink_size=self.draft_sink_size,
+            draft_window_size=self.draft_window_size,
+            allow_full_attention_context=allow_full_attention_context,
+        )

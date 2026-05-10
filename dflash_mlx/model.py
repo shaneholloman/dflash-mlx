@@ -40,7 +40,7 @@ def _default_draft_layer_types(
 ) -> tuple[str, ...]:
     layer_count = int(num_hidden_layers)
     if not _is_gemma4_model_type(model_type):
-        return ("full_attention",) * layer_count
+        return ()
     pattern_len = int(sliding_window_pattern or _GEMMA4_DEFAULT_SLIDING_WINDOW_PATTERN)
     pattern_len = max(1, pattern_len)
     pattern = ("sliding_attention",) * (pattern_len - 1) + ("full_attention",)
@@ -246,15 +246,19 @@ class DFlashDraftModelArgs:
     def from_dict(cls, params: dict[str, Any]) -> "DFlashDraftModelArgs":
         data = dict(params)
         layer_types = tuple(data.get("layer_types") or ())
-        if not layer_types and "num_hidden_layers" in data:
+        model_type = str(data.get("model_type", ""))
+        if (
+            not layer_types
+            and "num_hidden_layers" in data
+            and _is_gemma4_model_type(model_type)
+        ):
             layer_types = _default_draft_layer_types(
-                model_type=str(data.get("model_type", "")),
+                model_type=model_type,
                 num_hidden_layers=int(data["num_hidden_layers"]),
                 sliding_window_pattern=data.get("sliding_window_pattern"),
             )
             if (
-                _is_gemma4_model_type(str(data.get("model_type", "")))
-                and "sliding_window" not in data
+                "sliding_window" not in data
                 and "sliding_attention" in layer_types
             ):
                 data["sliding_window"] = _GEMMA4_DEFAULT_SLIDING_WINDOW
@@ -266,19 +270,18 @@ class DFlashDraftModelArgs:
 
     def __post_init__(self) -> None:
         layer_types = tuple(self.layer_types or ())
-        if not layer_types:
+        if not layer_types and _is_gemma4_model_type(self.model_type):
             layer_types = _default_draft_layer_types(
                 model_type=self.model_type,
                 num_hidden_layers=int(self.num_hidden_layers),
                 sliding_window_pattern=self.sliding_window_pattern,
             )
             if (
-                _is_gemma4_model_type(self.model_type)
-                and self.sliding_window is None
+                self.sliding_window is None
                 and "sliding_attention" in layer_types
             ):
                 self.sliding_window = _GEMMA4_DEFAULT_SLIDING_WINDOW
-        if len(layer_types) != int(self.num_hidden_layers):
+        if layer_types and len(layer_types) != int(self.num_hidden_layers):
             raise ValueError(
                 "DFlash draft layer_types length must match num_hidden_layers: "
                 f"{len(layer_types)} != {int(self.num_hidden_layers)}"

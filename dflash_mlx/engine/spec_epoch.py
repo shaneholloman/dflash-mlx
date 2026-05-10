@@ -7,16 +7,17 @@ from __future__ import annotations
 import sys
 import time
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import mlx.core as mx
 
-from dflash_mlx.cache.codecs import hydrate_target_cache
+from dflash_mlx.cache.codecs import PrefixSnapshotBuilder, hydrate_target_cache
 from dflash_mlx.cache.snapshot import (
     DFlashPrefixSnapshot,
     validate_prefix_snapshot as _validate_prefix_snapshot,
 )
-from dflash_mlx.draft_backend import make_draft_backend
+from dflash_mlx.draft_backend import DraftBackend
 from dflash_mlx.engine.acceptance import match_acceptance_length as _match_acceptance_length
 from dflash_mlx.engine.fallback import stream_baseline_generate
 from dflash_mlx.engine.prefill import (
@@ -26,10 +27,9 @@ from dflash_mlx.engine.prefill import (
 from dflash_mlx.engine.config import (
     _profile_dflash_cycles_enabled,
     resolve_draft_window,
-    resolve_verify_len_cap,
+    resolve_speculative_cycle_config,
     verify_token_count_for_block,
 )
-from dflash_mlx.engine.target_ops import bind_draft_to_target, resolve_target_ops
 from dflash_mlx.model import DFlashDraftModel
 from dflash_mlx.engine.memory_waterfall import (
     collect_memory_waterfall as _collect_memory_waterfall,
@@ -37,11 +37,213 @@ from dflash_mlx.engine.memory_waterfall import (
     should_sample_cycle as _should_sample_memory_cycle,
 )
 
+
+@dataclass
+class SpeculativeSession:
+    target_ops: Any
+    target_cache: Any
+    draft_cache: list[Any]
+    draft_backend: DraftBackend
+    snap_prefix_len: int
+    supports_prefix_snapshot: bool
+    allow_full_context_draft_layers: bool
+    draft_sink_size: int
+    draft_window_size: int
+    target_layer_id_list: list[int]
+    capture_layer_ids: set[int]
+    profile_cycles: bool
+    memory_waterfall: bool
+    clear_cache_boundaries: bool
+    target_fa_window: int
+
+    @classmethod
+    def open(
+        cls,
+        *,
+        target_model: Any,
+        draft_model: DFlashDraftModel,
+        draft_backend: DraftBackend,
+        target_ops: Any,
+        supports_prefix_snapshot: bool,
+        allow_full_context_draft_layers: bool,
+        prompt_tokens: list[int],
+        prompt_len: int,
+        max_new_tokens: int,
+        prefix_snapshot: Optional[DFlashPrefixSnapshot],
+        quantize_kv_cache: bool,
+        target_fa_window: int,
+        runtime_context: Any,
+    ) -> "SpeculativeSession":
+        runtime_config = runtime_context.runtime
+        draft_sink_size, draft_window_size = resolve_draft_window(
+            runtime_config,
+            draft_model,
+            context_len=prompt_len + max(0, int(max_new_tokens)),
+            allow_full_attention_context=allow_full_context_draft_layers,
+        )
+        snap_prefix_len = _validate_prefix_snapshot(prefix_snapshot, prompt_tokens)
+        if not supports_prefix_snapshot:
+            snap_prefix_len = 0
+        if snap_prefix_len > 0 and (quantize_kv_cache or target_fa_window > 0):
+            snap_prefix_len = 0
+        if snap_prefix_len > 0:
+            template_cache = target_ops.make_cache(
+                target_model,
+                enable_speculative_linear_cache=True,
+                quantize_kv_cache=quantize_kv_cache,
+                target_fa_window=target_fa_window,
+            )
+            try:
+                assert prefix_snapshot is not None
+                target_cache = hydrate_target_cache(prefix_snapshot, template_cache)
+            except (ValueError, TypeError):
+                snap_prefix_len = 0
+                target_cache = target_ops.make_cache(
+                    target_model,
+                    enable_speculative_linear_cache=True,
+                    quantize_kv_cache=quantize_kv_cache,
+                    target_fa_window=target_fa_window,
+                )
+            finally:
+                del template_cache
+        else:
+            target_cache = target_ops.make_cache(
+                target_model,
+                enable_speculative_linear_cache=True,
+                quantize_kv_cache=quantize_kv_cache,
+                target_fa_window=target_fa_window,
+            )
+        draft_cache = draft_backend.make_cache(
+            draft_model=draft_model,
+            sink_size=draft_sink_size,
+            window_size=draft_window_size,
+            allow_full_context_layers=allow_full_context_draft_layers,
+        )
+        diagnostics = runtime_context.diagnostics
+        profile_cycles = _profile_dflash_cycles_enabled(diagnostics)
+        memory_waterfall = _memory_waterfall_enabled(diagnostics)
+        return cls(
+            target_ops=target_ops,
+            target_cache=target_cache,
+            draft_cache=draft_cache,
+            draft_backend=draft_backend,
+            snap_prefix_len=snap_prefix_len,
+            supports_prefix_snapshot=supports_prefix_snapshot,
+            allow_full_context_draft_layers=allow_full_context_draft_layers,
+            draft_sink_size=draft_sink_size,
+            draft_window_size=draft_window_size,
+            target_layer_id_list=list(draft_model.target_layer_ids),
+            capture_layer_ids={
+                int(layer_id) + 1 for layer_id in draft_model.target_layer_ids
+            },
+            profile_cycles=profile_cycles,
+            memory_waterfall=memory_waterfall,
+            clear_cache_boundaries=bool(runtime_config.clear_cache_boundaries),
+            target_fa_window=target_fa_window,
+        )
+
+    def clear_cache_boundary(self) -> None:
+        if self.clear_cache_boundaries and hasattr(mx, "clear_cache"):
+            mx.clear_cache()
+
+    def memory_waterfall_event(
+        self,
+        phase: str,
+        *,
+        target_hidden_value: Any = None,
+        gen_hidden_chunks_value: Any = None,
+        extra: Optional[dict[str, Any]] = None,
+    ) -> Optional[dict[str, Any]]:
+        if not self.memory_waterfall:
+            return None
+        return {
+            "event": "memory_waterfall",
+            **_collect_memory_waterfall(
+                phase=phase,
+                target_cache=self.target_cache,
+                draft_cache=self.draft_cache,
+                target_hidden=target_hidden_value,
+                gen_hidden_chunks=gen_hidden_chunks_value,
+                extra=extra,
+            ),
+        }
+
+    def close(self) -> None:
+        self.target_ops.cleanup_generation_caches(self.target_cache, self.draft_cache)
+        if hasattr(mx, "clear_cache"):
+            mx.clear_cache()
+
+
+@dataclass
+class _YieldPauseTracker:
+    enabled: bool
+    pause_ns: int = 0
+
+    def mark(self) -> int:
+        return time.perf_counter_ns() if self.enabled else 0
+
+    def done(self, mark: int) -> None:
+        if self.enabled:
+            self.pause_ns += time.perf_counter_ns() - mark
+
+
+def _build_snapshot_ready_event(
+    *,
+    event_name: str,
+    token_ids: list[int],
+    target_cache: Any,
+    target_hidden: Optional[mx.array],
+    last_logits: Optional[mx.array],
+    snapshot_builder: Optional[PrefixSnapshotBuilder],
+    kind: str,
+    require_logits: bool,
+    snapshot_boundary: int,
+    allow_full_context_draft_layers: bool,
+    from_snapshot: bool = False,
+    snap_prefix_len: int = 0,
+) -> Optional[dict[str, Any]]:
+    if snapshot_builder is None or target_hidden is None:
+        return None
+    if require_logits and last_logits is None:
+        return None
+    try:
+        snapshot = snapshot_builder.build(
+            token_ids=token_ids,
+            target_cache=target_cache,
+            target_hidden=target_hidden,
+            last_logits=last_logits,
+            kind=kind,
+            allow_full_attention_context=allow_full_context_draft_layers,
+        )
+    except Exception as snapshot_err:
+        sys.stderr.write(
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"[dflash] {event_name} build failed: {snapshot_err}\n"
+        )
+        sys.stderr.flush()
+        return None
+    event = {
+        "event": event_name,
+        "snapshot": snapshot,
+        "snapshot_boundary": int(snapshot_boundary),
+    }
+    if kind == "prefill":
+        event.update(
+            {
+                "from_snapshot": bool(from_snapshot),
+                "snap_prefix_len": int(snap_prefix_len),
+            }
+        )
+    return event
+
+
 def stream_dflash_generate_impl(
     *,
     target_model: Any,
+    target_ops: Any,
     tokenizer: Any,
     draft_model: DFlashDraftModel,
+    draft_backend: DraftBackend,
     prompt: str,
     max_new_tokens: int,
     use_chat_template: bool = False,
@@ -51,8 +253,9 @@ def stream_dflash_generate_impl(
     prompt_tokens_override: Optional[list[int]] = None,
     quantize_kv_cache: bool = False,
     prefix_snapshot: Optional[DFlashPrefixSnapshot] = None,
+    prefix_snapshot_builder: Optional[PrefixSnapshotBuilder] = None,
     stable_prefix_len: Optional[int] = None,
-    prefix_cache: Optional[Any] = None,
+    prefix_cache_active: bool = False,
     runtime_context: Any,
 ) -> Iterator[dict[str, Any]]:
     from dflash_mlx.runtime import (
@@ -62,11 +265,12 @@ def stream_dflash_generate_impl(
         build_suppress_token_mask,
         greedy_tokens_with_mask,
     )
-    target_ops = resolve_target_ops(target_model)
-    bind_draft_to_target(draft_model, target_model, target_ops=target_ops)
     target_capabilities = target_ops.capabilities_for(target_model)
     supports_prefix_snapshot = bool(
         getattr(target_capabilities, "supports_prefix_snapshot", True)
+    )
+    allow_full_context_draft_layers = bool(
+        getattr(target_capabilities, "supports_full_context_draft_layers", False)
     )
     if quantize_kv_cache:
         target_ops.configure_full_attention_split(target_model, enabled=False)
@@ -89,6 +293,7 @@ def stream_dflash_generate_impl(
         fallback_reason = f"prompt_len={prompt_len} >= DFLASH_MAX_CTX={dflash_max_ctx}"
         yield from stream_baseline_generate(
             target_model=target_model,
+            target_ops=target_ops,
             tokenizer=tokenizer,
             prompt=prompt,
             max_new_tokens=max_new_tokens,
@@ -100,66 +305,50 @@ def stream_dflash_generate_impl(
             fallback_reason=fallback_reason,
         )
         return
-    draft_sink_size, draft_window_size = resolve_draft_window(
-        runtime_config,
-        draft_model,
-        context_len=prompt_len + max(0, int(max_new_tokens)),
-    )
     prompt_array = mx.array(prompt_tokens, dtype=mx.uint32)[None]
     stop_token_ids = list(stop_token_ids or [])
     stop_token_array = (
         mx.array(stop_token_ids, dtype=mx.uint32) if stop_token_ids else None
     )
 
-    draft_backend = make_draft_backend()
-
-    snap_prefix_len = _validate_prefix_snapshot(prefix_snapshot, prompt_tokens)
-    if not supports_prefix_snapshot:
-        snap_prefix_len = 0
-    if snap_prefix_len > 0 and (quantize_kv_cache or target_fa_window > 0):
-        snap_prefix_len = 0
-    if snap_prefix_len > 0:
-        template_cache = target_ops.make_cache(
-            target_model,
-            enable_speculative_linear_cache=True,
-            quantize_kv_cache=quantize_kv_cache,
-            target_fa_window=target_fa_window,
-        )
-        try:
-            assert prefix_snapshot is not None
-            target_cache = hydrate_target_cache(prefix_snapshot, template_cache)
-        except (ValueError, TypeError):
-            snap_prefix_len = 0
-            target_cache = target_ops.make_cache(
-                target_model,
-                enable_speculative_linear_cache=True,
-                quantize_kv_cache=quantize_kv_cache,
-                target_fa_window=target_fa_window,
-            )
-        finally:
-            del template_cache
-    else:
-        target_cache = target_ops.make_cache(
-            target_model,
-            enable_speculative_linear_cache=True,
-            quantize_kv_cache=quantize_kv_cache,
-            target_fa_window=target_fa_window,
-        )
-    draft_cache = draft_backend.make_cache(
+    session = SpeculativeSession.open(
+        target_model=target_model,
         draft_model=draft_model,
-        sink_size=draft_sink_size,
-        window_size=draft_window_size,
+        draft_backend=draft_backend,
+        target_ops=target_ops,
+        supports_prefix_snapshot=supports_prefix_snapshot,
+        allow_full_context_draft_layers=allow_full_context_draft_layers,
+        prompt_tokens=prompt_tokens,
+        prompt_len=prompt_len,
+        max_new_tokens=max_new_tokens,
+        prefix_snapshot=prefix_snapshot,
+        quantize_kv_cache=quantize_kv_cache,
+        target_fa_window=target_fa_window,
+        runtime_context=runtime_context,
     )
-    target_layer_id_list = list(draft_model.target_layer_ids)
-    capture_layer_ids = {int(layer_id) + 1 for layer_id in draft_model.target_layer_ids}
-    diagnostics = runtime_context.diagnostics
-    profile_cycles = _profile_dflash_cycles_enabled(diagnostics)
-    memory_waterfall = _memory_waterfall_enabled(diagnostics)
-    clear_cache_boundaries = bool(runtime_config.clear_cache_boundaries)
+    target_cache = session.target_cache
+    draft_cache = session.draft_cache
+    draft_backend = session.draft_backend
+    snap_prefix_len = session.snap_prefix_len
+    supports_prefix_snapshot = session.supports_prefix_snapshot
+    allow_full_context_draft_layers = session.allow_full_context_draft_layers
+    if supports_prefix_snapshot and prefix_snapshot_builder is None:
+        if prefix_cache_active:
+            raise ValueError(
+                "prefix_snapshot_builder is required when prefix cache is active"
+            )
+        supports_prefix_snapshot = False
+    draft_sink_size = session.draft_sink_size
+    draft_window_size = session.draft_window_size
+    target_fa_window = session.target_fa_window
+    target_layer_id_list = session.target_layer_id_list
+    capture_layer_ids = session.capture_layer_ids
+    profile_cycles = session.profile_cycles
+    memory_waterfall = session.memory_waterfall
+    clear_cache_boundaries = session.clear_cache_boundaries
 
     def _clear_cache_boundary() -> None:
-        if clear_cache_boundaries and hasattr(mx, "clear_cache"):
-            mx.clear_cache()
+        session.clear_cache_boundary()
 
     def _waterfall_event(
         phase: str,
@@ -168,39 +357,22 @@ def stream_dflash_generate_impl(
         gen_hidden_chunks_value: Any = None,
         extra: Optional[dict[str, Any]] = None,
     ) -> Optional[dict[str, Any]]:
-        if not memory_waterfall:
-            return None
-        return {
-            "event": "memory_waterfall",
-            **_collect_memory_waterfall(
-                phase=phase,
-                target_cache=target_cache,
-                draft_cache=draft_cache,
-                target_hidden=target_hidden_value,
-                gen_hidden_chunks=gen_hidden_chunks_value,
-                prefix_cache=prefix_cache,
-                extra=extra,
-            ),
-        }
+        return session.memory_waterfall_event(
+            phase,
+            target_hidden_value=target_hidden_value,
+            gen_hidden_chunks_value=gen_hidden_chunks_value,
+            extra=extra,
+        )
 
-    _yield_pause_ns = 0
-    track_yield_pause = bool(profile_cycles or memory_waterfall)
-
-    def _yield_start() -> int:
-        return time.perf_counter_ns() if track_yield_pause else 0
-
-    def _yield_done(mark: int) -> None:
-        nonlocal _yield_pause_ns
-        if track_yield_pause:
-            _yield_pause_ns += time.perf_counter_ns() - mark
+    yield_pause = _YieldPauseTracker(enabled=bool(profile_cycles or memory_waterfall))
 
     try:
         start_ns = time.perf_counter_ns()
         evt = _waterfall_event("after_target_cache_create")
         if evt is not None:
-            _pre_yield = _yield_start()
+            _pre_yield = yield_pause.mark()
             yield evt
-            _yield_done(_pre_yield)
+            yield_pause.done(_pre_yield)
         prefill_start_ns = time.perf_counter_ns()
         prefill_step_size = int(runtime_config.prefill_step_size)
         prefill_logits = None
@@ -228,9 +400,9 @@ def stream_dflash_generate_impl(
                 extra={"snap_prefix_len": int(snap_prefix_len)},
             )
             if evt is not None:
-                _pre_yield = _yield_start()
+                _pre_yield = yield_pause.mark()
                 yield evt
-                _yield_done(_pre_yield)
+                yield_pause.done(_pre_yield)
 
         snapshot_boundary = compute_snapshot_boundary(prompt_len, stable_prefix_len)
         prefill_context_len = max(0, snapshot_boundary - 1)
@@ -262,13 +434,13 @@ def stream_dflash_generate_impl(
             if profile_cycles:
                 _phase_cold_ns += time.perf_counter_ns() - _t
             _clear_cache_boundary()
-            _pre_yield = _yield_start()
+            _pre_yield = yield_pause.mark()
             yield {
                 "event": "prefill_progress",
                 "tokens_processed": chunk_end,
                 "tokens_total": prompt_len,
             }
-            _yield_done(_pre_yield)
+            yield_pause.done(_pre_yield)
             evt = _waterfall_event(
                 "after_prefill_chunk",
                 target_hidden_value=target_hidden,
@@ -278,9 +450,9 @@ def stream_dflash_generate_impl(
                 },
             )
             if evt is not None:
-                _pre_yield = _yield_start()
+                _pre_yield = yield_pause.mark()
                 yield evt
-                _yield_done(_pre_yield)
+                yield_pause.done(_pre_yield)
 
         if (
             snap_prefix_len > 0
@@ -320,38 +492,54 @@ def stream_dflash_generate_impl(
             del feat, prefill_hidden_states
             if profile_cycles:
                 _phase_seam_ns += time.perf_counter_ns() - _t
-        _pre_yield = _yield_start()
+        _pre_yield = yield_pause.mark()
         yield {
             "event": "prefill_progress",
             "tokens_processed": snapshot_boundary,
             "tokens_total": prompt_len,
         }
-        _yield_done(_pre_yield)
+        yield_pause.done(_pre_yield)
         if hasattr(mx, "clear_cache"):
             mx.clear_cache()
 
         if supports_prefix_snapshot:
-            _pre_yield = _yield_start()
-            yield {
-                "event": "prefill_snapshot_ready",
-                "token_ids": list(prompt_tokens[:snapshot_boundary]),
-                "target_cache": target_cache,
-                "target_hidden": target_hidden[:, :snapshot_boundary, :] if target_hidden is not None else None,
-                "last_logits": prefill_logits[:, -1, :] if prefill_logits is not None else None,
-                "from_snapshot": bool(snap_prefix_len > 0),
-                "snap_prefix_len": snap_prefix_len,
-                "snapshot_boundary": snapshot_boundary,
-            }
-            _yield_done(_pre_yield)
+            _snapshot_build = yield_pause.mark()
+            snapshot_event = _build_snapshot_ready_event(
+                event_name="prefill_snapshot_ready",
+                token_ids=list(prompt_tokens[:snapshot_boundary]),
+                target_cache=target_cache,
+                target_hidden=(
+                    target_hidden[:, :snapshot_boundary, :]
+                    if target_hidden is not None
+                    else None
+                ),
+                last_logits=(
+                    prefill_logits[:, -1, :]
+                    if prefill_logits is not None
+                    else None
+                ),
+                snapshot_builder=prefix_snapshot_builder,
+                kind="prefill",
+                require_logits=True,
+                snapshot_boundary=snapshot_boundary,
+                allow_full_context_draft_layers=allow_full_context_draft_layers,
+                from_snapshot=bool(snap_prefix_len > 0),
+                snap_prefix_len=snap_prefix_len,
+            )
+            yield_pause.done(_snapshot_build)
+            if snapshot_event is not None:
+                _pre_yield = yield_pause.mark()
+                yield snapshot_event
+                yield_pause.done(_pre_yield)
             evt = _waterfall_event(
                 "after_prefill_snapshot_ready",
                 target_hidden_value=target_hidden,
                 extra={"snapshot_boundary": int(snapshot_boundary)},
             )
             if evt is not None:
-                _pre_yield = _yield_start()
+                _pre_yield = yield_pause.mark()
                 yield evt
-                _yield_done(_pre_yield)
+                yield_pause.done(_pre_yield)
 
         if snapshot_boundary < prompt_len:
             if profile_cycles:
@@ -379,22 +567,22 @@ def stream_dflash_generate_impl(
             if profile_cycles:
                 _phase_tail_ns += time.perf_counter_ns() - _t
             _clear_cache_boundary()
-            _pre_yield = _yield_start()
+            _pre_yield = yield_pause.mark()
             yield {
                 "event": "prefill_progress",
                 "tokens_processed": prompt_len,
                 "tokens_total": prompt_len,
             }
-            _yield_done(_pre_yield)
+            yield_pause.done(_pre_yield)
         evt = _waterfall_event(
             "after_tail_prefill",
             target_hidden_value=target_hidden,
             extra={"prompt_len": int(prompt_len)},
         )
         if evt is not None:
-            _pre_yield = _yield_start()
+            _pre_yield = yield_pause.mark()
             yield evt
-            _yield_done(_pre_yield)
+            yield_pause.done(_pre_yield)
 
         prefill_ns = time.perf_counter_ns() - prefill_start_ns
 
@@ -429,14 +617,14 @@ def stream_dflash_generate_impl(
                     "phase_tail_us": _phase_tail_ns / 1_000.0,
                 }
             )
-        _pre_yield = _yield_start()
+        _pre_yield = yield_pause.mark()
         yield prefill_event
-        _yield_done(_pre_yield)
+        yield_pause.done(_pre_yield)
 
         first_token_yielded = False
         if max_new_tokens > 0:
             first_token_yielded = True
-            _pre_yield = _yield_start()
+            _pre_yield = yield_pause.mark()
             yield {
                 "event": "token",
                 "token_id": int(staged_first.item()),
@@ -444,11 +632,14 @@ def stream_dflash_generate_impl(
                 "acceptance_ratio": 0.0,
                 "cycles_completed": 0,
             }
-            _yield_done(_pre_yield)
+            yield_pause.done(_pre_yield)
 
-        draft_block_size = int(draft_model.block_size)
-        requested_block_tokens = draft_block_size if block_tokens is None else int(block_tokens)
-        effective_block_tokens = max(1, min(requested_block_tokens, draft_block_size))
+        cycle_config = resolve_speculative_cycle_config(
+            runtime_config,
+            draft_model,
+            block_tokens,
+        )
+        effective_block_tokens = cycle_config.effective_block_tokens
         block_token_buffer = mx.full(
             (effective_block_tokens,),
             int(draft_model.mask_token_id),
@@ -462,7 +653,7 @@ def stream_dflash_generate_impl(
         generated_token_ids: list[int] = []
         accepted_from_draft = 0
         cycles_completed = 0
-        verify_len_cap = resolve_verify_len_cap(runtime_config, effective_block_tokens)
+        verify_len_cap = cycle_config.verify_len_cap
         start = prompt_len
 
         draft_ns_total = 0
@@ -506,6 +697,7 @@ def stream_dflash_generate_impl(
                     draft_start_ns = time.perf_counter_ns()
                     drafted = draft_backend.draft_greedy(
                         target_model=target_model,
+                        target_ops=target_ops,
                         draft_model=draft_model,
                         draft_cache=draft_cache,
                         staged_first=current_staged_first,
@@ -529,6 +721,7 @@ def stream_dflash_generate_impl(
                         draft_start_ns = time.perf_counter_ns()
                         drafted = draft_backend.draft_greedy(
                             target_model=target_model,
+                            target_ops=target_ops,
                             draft_model=draft_model,
                             draft_cache=draft_cache,
                             staged_first=current_staged_first,
@@ -570,9 +763,9 @@ def stream_dflash_generate_impl(
                     extra={"cycle": int(cycles_completed + 1), "start": int(start)},
                 )
                 if evt is not None:
-                    _pre_yield = _yield_start()
+                    _pre_yield = yield_pause.mark()
                     yield evt
-                    _yield_done(_pre_yield)
+                    yield_pause.done(_pre_yield)
             verify_start_ns = time.perf_counter_ns()
             verify_logits, verify_hidden_states = target_ops.verify_block(
                 target_model=target_model,
@@ -592,9 +785,9 @@ def stream_dflash_generate_impl(
                     extra={"cycle": int(cycles_completed + 1), "start": int(start)},
                 )
                 if evt is not None:
-                    _pre_yield = _yield_start()
+                    _pre_yield = yield_pause.mark()
                     yield evt
-                    _yield_done(_pre_yield)
+                    yield_pause.done(_pre_yield)
 
             acceptance_start_ns = time.perf_counter_ns() if profile_cycles else 0
             posterior = greedy_tokens_with_mask(verify_logits[0], suppress_token_mask)
@@ -644,9 +837,9 @@ def stream_dflash_generate_impl(
                     },
                 )
                 if evt is not None:
-                    _pre_yield = _yield_start()
+                    _pre_yield = yield_pause.mark()
                     yield evt
-                    _yield_done(_pre_yield)
+                    yield_pause.done(_pre_yield)
             replay_ns_total += replay_cycle_ns
             cycles_completed += 1
             commit_wall_ns = time.perf_counter_ns() - commit_start_ns
@@ -662,6 +855,7 @@ def stream_dflash_generate_impl(
                     draft_start_ns = time.perf_counter_ns()
                     next_drafted = draft_backend.draft_greedy(
                         target_model=target_model,
+                        target_ops=target_ops,
                         draft_model=draft_model,
                         draft_cache=draft_cache,
                         staged_first=staged_first_next,
@@ -689,7 +883,7 @@ def stream_dflash_generate_impl(
                 if first_token_yielded:
                     first_token_yielded = False
                     continue
-                _pre_yield = _yield_start()
+                _pre_yield = yield_pause.mark()
                 yield {
                     "event": "token",
                     "token_id": token_id,
@@ -699,7 +893,7 @@ def stream_dflash_generate_impl(
                     ),
                     "cycles_completed": cycles_completed,
                 }
-                _yield_done(_pre_yield)
+                yield_pause.done(_pre_yield)
 
             stop_hit = False
             if stop_token_array is not None:
@@ -740,9 +934,9 @@ def stream_dflash_generate_impl(
                     "cycle_total_us": _ns_to_us(cycle_total_ns),
                 }
                 cycle_profiles.append(cycle_profile_entry)
-                _pre_yield = _yield_start()
+                _pre_yield = yield_pause.mark()
                 yield {"event": "cycle_complete", **cycle_profile_entry}
-                _yield_done(_pre_yield)
+                yield_pause.done(_pre_yield)
                 profile_totals_ns["draft"] += draft_cycle_ns
                 profile_totals_ns["verify"] += verify_cycle_ns
                 profile_totals_ns["acceptance"] += acceptance_cycle_ns
@@ -771,16 +965,24 @@ def stream_dflash_generate_impl(
                     mx.eval(last_cycle_logits)
                 _clear_cache_boundary()
                 end_total_len = prompt_len + len(generated_token_ids)
-                _pre_yield = _yield_start()
-                yield {
-                    "event": "generation_snapshot_ready",
-                    "token_ids": list(prompt_tokens) + list(generated_token_ids),
-                    "target_cache": target_cache,
-                    "target_hidden": end_target_hidden,
-                    "last_logits": last_cycle_logits,
-                    "snapshot_boundary": end_total_len,
-                }
-                _yield_done(_pre_yield)
+                _snapshot_build = yield_pause.mark()
+                snapshot_event = _build_snapshot_ready_event(
+                    event_name="generation_snapshot_ready",
+                    token_ids=list(prompt_tokens) + list(generated_token_ids),
+                    target_cache=target_cache,
+                    target_hidden=end_target_hidden,
+                    last_logits=last_cycle_logits,
+                    snapshot_builder=prefix_snapshot_builder,
+                    kind="generation",
+                    require_logits=False,
+                    snapshot_boundary=end_total_len,
+                    allow_full_context_draft_layers=allow_full_context_draft_layers,
+                )
+                yield_pause.done(_snapshot_build)
+                if snapshot_event is not None:
+                    _pre_yield = yield_pause.mark()
+                    yield snapshot_event
+                    yield_pause.done(_pre_yield)
                 evt = _waterfall_event(
                     "after_generation_snapshot_build",
                     target_hidden_value=end_target_hidden,
@@ -788,9 +990,9 @@ def stream_dflash_generate_impl(
                     extra={"snapshot_boundary": int(end_total_len)},
                 )
                 if evt is not None:
-                    _pre_yield = _yield_start()
+                    _pre_yield = yield_pause.mark()
                     yield evt
-                    _yield_done(_pre_yield)
+                    yield_pause.done(_pre_yield)
             except Exception as _gen_snap_err:
                 sys.stderr.write(
                     f"{time.strftime('%Y-%m-%d %H:%M:%S')} "
@@ -798,7 +1000,7 @@ def stream_dflash_generate_impl(
                 )
                 sys.stderr.flush()
 
-        elapsed_us = (time.perf_counter_ns() - start_ns - _yield_pause_ns) / 1_000.0
+        elapsed_us = (time.perf_counter_ns() - start_ns - yield_pause.pause_ns) / 1_000.0
         first_20 = acceptance_history[:20]
         last_20 = acceptance_history[-20:]
         summary = {
@@ -841,8 +1043,7 @@ def stream_dflash_generate_impl(
             }
         yield summary
     finally:
-        target_ops.cleanup_generation_caches(target_cache, draft_cache)
+        session.close()
         del draft_cache
         del target_cache
-        if hasattr(mx, "clear_cache"):
-            mx.clear_cache()
+        del session

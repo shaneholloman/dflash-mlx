@@ -8,13 +8,17 @@ import json
 from io import BytesIO
 from types import SimpleNamespace
 
+from dflash_mlx.cache.manager import RuntimeCacheManager
+from dflash_mlx.cache.prefix_l1 import DFlashPrefixCache
 from dflash_mlx.diagnostics import DiagnosticsConfig, TraceConfig
+from dflash_mlx.server import metrics as metrics_mod
 from dflash_mlx.server.metrics import (
     configure_live_metrics,
     record_request_metrics,
     reset_live_metrics_for_tests,
     start_live_request,
     update_live_request,
+    write_post_request_memory_line,
 )
 from dflash_mlx import serve
 from dflash_mlx.serve import DFlashAPIHandler, _build_prompt_regime
@@ -29,6 +33,8 @@ def _runtime_config(**overrides):
         "verify_len_cap": 0,
         "prefix_cache": True,
         "prefix_cache_l2": False,
+        "prefix_cache_l2_dir": "",
+        "prefix_cache_l2_max_bytes": 0,
         "target_fa_window": 0,
         "dflash_max_ctx": 0,
         "memory_waterfall": False,
@@ -44,14 +50,20 @@ def _runtime_config(**overrides):
 
 def _configure_metrics(runtime_config=None):
     runtime_config = runtime_config or _runtime_config()
+    runtime_context = SimpleNamespace(
+        runtime=runtime_config,
+        diagnostics=SimpleNamespace(trace=None),
+    )
     configure_live_metrics(
         version="test-version",
         model_provider=SimpleNamespace(
             model_key=("target-model", None, "draft-model"),
+            draft_model=SimpleNamespace(target_layer_ids=()),
             cli_args=SimpleNamespace(
                 model="target-model",
                 draft_model=None,
                 runtime_config=runtime_config,
+                runtime_context=runtime_context,
                 diagnostics="off",
                 metal_limits=SimpleNamespace(wired_bytes=64 * 1024**3),
             ),
@@ -91,6 +103,42 @@ class FakePrefixCache:
             "evictions": 1,
             "prefill_tokens_saved": 750,
         }
+
+
+class FakePrefixCacheManager:
+    def __init__(self, cache=None):
+        self.cache = cache or FakePrefixCache()
+
+    def stats(self):
+        return self.cache.stats()
+
+
+class BrokenStderr:
+    def write(self, _line):
+        raise RuntimeError("stderr closed")
+
+    def flush(self):
+        raise RuntimeError("stderr closed")
+
+
+def _memory_snapshot(**overrides):
+    values = {
+        "mlx_active_gb": 2.0,
+        "mlx_cache_gb": 0.5,
+        "mlx_peak_gb": 3.0,
+        "rss_gb": 4.0,
+        "rss_peak_gb": 5.0,
+    }
+    values.update(overrides)
+    return values
+
+
+def _patch_memory_snapshot(monkeypatch, **overrides):
+    monkeypatch.setattr(
+        metrics_mod,
+        "get_memory_snapshot",
+        lambda: _memory_snapshot(**overrides),
+    )
 
 
 def test_diagnostics_post_event_records_prefill_details(tmp_path):
@@ -166,7 +214,7 @@ def test_diagnostics_post_event_records_prefill_details(tmp_path):
 def test_metrics_endpoint_returns_json_before_request(monkeypatch):
     reset_live_metrics_for_tests()
     _configure_metrics()
-    monkeypatch.setattr(serve, "_current_dflash_prefix_cache", lambda: None)
+    monkeypatch.setattr(serve, "_current_runtime_cache_manager", lambda: None)
 
     payload = _call_metrics_endpoint()
 
@@ -186,14 +234,172 @@ def test_metrics_endpoint_returns_json_before_request(monkeypatch):
     assert payload["current_request"] is None
     assert payload["last_request"] is None
     assert payload["recent_requests"] == []
+    assert payload["rates"].keys() >= {
+        "requests_per_s",
+        "requests_per_s_60s",
+        "generated_tokens_per_s",
+        "prefill_tokens_physical_per_s",
+        "prefill_tokens_restored_per_s",
+        "active_decode_tok_s",
+    }
+    assert payload["rates"]["requests_per_s"] == 0.0
+    assert payload["rates"]["requests_per_s_60s"] == 0.0
     assert payload["prefix_cache"]["entries"] == 0
     assert payload["totals"]["requests"] == 0
+
+
+def test_metrics_startup_clears_stale_cache_when_runtime_disables_prefix_cache(monkeypatch):
+    import dflash_mlx.cache.manager as cache_manager_mod
+
+    shutdown_calls: list[DFlashPrefixCache] = []
+    original_shutdown = DFlashPrefixCache.shutdown
+
+    def tracked_shutdown(self):
+        shutdown_calls.append(self)
+        return original_shutdown(self)
+
+    stale_cache = DFlashPrefixCache()
+    monkeypatch.setattr(
+        cache_manager_mod,
+        "_DFLASH_RUNTIME_CACHE_MANAGER",
+        RuntimeCacheManager(stale_cache),
+    )
+    monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", ("old",))
+    monkeypatch.setattr(DFlashPrefixCache, "shutdown", tracked_shutdown)
+    reset_live_metrics_for_tests()
+
+    _configure_metrics(_runtime_config(prefix_cache=False, target_fa_window=2048))
+    payload = _call_metrics_endpoint()
+
+    assert shutdown_calls == [stale_cache]
+    assert cache_manager_mod.current_runtime_cache_manager() is None
+    assert payload["runtime"]["prefix_cache_enabled"] is False
+    assert payload["prefix_cache"]["entries"] is None
+
+
+def test_metrics_startup_preserves_request_cache_identity(monkeypatch):
+    import dflash_mlx.cache.manager as cache_manager_mod
+    from dflash_mlx.server.prefix_cache_manager import build_prefix_key
+
+    runtime_config = _runtime_config(prefix_cache=True)
+    runtime_context = SimpleNamespace(
+        runtime=runtime_config,
+        diagnostics=SimpleNamespace(trace=None),
+    )
+    draft_model = SimpleNamespace(target_layer_ids=(3, 7))
+    model_provider = SimpleNamespace(
+        model_key=("target-model", None, "draft-model"),
+        draft_model=draft_model,
+        cli_args=SimpleNamespace(
+            model="target-model",
+            draft_model=None,
+            runtime_config=runtime_config,
+            runtime_context=runtime_context,
+            diagnostics="off",
+            metal_limits=SimpleNamespace(wired_bytes=64 * 1024**3),
+        ),
+    )
+    cache_identity = build_prefix_key(model_provider, draft_model, runtime_context)
+    monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", None)
+    monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", None)
+    existing = cache_manager_mod.get_runtime_cache_manager(
+        runtime_context,
+        cache_identity=cache_identity,
+    )
+    assert existing is not None
+
+    configure_live_metrics(version="test-version", model_provider=model_provider)
+
+    assert cache_manager_mod.current_runtime_cache_manager() is existing
+
+
+def test_post_request_memory_line_logs_snapshot(monkeypatch, capsys):
+    _patch_memory_snapshot(monkeypatch)
+
+    write_post_request_memory_line(request_id=7)
+
+    err = capsys.readouterr().err
+    assert "[dflash] req#7 mlx_active=2.00" in err
+    assert "rss_now=4.00 rss_peak=5.00 untracked=1.50 GB" in err
+
+
+def test_post_request_memory_line_logs_snapshot_failure(monkeypatch, capsys):
+    def boom():
+        raise RuntimeError("no memory today")
+
+    monkeypatch.setattr(metrics_mod, "get_memory_snapshot", boom)
+
+    write_post_request_memory_line(request_id=8)
+
+    err = capsys.readouterr().err
+    assert "[dflash] req#8 memory snapshot failed: no memory today" in err
+
+
+def test_post_request_memory_line_logs_partial_snapshot(monkeypatch, capsys):
+    _patch_memory_snapshot(monkeypatch, mlx_active_gb=None, rss_gb=None)
+
+    write_post_request_memory_line(request_id=9)
+
+    err = capsys.readouterr().err
+    assert "[dflash] req#9 memory snapshot partial unavailable=mlx_active_gb,rss_gb" in err
+    assert "[dflash] req#9 mlx_active=0.00" in err
+
+
+def test_post_request_memory_line_stderr_failure_does_not_raise(monkeypatch):
+    writes: list[tuple[int, bytes]] = []
+    monkeypatch.setattr(metrics_mod.sys, "stderr", BrokenStderr())
+    monkeypatch.setattr(
+        metrics_mod.os,
+        "write",
+        lambda fd, data: writes.append((fd, data)) or len(data),
+    )
+    _patch_memory_snapshot(monkeypatch)
+
+    write_post_request_memory_line(request_id=10)
+
+    assert writes
+    assert b"observability stderr write failed: stderr closed" in writes[0][1]
+
+
+def test_post_request_memory_line_stderr_and_fallback_failure_does_not_raise(monkeypatch):
+    monkeypatch.setattr(metrics_mod.sys, "stderr", BrokenStderr())
+    monkeypatch.setattr(
+        metrics_mod.os,
+        "write",
+        lambda _fd, _data: (_ for _ in ()).throw(OSError("fd closed")),
+    )
+    _patch_memory_snapshot(monkeypatch)
+
+    write_post_request_memory_line(request_id=11)
+
+
+def test_summary_line_stderr_failure_does_not_raise(monkeypatch):
+    writes: list[tuple[int, bytes]] = []
+    monkeypatch.setattr(metrics_mod.sys, "stderr", BrokenStderr())
+    monkeypatch.setattr(
+        metrics_mod.os,
+        "write",
+        lambda fd, data: writes.append((fd, data)) or len(data),
+    )
+
+    metrics_mod.write_summary_line(
+        summary_event={
+            "generation_tokens": 2,
+            "elapsed_us": 2_000_000.0,
+            "phase_timings_us": {"prefill": 1_000_000.0},
+            "acceptance_ratio": 0.5,
+        },
+        prompt_token_count=4,
+    )
+
+    assert writes
+    assert b"observability stderr write failed: stderr closed" in writes[0][1]
 
 
 def test_metrics_endpoint_reports_current_request(monkeypatch):
     reset_live_metrics_for_tests()
     _configure_metrics()
-    monkeypatch.setattr(serve, "_current_dflash_prefix_cache", lambda: None)
+    monkeypatch.setattr(serve, "_current_runtime_cache_manager", lambda: None)
 
     start_live_request(
         request_id=9,
@@ -238,12 +444,17 @@ def test_metrics_endpoint_reports_current_request(monkeypatch):
     assert payload["current_request"]["generated_tokens"] == 3
     assert payload["current_request"]["decode_tok_s"] == 24.0
     assert payload["current_request"]["acceptance_rate"] == 0.75
+    assert payload["rates"]["active_decode_tok_s"] == 24.0
 
 
 def test_metrics_endpoint_reports_last_request_and_prefix_cache(monkeypatch):
     reset_live_metrics_for_tests()
     runtime_config = _configure_metrics()
-    monkeypatch.setattr(serve, "_current_dflash_prefix_cache", lambda: FakePrefixCache())
+    monkeypatch.setattr(
+        serve,
+        "_current_runtime_cache_manager",
+        lambda: FakePrefixCacheManager(),
+    )
 
     record_request_metrics(
         request_id=12,
@@ -298,6 +509,10 @@ def test_metrics_endpoint_reports_last_request_and_prefix_cache(monkeypatch):
     assert payload["totals"]["generated_tokens"] == 100
     assert payload["totals"]["prefill_tokens_physical"] == 250
     assert payload["totals"]["prefill_tokens_restored"] == 750
+    assert payload["rates"]["requests_per_s"] > 0.0
+    assert payload["rates"]["requests_per_s_60s"] > 0.0
+    assert payload["rates"]["generated_tokens_per_s"] > 0.0
+    assert payload["rates"]["active_decode_tok_s"] == last["decode_tok_s"]
     assert len(payload["recent_requests"]) == 1
     assert payload["recent_requests"][0]["request_id"] == 12
 

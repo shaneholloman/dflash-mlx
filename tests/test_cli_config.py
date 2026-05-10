@@ -77,8 +77,7 @@ def test_serve_cli_thinking_default_is_disabled(monkeypatch):
     normalize_cli_args(args)
 
     assert args.enable_thinking is False
-    assert args.chat_template_args == {}
-    assert bool(args.chat_template_args.get("enable_thinking", False)) is False
+    assert args.chat_template_args == {"enable_thinking": False}
     assert args.fastpath_max_tokens == 256
 
 def test_serve_cli_fastpath_max_tokens_zero_is_accepted(monkeypatch):
@@ -135,6 +134,8 @@ def test_serve_help_documents_enable_thinking(capsys):
 
 def test_model_provider_adds_mlx_lm_server_boundary_defaults(monkeypatch):
     _clear_profile_env(monkeypatch)
+    target_ops = object()
+    draft_backend = object()
 
     class FakeGroup:
         def size(self):
@@ -143,12 +144,14 @@ def test_model_provider_adds_mlx_lm_server_boundary_defaults(monkeypatch):
     monkeypatch.setattr(model_provider.mx.distributed, "init", lambda: FakeGroup())
     monkeypatch.setattr(
         model_provider,
-        "load_runtime_components",
-        lambda **_kwargs: (
-            SimpleNamespace(parameters=lambda: []),
-            SimpleNamespace(chat_template=None, default_chat_template=None),
-            SimpleNamespace(parameters=lambda: []),
-            "draft",
+        "load_runtime_bundle",
+        lambda **_kwargs: SimpleNamespace(
+            target_model=SimpleNamespace(parameters=lambda: []),
+            tokenizer=SimpleNamespace(chat_template=None, default_chat_template=None),
+            draft_model=SimpleNamespace(parameters=lambda: []),
+            draft_backend=draft_backend,
+            target_ops=target_ops,
+            resolved_draft_ref="draft",
         ),
     )
     args = build_parser().parse_args(["--model", "m"])
@@ -162,6 +165,9 @@ def test_model_provider_adds_mlx_lm_server_boundary_defaults(monkeypatch):
     assert provider.cli_args is args
     for attr, default in model_provider._MLX_LM_SERVER_DEFAULTS.items():
         assert getattr(args, attr) == default
+    provider.load("default_model")
+    assert provider.target_ops is target_ops
+    assert provider.draft_backend is draft_backend
 
 def test_serve_cli_prefill_step_size_is_not_decorative(monkeypatch):
     _clear_profile_env(monkeypatch)

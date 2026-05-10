@@ -15,7 +15,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 from dflash_mlx.bench_logger import log_post as _bench_log_post
+from dflash_mlx.cache.manager import sync_runtime_cache_manager
 from dflash_mlx.diagnostics import DiagnosticsConfig
+from dflash_mlx.server.prefix_cache_manager import build_prefix_key
 
 _GB = 1_000_000_000.0
 _LIVE_LOCK = threading.Lock()
@@ -44,6 +46,7 @@ _LIVE_METAL_LIMITS: dict[str, Any] = {
 _LIVE_LAST_REQUEST: Optional[dict[str, Any]] = None
 _LIVE_CURRENT_REQUEST: Optional[dict[str, Any]] = None
 _LIVE_RECENT_REQUESTS = deque(maxlen=32)
+_LIVE_REQUEST_FINISH_TIMES = deque(maxlen=512)
 _LIVE_LAST_PREFIX: dict[str, Optional[int]] = {
     "restored": None,
     "computed": None,
@@ -73,6 +76,12 @@ def configure_live_metrics(
         and getattr(runtime_config, "prefix_cache", False)
         and int(target_fa_window or 0) <= 0
     )
+    runtime_context = getattr(cli_args, "runtime_context", None)
+    cache_identity: Any = tuple(model_key)
+    draft_model = getattr(model_provider, "draft_model", None)
+    if runtime_context is not None and draft_model is not None:
+        cache_identity = build_prefix_key(model_provider, draft_model, runtime_context)
+    sync_runtime_cache_manager(runtime_context, cache_identity=cache_identity)
     metal_limits = getattr(cli_args, "metal_limits", None)
     with _LIVE_LOCK:
         global _LIVE_STARTED_AT
@@ -117,18 +126,20 @@ def configure_live_metrics(
             }
         )
 
-def get_live_metrics_payload(*, prefix_cache: Optional[Any] = None) -> dict[str, Any]:
-    prefix_stats = _prefix_cache_payload(prefix_cache)
+def get_live_metrics_payload(*, prefix_cache_manager: Optional[Any] = None) -> dict[str, Any]:
+    prefix_stats = _prefix_cache_payload(prefix_cache_manager)
     now = time.time()
     with _LIVE_LOCK:
         server = dict(_LIVE_SERVER)
         server["uptime_s"] = max(0.0, now - _LIVE_STARTED_AT)
+        started_at = _LIVE_STARTED_AT
         runtime = dict(_LIVE_RUNTIME)
         last_request = None if _LIVE_LAST_REQUEST is None else dict(_LIVE_LAST_REQUEST)
         current_request = _current_request_payload(_LIVE_CURRENT_REQUEST, now)
         recent_requests = [dict(request) for request in _LIVE_RECENT_REQUESTS]
         totals = dict(_LIVE_TOTALS)
         metal_limits = dict(_LIVE_METAL_LIMITS)
+        finish_times = list(_LIVE_REQUEST_FINISH_TIMES)
     payload = {
         "server": server,
         "runtime": runtime,
@@ -136,11 +147,19 @@ def get_live_metrics_payload(*, prefix_cache: Optional[Any] = None) -> dict[str,
         "current_request": current_request,
         "last_request": last_request,
         "recent_requests": recent_requests,
+        "rates": _rates_payload(
+            totals=totals,
+            current_request=current_request,
+            last_request=last_request,
+            finish_times=finish_times,
+            started_at=started_at,
+            now=now,
+        ),
         "prefix_cache": prefix_stats,
         "totals": totals,
     }
-    if prefix_cache is not None:
-        stats = prefix_cache.stats()
+    if prefix_cache_manager is not None:
+        stats = prefix_cache_manager.stats()
         payload["totals"]["cache_hits"] = int(
             stats.get("exact_hits", 0) + stats.get("prefix_hits", 0)
         )
@@ -283,6 +302,7 @@ def reset_live_metrics_for_tests() -> None:
         _LIVE_LAST_REQUEST = None
         _LIVE_CURRENT_REQUEST = None
         _LIVE_RECENT_REQUESTS.clear()
+        _LIVE_REQUEST_FINISH_TIMES.clear()
         _LIVE_LAST_PREFIX.update({"restored": None, "computed": None})
         for key in _LIVE_TOTALS:
             _LIVE_TOTALS[key] = 0
@@ -305,13 +325,67 @@ def write_summary_line(
     tok_s = (generation_tokens / decode_s) if decode_s > 0.0 else 0.0
     acceptance_pct = float(summary_event.get("acceptance_ratio", 0.0) or 0.0) * 100.0
     total_s = elapsed_us / 1_000_000.0
-    sys.stderr.write(
+    _write_observability_line(
         f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] {tok_s:.1f} tok/s | "
         f"prefill {prefill_tok_s:.1f} tok/s | "
         f"{acceptance_pct:.1f}% accepted | {generation_tokens} tokens | "
         f"{total_s:.1f}s | prompt: {prompt_token_count} tokens\n"
     )
-    sys.stderr.flush()
+
+
+def write_post_request_memory_line(*, request_id: int) -> None:
+    try:
+        memory = get_memory_snapshot()
+    except Exception as exc:
+        _write_observability_line(
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"[dflash] req#{request_id} memory snapshot failed: {exc}\n"
+        )
+        return
+    unavailable = [
+        key
+        for key in (
+            "mlx_active_gb",
+            "mlx_cache_gb",
+            "mlx_peak_gb",
+            "rss_gb",
+            "rss_peak_gb",
+        )
+        if memory.get(key) is None
+    ]
+    if unavailable:
+        _write_observability_line(
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"[dflash] req#{request_id} memory snapshot partial "
+            f"unavailable={','.join(unavailable)}\n"
+        )
+    mlx_active_gb = _float_or_none(memory.get("mlx_active_gb")) or 0.0
+    mlx_cache_gb = _float_or_none(memory.get("mlx_cache_gb")) or 0.0
+    mlx_peak_gb = _float_or_none(memory.get("mlx_peak_gb")) or 0.0
+    rss_now_gb = _float_or_none(memory.get("rss_gb")) or 0.0
+    rss_peak_gb = _float_or_none(memory.get("rss_peak_gb")) or 0.0
+    untracked_gb = max(0.0, rss_now_gb - mlx_active_gb - mlx_cache_gb)
+    _write_observability_line(
+        f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] req#{request_id} "
+        f"mlx_active={mlx_active_gb:.2f} mlx_cache={mlx_cache_gb:.2f} "
+        f"mlx_peak={mlx_peak_gb:.2f} rss_now={rss_now_gb:.2f} "
+        f"rss_peak={rss_peak_gb:.2f} untracked={untracked_gb:.2f} GB\n"
+    )
+
+def _write_observability_line(line: str) -> None:
+    try:
+        sys.stderr.write(line)
+        sys.stderr.flush()
+    except Exception as exc:
+        fallback = (
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"[dflash] observability stderr write failed: {exc}\n"
+        )
+        try:
+            os.write(2, fallback.encode())
+        except OSError:
+            return
+
 
 def record_request_metrics(
     *,
@@ -616,11 +690,47 @@ def _finish_live_request_unlocked(last_request: dict[str, Any]) -> None:
     global _LIVE_LAST_REQUEST, _LIVE_CURRENT_REQUEST
     _LIVE_LAST_REQUEST = dict(last_request)
     _LIVE_RECENT_REQUESTS.append(dict(last_request))
+    _LIVE_REQUEST_FINISH_TIMES.append(time.time())
     if (
         _LIVE_CURRENT_REQUEST is not None
         and _LIVE_CURRENT_REQUEST.get("request_id") == last_request.get("request_id")
     ):
         _LIVE_CURRENT_REQUEST = None
+
+def _rates_payload(
+    *,
+    totals: dict[str, int],
+    current_request: Optional[dict[str, Any]],
+    last_request: Optional[dict[str, Any]],
+    finish_times: list[float],
+    started_at: float,
+    now: float,
+) -> dict[str, Optional[float]]:
+    uptime_s = max(0.0, now - started_at)
+    requests = int(totals.get("requests", 0) or 0)
+    recent_window_s = min(60.0, uptime_s)
+    recent_cutoff = now - 60.0
+    recent_requests = sum(1 for ts in finish_times if ts >= recent_cutoff)
+    source = current_request if current_request is not None else last_request
+    return {
+        "requests_per_s": _rate(requests, uptime_s),
+        "requests_per_s_60s": _rate(recent_requests, recent_window_s),
+        "generated_tokens_per_s": _rate(
+            int(totals.get("generated_tokens", 0) or 0),
+            uptime_s,
+        ),
+        "prefill_tokens_physical_per_s": _rate(
+            int(totals.get("prefill_tokens_physical", 0) or 0),
+            uptime_s,
+        ),
+        "prefill_tokens_restored_per_s": _rate(
+            int(totals.get("prefill_tokens_restored", 0) or 0),
+            uptime_s,
+        ),
+        "active_decode_tok_s": _float_or_none(
+            None if source is None else source.get("decode_tok_s")
+        ),
+    }
 
 def _current_request_payload(
     current: Optional[dict[str, Any]],
@@ -670,12 +780,12 @@ def _last_request_payload(
         "finish_reason": finish_reason,
     }
 
-def _prefix_cache_payload(prefix_cache: Optional[Any]) -> dict[str, Any]:
+def _prefix_cache_payload(prefix_cache_manager: Optional[Any]) -> dict[str, Any]:
     with _LIVE_LOCK:
         config = dict(_LIVE_PREFIX_CONFIG)
         last_request = None if _LIVE_LAST_REQUEST is None else dict(_LIVE_LAST_REQUEST)
         last_prefix = dict(_LIVE_LAST_PREFIX)
-    if prefix_cache is None:
+    if prefix_cache_manager is None:
         if not config.get("enabled"):
             return {
                 "entries": None,
@@ -703,7 +813,7 @@ def _prefix_cache_payload(prefix_cache: Optional[Any]) -> dict[str, Any]:
             "last_restored_tokens": None,
             "last_computed_tokens": None,
         }
-    stats = prefix_cache.stats()
+    stats = prefix_cache_manager.stats()
     return {
         "entries": _int_or_none(stats.get("current_entries")),
         "max_entries": _int_or_none(stats.get("max_entries")),
@@ -868,6 +978,11 @@ def _seconds_or_none(value_ms: Optional[float]) -> Optional[float]:
     if value_ms is None:
         return None
     return float(value_ms) / 1_000.0
+
+def _rate(count: int, elapsed_s: float) -> Optional[float]:
+    if elapsed_s <= 0.0:
+        return None
+    return float(count) / float(elapsed_s)
 
 def _float_or_none(value: Optional[float]) -> Optional[float]:
     if value is None:

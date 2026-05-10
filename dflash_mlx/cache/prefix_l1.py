@@ -320,6 +320,51 @@ class DFlashPrefixCache:
             out["l2"] = self._l2.stats()
         return out
 
+    def memory_waterfall_bytes(self) -> dict[str, int]:
+        out = {
+            "l1_snapshot_bytes": 0,
+            "l1_snapshot_fa_kv_bytes": 0,
+            "l1_snapshot_gdn_state_bytes": 0,
+            "l1_snapshot_target_hidden_bytes": 0,
+            "l1_snapshot_last_logits_bytes": 0,
+            "l2_disk_bytes": 0,
+            "prefix_prunes": 0,
+            "cross_kind_prunes": 0,
+            "byte_budget_evictions": 0,
+            "l2_hits": 0,
+            "l2_writes": 0,
+            "l2_misses": 0,
+        }
+        with self._lock:
+            stats = dict(self._stats)
+            entries = list(self._entries.values())
+            current_bytes = self._current_bytes()
+        out["l1_snapshot_bytes"] = int(current_bytes)
+        out["prefix_prunes"] = int(stats.get("prefix_prunes", 0))
+        out["cross_kind_prunes"] = int(stats.get("cross_kind_prunes", 0))
+        out["byte_budget_evictions"] = int(stats.get("byte_budget_evictions", 0))
+        out["l2_hits"] = int(stats.get("l2_hits", 0))
+        out["l2_misses"] = int(stats.get("l2_misses", 0))
+        if self._l2 is not None:
+            l2 = self._l2.stats()
+            out["l2_disk_bytes"] = int(l2.get("current_bytes", 0) or 0)
+            out["l2_writes"] = int(l2.get("writes", 0) or 0)
+        if entries:
+            fa = gdn = hidden = logits = total = 0
+            for snapshot in entries:
+                breakdown = snapshot.nbytes_breakdown()
+                fa += int(breakdown.get("fa_kv", 0) or 0)
+                gdn += int(breakdown.get("gdn_state", 0) or 0)
+                hidden += int(breakdown.get("target_hidden", 0) or 0)
+                logits += int(breakdown.get("last_logits", 0) or 0)
+                total += int(snapshot.nbytes)
+            out["l1_snapshot_bytes"] = total
+            out["l1_snapshot_fa_kv_bytes"] = fa
+            out["l1_snapshot_gdn_state_bytes"] = gdn
+            out["l1_snapshot_target_hidden_bytes"] = hidden
+            out["l1_snapshot_last_logits_bytes"] = logits
+        return out
+
     def clear(self) -> None:
         with self._lock:
             self._entries.clear()

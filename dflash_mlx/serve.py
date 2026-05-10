@@ -17,14 +17,18 @@ warnings.filterwarnings("ignore", message="mlx_lm.server is not recommended")
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 try:
     from huggingface_hub.utils import disable_progress_bars
-except Exception:
+except ImportError:
     disable_progress_bars = None
 
 if disable_progress_bars is not None:
     try:
         disable_progress_bars()
-    except Exception:
-        pass
+    except Exception as exc:
+        sys.stderr.write(
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"[dflash] huggingface progress bar disable failed: {exc}\n"
+        )
+        sys.stderr.flush()
 
 import mlx.core as mx
 import mlx_lm.server as mlx_server
@@ -39,7 +43,9 @@ from dflash_mlx.server.config import (
 from dflash_mlx.server.protocol import (
     STATEFUL_SERVER_API as _STATEFUL_SERVER_API,
     build_generation_context as _build_generation_context,
+    make_state_machine as _make_state_machine,
     match_stream_token as _match_stream_token,
+    thinking_enabled_for_request as _thinking_enabled_for_request,
 )
 from dflash_mlx.bench_logger import (
     enabled as _bench_enabled,
@@ -48,11 +54,11 @@ from dflash_mlx.bench_logger import (
 from dflash_mlx.server.metrics import (
     clear_live_request as _clear_live_request,
     configure_live_metrics as _configure_live_metrics,
-    get_memory_snapshot as _get_memory_snapshot,
     get_live_metrics_payload as _get_live_metrics_payload,
     record_request_metrics as _record_request_metrics,
     record_target_only_request as _record_target_only_request,
     start_live_request as _start_live_request,
+    write_post_request_memory_line as _write_post_request_memory_line,
     write_summary_line as _write_summary_line,
 )
 from dflash_mlx.server.model_provider import (
@@ -61,15 +67,15 @@ from dflash_mlx.server.model_provider import (
 )
 from dflash_mlx.runtime import get_stop_token_ids, stream_dflash_generate
 from dflash_mlx.runtime_context import with_metal_limits
-from dflash_mlx.server.prefix_cache_flow import (
-    PrefixCacheFlow,
-    current_dflash_prefix_cache as _current_dflash_prefix_cache,
-    get_dflash_prefix_cache as _get_dflash_prefix_cache,
-    log_prefix_cache_stats,
-    shutdown_dflash_prefix_cache,
+from dflash_mlx.cache.manager import (
+    current_runtime_cache_manager as _current_runtime_cache_manager,
+    shutdown_runtime_cache_manager,
 )
-from dflash_mlx.server.prefix_cache_manager import (
-    build_prefix_key as _build_prefix_key,
+from dflash_mlx.server.prefix_cache_flow import PrefixCacheFlow
+from dflash_mlx.server.responses_adapter import (
+    ResponsesAdapterError,
+    chat_response_to_responses,
+    responses_to_chat_body,
 )
 from dflash_mlx.server.request_loop import consume_dflash_events
 
@@ -111,57 +117,110 @@ def _build_prompt_regime(args, tokenizer, request=None) -> dict[str, object]:
     }
 
 class DFlashResponseGenerator(mlx_server.ResponseGenerator):
+    def _restore_thinking_enabled(self, had_previous: bool, previous: object) -> None:
+        if had_previous:
+            self._current_thinking_enabled = previous
+        elif hasattr(self, "_current_thinking_enabled"):
+            delattr(self, "_current_thinking_enabled")
+
+    def _tokenize(self, tokenizer, request, args):
+        tokenized = super()._tokenize(tokenizer, request, args)
+        if (
+            not bool(getattr(self, "_current_thinking_enabled", True))
+            and isinstance(tokenized, tuple)
+            and len(tokenized) == 4
+        ):
+            prompt, segments, segment_types, _initial_state = tokenized
+            return prompt, segments, segment_types, "normal"
+        return tokenized
+
+    def _make_state_machine(
+        self,
+        model_key,
+        tokenizer,
+        stop_words,
+        initial_state="normal",
+    ):
+        include_thinking = bool(getattr(self, "_current_thinking_enabled", True))
+        cache_key = (model_key, tuple(stop_words), initial_state, include_thinking)
+        cached = self._state_machine_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        sm, sequences = _make_state_machine(
+            tokenizer=tokenizer,
+            stop_words=stop_words,
+            initial_state=initial_state,
+            include_thinking=include_thinking,
+        )
+        if len(self._state_machine_cache) > 100:
+            self._state_machine_cache.clear()
+        self._state_machine_cache[cache_key] = (sm, sequences)
+        return sm, sequences
+
     def _serve_single(self, request):
         request_tuple = request
         rqueue, request, args = request_tuple
 
         request_id = next(_DFLASH_REQUEST_COUNTER)
-        runtime_context = self.model_provider.cli_args.runtime_context
-        trace_config = runtime_context.diagnostics.trace
-        bench_active = _bench_enabled(trace_config)
-        fastpath_max_tokens = int(
-            getattr(self.model_provider.cli_args, "fastpath_max_tokens", 256) or 0
+        had_previous_thinking_enabled = hasattr(self, "_current_thinking_enabled")
+        previous_thinking_enabled = getattr(self, "_current_thinking_enabled", None)
+        self._current_thinking_enabled = _thinking_enabled_for_request(
+            self.model_provider.cli_args,
+            args,
         )
+        try:
+            runtime_context = self.model_provider.cli_args.runtime_context
+            trace_config = runtime_context.diagnostics.trace
+            bench_active = _bench_enabled(trace_config)
+            fastpath_max_tokens = int(
+                getattr(self.model_provider.cli_args, "fastpath_max_tokens", 256) or 0
+            )
 
-        if fastpath_max_tokens > 0 and args.max_tokens <= fastpath_max_tokens:
-            sys.stderr.write(
-                f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] fast-path AR | "
-                f"max_tokens={args.max_tokens} threshold={fastpath_max_tokens}\n"
-            )
-            sys.stderr.flush()
-            saved_draft_model = self.model_provider.draft_model
-            wall_t0 = time.perf_counter_ns()
-            _start_live_request(
-                request_id=request_id,
-                mode_used="ar_fastpath",
-                prompt_tokens=None,
-                max_tokens=int(args.max_tokens),
-            )
-            try:
-                self.model_provider.draft_model = None
-                return super()._serve_single((rqueue, request, args))
-            finally:
-                self.model_provider.draft_model = saved_draft_model
-                wall_ms = (time.perf_counter_ns() - wall_t0) / 1e6
-                _record_target_only_request(
+            if fastpath_max_tokens > 0 and args.max_tokens <= fastpath_max_tokens:
+                sys.stderr.write(
+                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] fast-path AR | "
+                    f"max_tokens={args.max_tokens} threshold={fastpath_max_tokens}\n"
+                )
+                sys.stderr.flush()
+                saved_draft_model = self.model_provider.draft_model
+                wall_t0 = time.perf_counter_ns()
+                _start_live_request(
                     request_id=request_id,
                     mode_used="ar_fastpath",
-                    wall_ms=wall_ms,
+                    prompt_tokens=None,
                     max_tokens=int(args.max_tokens),
                 )
-                if bench_active:
-                    _bench_log_post(
-                        trace_config,
+                try:
+                    self.model_provider.draft_model = None
+                    return super()._serve_single((rqueue, request, args))
+                finally:
+                    self.model_provider.draft_model = saved_draft_model
+                    wall_ms = (time.perf_counter_ns() - wall_t0) / 1e6
+                    _record_target_only_request(
                         request_id=request_id,
                         mode_used="ar_fastpath",
-                        max_tokens=int(args.max_tokens),
                         wall_ms=wall_ms,
+                        max_tokens=int(args.max_tokens),
                     )
+                    if bench_active:
+                        _bench_log_post(
+                            trace_config,
+                            request_id=request_id,
+                            mode_used="ar_fastpath",
+                            max_tokens=int(args.max_tokens),
+                            wall_ms=wall_ms,
+                        )
 
-        try:
             model = self.model_provider.model
             tokenizer = self.model_provider.tokenizer
             draft_model = self.model_provider.draft_model
+            draft_backend = getattr(self.model_provider, "draft_backend", None)
+            target_ops = getattr(self.model_provider, "target_ops", None)
+            if draft_backend is None:
+                raise RuntimeError("DFlash draft backend is not loaded")
+            if target_ops is None:
+                raise RuntimeError("DFlash target ops are not loaded")
             tokenized = self._tokenize(tokenizer, request, args)
             if isinstance(tokenized, tuple):
                 prompt, _, _, initial_state = tokenized
@@ -186,6 +245,7 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
                 prompt,
                 stop_words=args.stop_words,
                 sequences=sequences,
+                has_thinking=self._current_thinking_enabled,
             )
             rqueue.put(ctx)
 
@@ -214,16 +274,19 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
 
             event_iter = stream_dflash_generate(
                 target_model=model,
+                target_ops=target_ops,
                 tokenizer=tokenizer,
                 draft_model=draft_model,
+                draft_backend=draft_backend,
                 prompt="",
                 max_new_tokens=args.max_tokens,
                 use_chat_template=False,
                 stop_token_ids=stop_token_ids,
                 prompt_tokens_override=prompt,
                 prefix_snapshot=prefix_flow.snapshot,
+                prefix_snapshot_builder=prefix_flow.snapshot_builder,
                 stable_prefix_len=prefix_flow.stable_prefix_len,
-                prefix_cache=prefix_flow.cache,
+                prefix_cache_active=prefix_flow.cache_active,
                 runtime_context=runtime_context,
             )
             loop_result = consume_dflash_events(
@@ -270,26 +333,16 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
                 prefill_event=loop_result.prefill_event,
                 runtime_config=runtime_context.runtime,
             )
-            try:
-                memory = _get_memory_snapshot()
-                mlx_active_gb = float(memory.get("mlx_active_gb") or 0.0)
-                mlx_cache_gb = float(memory.get("mlx_cache_gb") or 0.0)
-                mlx_peak_gb = float(memory.get("mlx_peak_gb") or 0.0)
-                rss_now_gb = float(memory.get("rss_gb") or 0.0)
-                rss_peak_gb = float(memory.get("rss_peak_gb") or 0.0)
-                untracked_gb = max(0.0, rss_now_gb - mlx_active_gb - mlx_cache_gb)
-                sys.stderr.write(
-                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] req#{request_id} "
-                    f"mlx_active={mlx_active_gb:.2f} mlx_cache={mlx_cache_gb:.2f} mlx_peak={mlx_peak_gb:.2f} "
-                    f"rss_now={rss_now_gb:.2f} rss_peak={rss_peak_gb:.2f} untracked={untracked_gb:.2f} GB\n"
-                )
-                sys.stderr.flush()
-            except Exception:
-                pass
+            _write_post_request_memory_line(request_id=request_id)
             rqueue.put(None)
         except Exception as e:
             _clear_live_request(request_id=request_id)
             rqueue.put(e)
+        finally:
+            self._restore_thinking_enabled(
+                had_previous_thinking_enabled,
+                previous_thinking_enabled,
+            )
 
 class DFlashAPIHandler(mlx_server.APIHandler):
     def do_GET(self):
@@ -298,12 +351,117 @@ class DFlashAPIHandler(mlx_server.APIHandler):
             return
         return super().do_GET()
 
+    def do_POST(self):
+        if self.path.split("?", 1)[0] == "/v1/responses":
+            self.handle_responses_request()
+            return
+        return super().do_POST()
+
     def handle_metrics_request(self):
         payload = _get_live_metrics_payload(
-            prefix_cache=_current_dflash_prefix_cache(),
+            prefix_cache_manager=_current_runtime_cache_manager(),
         )
         body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
         self._set_completion_headers(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+
+    def handle_responses_request(self):
+        try:
+            body = self._read_json_body()
+            chat_body = responses_to_chat_body(body)
+            self._serve_responses_as_chat(chat_body)
+        except ResponsesAdapterError as e:
+            self._write_json_response(400, {"error": str(e)})
+
+    def _serve_responses_as_chat(self, chat_body: dict[str, object]) -> None:
+        previous_body = getattr(self, "body", None)
+        previous_path = self.path
+        previous_responses_mode = getattr(self, "_responses_mode", None)
+        self.body = chat_body
+        self.path = "/v1/chat/completions"
+        self._responses_mode = True
+        try:
+            stop_words = self._load_completion_fields(chat_body)
+            request = self.handle_chat_completions()
+            self.handle_completion(request, stop_words)
+        except ValueError as e:
+            self._write_json_response(400, {"error": str(e)})
+        finally:
+            self.body = previous_body
+            self.path = previous_path
+            if previous_responses_mode is None:
+                if hasattr(self, "_responses_mode"):
+                    delattr(self, "_responses_mode")
+            else:
+                self._responses_mode = previous_responses_mode
+
+    def _read_json_body(self) -> dict[str, object]:
+        content_length = self.headers.get("Content-Length")
+        if content_length is None:
+            raise ResponsesAdapterError("Content-Length header is required")
+        try:
+            length = int(content_length)
+        except ValueError as exc:
+            raise ResponsesAdapterError("Invalid Content-Length header") from exc
+        try:
+            body = json.loads(self.rfile.read(length).decode())
+        except json.JSONDecodeError as exc:
+            raise ResponsesAdapterError(f"Invalid JSON in request body: {exc}") from exc
+        if not isinstance(body, dict):
+            raise ResponsesAdapterError("Request should be a JSON dictionary")
+        return body
+
+    def _load_completion_fields(self, body: dict[str, object]) -> list[str]:
+        self.stream = bool(body.get("stream", False))
+        self.stream_options = body.get("stream_options", None)
+        self.requested_model = body.get("model", "default_model")
+        self.requested_draft_model = body.get("draft_model", "default_model")
+        self.num_draft_tokens = body.get(
+            "num_draft_tokens",
+            self.response_generator.cli_args.num_draft_tokens,
+        )
+        self.adapter = body.get("adapters", None)
+        self.max_tokens = body.get("max_completion_tokens", None)
+        if self.max_tokens is None:
+            self.max_tokens = body.get(
+                "max_tokens",
+                self.response_generator.cli_args.max_tokens,
+            )
+        self.temperature = body.get(
+            "temperature",
+            self.response_generator.cli_args.temp,
+        )
+        self.top_p = body.get("top_p", self.response_generator.cli_args.top_p)
+        self.top_k = body.get("top_k", self.response_generator.cli_args.top_k)
+        self.min_p = body.get("min_p", self.response_generator.cli_args.min_p)
+        self.repetition_penalty = body.get("repetition_penalty", 0.0)
+        self.repetition_context_size = body.get("repetition_context_size", 20)
+        self.presence_penalty = body.get("presence_penalty", 0.0)
+        self.presence_context_size = body.get("presence_context_size", 20)
+        self.frequency_penalty = body.get("frequency_penalty", 0.0)
+        self.frequency_context_size = body.get("frequency_context_size", 20)
+        self.xtc_probability = body.get("xtc_probability", 0.0)
+        self.xtc_threshold = body.get("xtc_threshold", 0.0)
+        self.logit_bias = body.get("logit_bias", None)
+        self.logprobs = body.get("logprobs", False)
+        self.top_logprobs = body.get("top_logprobs", -1)
+        self.seed = body.get("seed", None)
+        self.chat_template_kwargs = body.get("chat_template_kwargs")
+        self.validate_model_parameters()
+
+        stop_words = body.get("stop") or []
+        if isinstance(stop_words, str):
+            return [stop_words]
+        if not isinstance(stop_words, list):
+            raise ValueError("stop must be a string or list")
+        return stop_words
+
+    def _write_json_response(self, status: int, payload: dict[str, object]) -> None:
+        body = json.dumps(payload, separators=(",", ":")).encode()
+        self._set_completion_headers(status)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -329,6 +487,8 @@ class DFlashAPIHandler(mlx_server.APIHandler):
         )
         if served_model:
             response["model"] = served_model
+        if getattr(self, "_responses_mode", False):
+            return chat_response_to_responses(response)
         return response
 
 def _print_startup_banner(
@@ -488,7 +648,7 @@ def _run_with_dflash_server(host: str, port: int, model_provider: DFlashModelPro
                 handler_class=DFlashAPIHandler,
             )
         finally:
-            shutdown_dflash_prefix_cache()
+            shutdown_runtime_cache_manager()
     else:
         response_generator.join()
 

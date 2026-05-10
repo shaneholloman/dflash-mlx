@@ -36,3 +36,7 @@ benchmark/*.bak
 .idea/
 /uv.lock
 .claude/
+.codex/
+.local/
+.agents/
+skills-lock.json

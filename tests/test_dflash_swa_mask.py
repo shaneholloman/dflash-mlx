@@ -4,7 +4,7 @@
 
 import mlx.core as mx
 
-from dflash_mlx import runtime
+from dflash_mlx.engine.config import _effective_draft_window_size
 from dflash_mlx.model import (
     ContextOnlyDraftKVCache,
     DFlashAttention,
@@ -160,8 +160,8 @@ def test_sliding_attention_disables_unmasked_fast_cross_attention(monkeypatch):
 def test_effective_draft_window_never_under_model_swa_window():
     draft_model = DFlashDraftModel(_args(sliding_window=2048))
 
-    assert runtime._effective_draft_window_size(draft_model, 1024) == 2048
-    assert runtime._effective_draft_window_size(draft_model, 4096) == 4096
+    assert _effective_draft_window_size(draft_model, 1024) == 2048
+    assert _effective_draft_window_size(draft_model, 4096) == 4096
 
 def test_effective_draft_window_expands_unwindowed_full_attention_to_context():
     draft_model = DFlashDraftModel(
@@ -169,10 +169,11 @@ def test_effective_draft_window_expands_unwindowed_full_attention_to_context():
     )
 
     assert (
-        runtime._effective_draft_window_size(
+        _effective_draft_window_size(
             draft_model,
             1024,
             context_len=4096,
+            allow_full_attention_context=True,
         )
         == 4096
     )
@@ -183,11 +184,10 @@ def test_effective_draft_window_can_keep_explicit_user_window():
     )
 
     assert (
-        runtime._effective_draft_window_size(
+        _effective_draft_window_size(
             draft_model,
             1024,
             context_len=4096,
-            allow_full_attention_context=False,
         )
         == 1024
     )

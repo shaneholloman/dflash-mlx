@@ -346,7 +346,7 @@ def _check_model(args: argparse.Namespace) -> DoctorCheck:
             {"model": None},
         )
     try:
-        from dflash_mlx.generate import resolve_optional_draft_ref
+        from dflash_mlx.runtime_registry import resolve_optional_draft_ref
 
         draft = resolve_optional_draft_ref(args.model, args.draft_model)
     except Exception as exc:
@@ -376,26 +376,29 @@ def _check_load_model(
             {"model": None},
         )
     try:
-        from dflash_mlx.runtime import load_target_bundle
+        from dflash_mlx.runtime_bundle import load_runtime_bundle
 
         context = build_runtime_context(cfg) if cfg is not None else None
-        load_target_bundle(
-            args.model,
-            lazy=True,
+        bundle = load_runtime_bundle(
+            model_ref=args.model,
+            draft_ref=args.draft_model,
             verify_config=context.verify if context is not None else None,
         )
     except Exception as exc:
         return DoctorCheck(
             "load_model",
             "fatal",
-            "target model failed to load",
+            "runtime bundle failed to load",
             {"model": args.model, "error": str(exc)},
         )
     return DoctorCheck(
         "load_model",
         "ok",
-        "target model loads",
-        {"model": args.model},
+        "runtime bundle loads",
+        {
+            "model": bundle.resolved_model_ref,
+            "draft": bundle.resolved_draft_ref,
+        },
     )
 
 def _effective_config_payload(

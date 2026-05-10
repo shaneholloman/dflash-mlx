@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 from dflash_mlx import doctor
 
@@ -61,6 +62,39 @@ def test_doctor_model_draft_resolution(monkeypatch, capsys):
     model_check = next(check for check in report["checks"] if check["name"] == "model")
     assert model_check["status"] == "ok"
     assert model_check["details"]["draft"] == "z-lab/Qwen3.6-27B-DFlash"
+
+def test_doctor_load_model_uses_runtime_bundle(monkeypatch, capsys):
+    _clear_doctor_env(monkeypatch)
+    calls = []
+
+    import dflash_mlx.runtime_bundle as runtime_bundle
+
+    def fake_load_runtime_bundle(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            resolved_model_ref="Qwen/Qwen3.5-9B",
+            resolved_draft_ref="manual/draft",
+        )
+
+    monkeypatch.setattr(runtime_bundle, "load_runtime_bundle", fake_load_runtime_bundle)
+
+    code, report = _json_run(
+        ["--model", "Qwen/Qwen3.5-9B", "--draft", "manual/draft", "--load-model"],
+        capsys,
+    )
+
+    assert code in (0, 2)
+    assert calls
+    assert calls[0]["model_ref"] == "Qwen/Qwen3.5-9B"
+    assert calls[0]["draft_ref"] == "manual/draft"
+    assert calls[0]["verify_config"].mode == "auto"
+    load_check = next(check for check in report["checks"] if check["name"] == "load_model")
+    assert load_check["status"] == "ok"
+    assert load_check["message"] == "runtime bundle loads"
+    assert load_check["details"] == {
+        "model": "Qwen/Qwen3.5-9B",
+        "draft": "manual/draft",
+    }
 
 def test_doctor_warns_on_target_fa_window(monkeypatch, capsys):
     _clear_doctor_env(monkeypatch)

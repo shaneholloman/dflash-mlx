@@ -176,6 +176,15 @@ def test_prefix_cache_fingerprint_separates_target_fa_window():
 
 def test_prefix_cache_flow_disabled_for_windowed_target(monkeypatch):
     import dflash_mlx.server.prefix_cache_flow as flow_mod
+    import dflash_mlx.cache.manager as cache_manager_mod
+    from dflash_mlx.cache.manager import RuntimeCacheManager
+
+    shutdown_calls: list[DFlashPrefixCache] = []
+    original_shutdown = DFlashPrefixCache.shutdown
+
+    def tracked_shutdown(self):
+        shutdown_calls.append(self)
+        return original_shutdown(self)
 
     class FakeProvider:
         model_key = ("target", None, "draft")
@@ -189,7 +198,18 @@ def test_prefix_cache_flow_disabled_for_windowed_target(monkeypatch):
         def convert_tokens_to_ids(self, tokens):
             return [-1 for _ in tokens]
 
-    monkeypatch.setattr(flow_mod, "_DFLASH_PREFIX_CACHE_SINGLETON", DFlashPrefixCache())
+    preexisting_cache = DFlashPrefixCache()
+    monkeypatch.setattr(
+        cache_manager_mod,
+        "_DFLASH_RUNTIME_CACHE_MANAGER",
+        RuntimeCacheManager(preexisting_cache),
+    )
+    monkeypatch.setattr(
+        cache_manager_mod,
+        "_DFLASH_RUNTIME_CACHE_CONFIG_KEY",
+        ("old",),
+    )
+    monkeypatch.setattr(DFlashPrefixCache, "shutdown", tracked_shutdown)
 
     flow = flow_mod.PrefixCacheFlow.for_request(
         model_provider=FakeProvider(),
@@ -199,10 +219,14 @@ def test_prefix_cache_flow_disabled_for_windowed_target(monkeypatch):
         runtime_context=_runtime_context(target_fa_window=2048),
     )
 
-    assert flow.cache is None
+    assert not flow.cache_active
+    assert flow.prefix_cache_memory_bytes() is None
     assert flow.key is None
     assert flow.hit_tokens == 0
     assert flow.snapshot is None
+    assert flow.snapshot_builder is None
+    assert cache_manager_mod.current_runtime_cache_manager() is None
+    assert shutdown_calls == [preexisting_cache]
 
 def test_build_prefix_key_records_target_fa_window(monkeypatch):
     from dflash_mlx.server.prefix_cache_manager import build_prefix_key
@@ -250,10 +274,9 @@ def test_fallback_ar_forces_target_fa_window_zero(monkeypatch):
             calls.append(kwargs)
             return ["cache"]
 
-    monkeypatch.setattr("dflash_mlx.engine.target_ops.resolve_target_ops", lambda _model: FakeOps())
-
     cache = fallback._make_fallback_target_cache(
         object(),
+        FakeOps(),
         quantize_kv_cache=False,
     )
 
@@ -280,11 +303,10 @@ def test_fallback_prefill_event_reports_full_physical_prefill(monkeypatch):
             batch, seq_len = input_ids.shape
             return mx.zeros((batch, seq_len, 8), dtype=mx.float32)
 
-    monkeypatch.setattr("dflash_mlx.engine.target_ops.resolve_target_ops", lambda _model: FakeOps())
-
     events = list(
         fallback.stream_baseline_generate(
             target_model=FakeTarget(),
+            target_ops=FakeOps(),
             tokenizer=object(),
             prompt="unused",
             max_new_tokens=1,

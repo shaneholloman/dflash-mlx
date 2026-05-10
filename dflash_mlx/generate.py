@@ -10,64 +10,14 @@ from collections.abc import Sequence
 from typing import Any, Optional
 
 from dflash_mlx.metal_limits import apply_metal_limits
-from dflash_mlx.engine.target_ops import bind_draft_to_target, resolve_target_ops
 from dflash_mlx.runtime import (
-    VerifyConfig,
     get_stop_token_ids,
-    load_draft_bundle,
-    load_target_bundle,
     stream_dflash_generate,
 )
+from dflash_mlx.runtime_bundle import load_runtime_bundle
 from dflash_mlx.runtime_context import (
     build_offline_runtime_context,
 )
-
-DRAFT_REGISTRY = {
-    "Qwen3.5-4B": "z-lab/Qwen3.5-4B-DFlash",
-    "Qwen3.5-9B": "z-lab/Qwen3.5-9B-DFlash",
-    "Qwen3.5-27B": "z-lab/Qwen3.5-27B-DFlash",
-    "Qwen3.5-35B-A3B": "z-lab/Qwen3.5-35B-A3B-DFlash",
-    "Qwen3.6-27B": "z-lab/Qwen3.6-27B-DFlash",
-    "Qwen3.6-35B-A3B": "z-lab/Qwen3.6-35B-A3B-DFlash",
-    "Qwen3-4B": "z-lab/Qwen3-4B-DFlash-b16",
-    "Qwen3-8B": "z-lab/Qwen3-8B-DFlash-b16",
-    "gemma-4-31b-it": "z-lab/gemma-4-31B-it-DFlash",
-    "gemma-4-26b-a4b-it": "z-lab/gemma-4-26B-A4B-it-DFlash",
-}
-
-_NORMALIZED_DRAFT_REGISTRY = {
-    key.lower(): value for key, value in DRAFT_REGISTRY.items()
-}
-
-def _supported_base_models() -> str:
-    return ", ".join(DRAFT_REGISTRY.keys())
-
-def _strip_model_org(model_ref: str) -> str:
-    return str(model_ref).rsplit("/", 1)[-1].strip()
-
-def resolve_optional_draft_ref(model_ref: str, draft_ref: Optional[str]) -> Optional[str]:
-    if draft_ref:
-        return draft_ref
-
-    stripped_name = _strip_model_org(model_ref)
-    lowered_name = stripped_name.lower()
-
-    exact = _NORMALIZED_DRAFT_REGISTRY.get(lowered_name)
-    if exact is not None:
-        return exact
-
-    matching_bases = [
-        base_name
-        for base_name in _NORMALIZED_DRAFT_REGISTRY
-        if lowered_name == base_name
-        or lowered_name.startswith(base_name + "-")
-        or lowered_name.startswith(base_name + "_")
-    ]
-    if not matching_bases:
-        return None
-
-    best_match = max(matching_bases, key=len)
-    return _NORMALIZED_DRAFT_REGISTRY[best_match]
 
 def decode_token(tokenizer: Any, token_id: int) -> str:
     try:
@@ -82,37 +32,6 @@ def generation_tps_from_summary(summary: dict[str, Any]) -> float:
     generation_tokens = int(summary.get("generation_tokens", 0))
     generation_us = max(0.0, elapsed_us - prefill_us)
     return (generation_tokens / (generation_us / 1e6)) if generation_us > 0.0 else 0.0
-
-def load_runtime_components(
-    *,
-    model_ref: str,
-    draft_ref: Optional[str],
-    draft_quant: Optional[str] = None,
-    verify_config: Optional[VerifyConfig] = None,
-):
-    resolved_draft_ref = resolve_optional_draft_ref(model_ref, draft_ref)
-    if not resolved_draft_ref:
-        raise ValueError(
-            f"No DFlash draft model found for '{model_ref}'.\n"
-            f"Use --draft to specify one, or check https://huggingface.co/z-lab for available drafts.\n"
-            f"Supported base models: {_supported_base_models()}"
-        )
-    target_model, tokenizer, _ = load_target_bundle(
-        model_ref,
-        lazy=True,
-        verify_config=verify_config,
-    )
-    try:
-        draft_model, _ = load_draft_bundle(resolved_draft_ref, lazy=True, draft_quant=draft_quant)
-    except ValueError:
-        raise
-    except Exception as exc:
-        raise ValueError(
-            f"Failed to load DFlash draft model '{resolved_draft_ref}' for '{model_ref}'."
-        ) from exc
-    target_ops = resolve_target_ops(target_model)
-    bind_draft_to_target(draft_model, target_model, target_ops=target_ops)
-    return target_model, tokenizer, draft_model, resolved_draft_ref
 
 def run_generate(
     *,
@@ -137,17 +56,24 @@ def run_generate(
         verify_len_cap=verify_len_cap,
         verify_mode=verify_mode,
     )
-    target_model, tokenizer, draft_model, _ = load_runtime_components(
+    bundle = load_runtime_bundle(
         model_ref=model_ref,
         draft_ref=draft_ref,
         draft_quant=draft_quant,
         verify_config=runtime_context.verify,
     )
+    target_model = bundle.target_model
+    tokenizer = bundle.tokenizer
+    draft_model = bundle.draft_model
+    draft_backend = bundle.draft_backend
+    target_ops = bundle.target_ops
     stop_token_ids = get_stop_token_ids(tokenizer)
     stream = stream_dflash_generate(
         target_model=target_model,
+        target_ops=target_ops,
         tokenizer=tokenizer,
         draft_model=draft_model,
+        draft_backend=draft_backend,
         prompt=prompt,
         max_new_tokens=max_tokens,
         use_chat_template=use_chat_template,

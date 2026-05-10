@@ -4,9 +4,19 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from dflash_mlx.diagnostics import DiagnosticsConfig
+
+
+@dataclass(frozen=True)
+class SpeculativeCycleConfig:
+    draft_block_size: int
+    requested_block_tokens: int
+    effective_block_tokens: int
+    verify_len_cap: int
+
 
 def resolve_verify_len_cap(runtime_config: Any, block_tokens: int) -> int:
     requested = int(getattr(runtime_config, "verify_len_cap", 0) or 0)
@@ -17,11 +27,31 @@ def resolve_verify_len_cap(runtime_config: Any, block_tokens: int) -> int:
 def verify_token_count_for_block(block_len: int, verify_len_cap: int) -> int:
     return max(1, min(int(block_len), int(verify_len_cap)))
 
+
+def resolve_speculative_cycle_config(
+    runtime_config: Any,
+    draft_model: Any,
+    block_tokens: Optional[int],
+) -> SpeculativeCycleConfig:
+    draft_block_size = int(draft_model.block_size)
+    requested_block_tokens = (
+        draft_block_size if block_tokens is None else int(block_tokens)
+    )
+    effective_block_tokens = max(1, min(requested_block_tokens, draft_block_size))
+    return SpeculativeCycleConfig(
+        draft_block_size=draft_block_size,
+        requested_block_tokens=requested_block_tokens,
+        effective_block_tokens=effective_block_tokens,
+        verify_len_cap=resolve_verify_len_cap(runtime_config, effective_block_tokens),
+    )
+
+
 def resolve_draft_window(
     runtime_config: Any,
     draft_model: Any,
     *,
     context_len: Optional[int] = None,
+    allow_full_attention_context: bool = False,
 ) -> tuple[int, int]:
     sink = int(getattr(runtime_config, "draft_sink_size", 64))
     requested_window = int(getattr(runtime_config, "draft_window_size", 1024))
@@ -29,7 +59,7 @@ def resolve_draft_window(
         draft_model,
         requested_window,
         context_len=context_len,
-        allow_full_attention_context=True,
+        allow_full_attention_context=allow_full_attention_context,
     )
 
 def _is_unwindowed_full_attention_draft(draft_model: Any) -> bool:
@@ -48,7 +78,7 @@ def _effective_draft_window_size(
     requested_window: int,
     *,
     context_len: Optional[int] = None,
-    allow_full_attention_context: bool = True,
+    allow_full_attention_context: bool = False,
 ) -> int:
     sliding_window = int(getattr(getattr(draft_model, "args", None), "sliding_window", 0) or 0)
     window = max(1, int(requested_window), sliding_window)

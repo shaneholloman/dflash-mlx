@@ -12,12 +12,11 @@ import mlx.core as mx
 
 def _make_fallback_target_cache(
     target_model: Any,
+    target_ops: Any,
     *,
     quantize_kv_cache: bool,
 ) -> list[Any]:
-    from dflash_mlx.engine.target_ops import resolve_target_ops
-
-    return resolve_target_ops(target_model).make_cache(
+    return target_ops.make_cache(
         target_model,
         enable_speculative_linear_cache=False,
         quantize_kv_cache=quantize_kv_cache,
@@ -27,6 +26,7 @@ def _make_fallback_target_cache(
 def stream_baseline_generate(
     *,
     target_model: Any,
+    target_ops: Any,
     tokenizer: Any,
     prompt: str,
     max_new_tokens: int,
@@ -52,6 +52,7 @@ def stream_baseline_generate(
     prompt_array = mx.array(prompt_tokens, dtype=mx.uint32)[None]
     cache = _make_fallback_target_cache(
         target_model,
+        target_ops,
         quantize_kv_cache=quantize_kv_cache,
     )
     start_ns = time.perf_counter_ns()

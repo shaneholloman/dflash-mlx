@@ -119,6 +119,7 @@ class Gemma4TargetOps:
             ),
             supports_target_hidden_capture=True,
             supports_verify_linear=True,
+            supports_full_context_draft_layers=True,
         )
 
     def text_wrapper(self, target_model: Any) -> Any:

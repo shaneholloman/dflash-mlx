@@ -18,13 +18,17 @@ import mlx.core as mx
 from mlx_lm.generate import stream_generate as mlx_stream_generate
 from mlx_lm.utils import load as load_pristine_target
 
+from dflash_mlx.draft_backend import DraftBackend
 from dflash_mlx.runtime import (
     _prepare_prompt_tokens,
-    load_draft_bundle,
-    load_target_bundle,
-    resolve_model_ref,
     stream_dflash_generate,
 )
+from dflash_mlx.runtime_bundle import load_runtime_bundle
+from dflash_mlx.runtime_context import (
+    RuntimeContext,
+    build_offline_runtime_context,
+)
+from dflash_mlx.runtime_loading import resolve_model_ref
 
 DEFAULT_PROMPT = "Implement a REST API with auth"
 CONTENT_START_ROW = 4
@@ -360,8 +364,11 @@ def run_baseline(
 def run_dflash(
     *,
     target_model: Any,
+    target_ops: Any,
     tokenizer: Any,
     draft_model: Any,
+    draft_backend: DraftBackend,
+    runtime_context: RuntimeContext,
     prompt: str,
     max_tokens: int,
     info_line: str,
@@ -384,8 +391,10 @@ def run_dflash(
 
     for event in stream_dflash_generate(
         target_model=target_model,
+        target_ops=target_ops,
         tokenizer=tokenizer,
         draft_model=draft_model,
+        draft_backend=draft_backend,
         prompt=prompt,
         max_new_tokens=max_tokens,
         use_chat_template=use_chat_template,
@@ -393,6 +402,7 @@ def run_dflash(
         stop_token_ids=[] if no_eos else eos_ids,
         suppress_token_ids=eos_ids if no_eos else None,
         quantize_kv_cache=quantize_kv_cache,
+        runtime_context=runtime_context,
     ):
         if event["event"] == "prefill":
             prefill_us = float(event["prefill_us"])
@@ -495,10 +505,12 @@ def main() -> None:
                 return_config=True,
             )
         else:
-            target_model, tokenizer, _ = load_target_bundle(
-                resolved_target_ref,
-                lazy=True,
-                split_full_attention_sdpa=True,
+            runtime_context = build_offline_runtime_context(target_fa_window=0)
+            bundle = load_runtime_bundle(
+                model_ref=resolved_target_ref,
+                draft_ref=args.draft_model,
+                verify_config=runtime_context.verify,
+                split_full_attention_sdpa=not args.quantize_kv_cache,
                 quantize_kv_cache=args.quantize_kv_cache,
             )
 
@@ -516,16 +528,14 @@ def main() -> None:
             )
         )
 
-    with _suppress_load_noise():
-        draft_model, _ = load_draft_bundle(
-            resolve_model_ref(args.draft_model, kind="draft"),
-            lazy=True,
-        )
     raise SystemExit(
         run_dflash(
-            target_model=target_model,
-            tokenizer=tokenizer,
-            draft_model=draft_model,
+            target_model=bundle.target_model,
+            target_ops=bundle.target_ops,
+            tokenizer=bundle.tokenizer,
+            draft_model=bundle.draft_model,
+            draft_backend=bundle.draft_backend,
+            runtime_context=runtime_context,
             prompt=args.prompt,
             max_tokens=args.max_tokens,
             info_line=info_line,

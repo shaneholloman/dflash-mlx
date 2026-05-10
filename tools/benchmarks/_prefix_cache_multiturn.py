@@ -14,14 +14,12 @@ from typing import Any, Optional
 
 from mlx_lm import stream_generate as mlxlm_stream_generate
 
-from dflash_mlx.generate import load_runtime_components
-from dflash_mlx.cache.codecs import (
-    build_snapshot,
-    target_cache_is_serializable,
-)
+from dflash_mlx.cache.codecs import PrefixSnapshotBuilder
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
 from dflash_mlx.cache.prefix_l1 import DFlashPrefixCache
+from dflash_mlx.draft_backend import DraftBackend
 from dflash_mlx.runtime import stream_dflash_generate
+from dflash_mlx.runtime_bundle import load_runtime_bundle
 from dflash_mlx.runtime_context import build_runtime_context, runtime_config_from_profile
 
 def _tokenize(tokenizer: Any, text: str) -> list[int]:
@@ -48,8 +46,10 @@ def _build_key(
 def _run_one_turn(
     *,
     target_model: Any,
+    target_ops: Any,
     tokenizer: Any,
     draft_model: Any,
+    draft_backend: DraftBackend,
     prompt_tokens: list[int],
     max_tokens: int,
     prefix_snapshot=None,
@@ -66,13 +66,25 @@ def _run_one_turn(
     breakdown: dict[str, Any] = {}
     stream = stream_dflash_generate(
         target_model=target_model,
+        target_ops=target_ops,
         tokenizer=tokenizer,
         draft_model=draft_model,
+        draft_backend=draft_backend,
         prompt="",
         max_new_tokens=max_tokens,
         use_chat_template=False,
         prompt_tokens_override=prompt_tokens,
         prefix_snapshot=prefix_snapshot,
+        prefix_snapshot_builder=(
+            PrefixSnapshotBuilder(
+                key=cache_key,
+                draft_model=draft_model,
+                draft_sink_size=int(runtime_context.runtime.draft_sink_size),
+                draft_window_size=int(runtime_context.runtime.draft_window_size),
+            )
+            if cache_to_populate is not None and cache_key is not None
+            else None
+        ),
         runtime_context=runtime_context,
     )
     try:
@@ -93,23 +105,8 @@ def _run_one_turn(
                 from_snapshot = bool(event.get("from_snapshot", False))
                 snap_len_used = int(event.get("snap_prefix_len", 0))
                 if cache_to_populate is not None and cache_key is not None:
-                    tc = event.get("target_cache")
-                    th = event.get("target_hidden")
-                    ll = event.get("last_logits")
-                    tk = event.get("token_ids") or []
-                    if (
-                        tc is not None
-                        and th is not None
-                        and ll is not None
-                        and target_cache_is_serializable(tc)
-                    ):
-                        snap = build_snapshot(
-                            token_ids=list(tk),
-                            target_cache=tc,
-                            target_hidden=th,
-                            last_logits=ll,
-                            key=cache_key,
-                        )
+                    snap = event.get("snapshot")
+                    if snap is not None and snap.key == cache_key:
                         cache_to_populate.insert(snap)
                         inserted = True
                 continue
@@ -251,8 +248,10 @@ def _session_mlxlm(
 def _session(
     *,
     target_model: Any,
+    target_ops: Any,
     tokenizer: Any,
     draft_model: Any,
+    draft_backend: DraftBackend,
     prompts: list[list[int]],
     max_tokens: int,
     use_cache: bool,
@@ -268,8 +267,10 @@ def _session(
             matched, prefix_snapshot = cache.lookup(prompt_tokens, key)
         res = _run_one_turn(
             target_model=target_model,
+            target_ops=target_ops,
             tokenizer=tokenizer,
             draft_model=draft_model,
+            draft_backend=draft_backend,
             prompt_tokens=prompt_tokens,
             max_tokens=max_tokens,
             prefix_snapshot=prefix_snapshot,
@@ -324,10 +325,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"Target={target_ref}")
     print(f"Draft ={draft_ref}")
     print(f"Turns={n_turns}  system_tokens~={system_target_tokens}  max_tokens={max_tokens}")
-    target_model, tokenizer, draft_model, resolved_draft = load_runtime_components(
+    bundle = load_runtime_bundle(
         model_ref=target_ref,
         draft_ref=draft_ref,
     )
+    target_model = bundle.target_model
+    target_ops = bundle.target_ops
+    tokenizer = bundle.tokenizer
+    draft_model = bundle.draft_model
+    draft_backend = bundle.draft_backend
+    resolved_draft = bundle.resolved_draft_ref
     runtime_context = build_runtime_context(runtime_config_from_profile(profile="balanced"))
     print(f"Loaded. resolved_draft={resolved_draft}")
 
@@ -337,8 +344,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     print("Warmup (8 tokens, no cache)...")
     _run_one_turn(
         target_model=target_model,
+        target_ops=target_ops,
         tokenizer=tokenizer,
         draft_model=draft_model,
+        draft_backend=draft_backend,
         prompt_tokens=prompts[0][:64],
         max_tokens=8,
         runtime_context=runtime_context,
@@ -355,8 +364,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     print("\n=== DFlash (cache OFF — pre-feature behavior) ===")
     baseline = _session(
         target_model=target_model,
+        target_ops=target_ops,
         tokenizer=tokenizer,
         draft_model=draft_model,
+        draft_backend=draft_backend,
         prompts=prompts,
         max_tokens=max_tokens,
         use_cache=False,
@@ -370,8 +381,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     key = _build_key(target_ref, resolved_draft or draft_ref, draft_model, runtime_context)
     cached = _session(
         target_model=target_model,
+        target_ops=target_ops,
         tokenizer=tokenizer,
         draft_model=draft_model,
+        draft_backend=draft_backend,
         prompts=prompts,
         max_tokens=max_tokens,
         use_cache=True,

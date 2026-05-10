@@ -12,13 +12,9 @@ import pytest
 from mlx_lm.generate import generate_step
 
 from dflash_mlx.engine.target_gemma4 import Gemma4TargetOps
-from dflash_mlx.engine.target_ops import bind_draft_to_target, resolve_target_ops
-from dflash_mlx.runtime import (
-    VerifyConfig,
-    load_draft_bundle,
-    load_target_bundle,
-    stream_dflash_generate,
-)
+from dflash_mlx.runtime import VerifyConfig, stream_dflash_generate
+from dflash_mlx.runtime_bundle import load_runtime_bundle
+from dflash_mlx.runtime_loading import load_draft_bundle, load_target_bundle
 from dflash_mlx.runtime_context import build_offline_runtime_context
 
 pytestmark = pytest.mark.skipif(
@@ -54,12 +50,11 @@ def _draft_ref() -> str:
 
 @lru_cache(maxsize=1)
 def _load_target():
-    model, tokenizer, meta = load_target_bundle(
+    return load_target_bundle(
         _local_snapshot(_target_ref()),
         lazy=True,
         verify_config=VerifyConfig.from_mode("off"),
     )
-    return model, tokenizer, meta
 
 
 def _token_ids(tokenizer) -> mx.array:
@@ -86,8 +81,11 @@ def _mlx_lm_greedy_tokens(model, prompt_ids: list[int], max_tokens: int) -> list
 
 
 def test_real_gemma4_target_ops_load_cache_and_logits_parity():
-    model, tokenizer, meta = _load_target()
-    ops = resolve_target_ops(model)
+    target_bundle = _load_target()
+    model = target_bundle.model
+    tokenizer = target_bundle.tokenizer
+    meta = target_bundle.meta
+    ops = target_bundle.target_ops
     assert isinstance(ops, Gemma4TargetOps)
     assert ops.family(model) == "gemma4_swa"
     assert meta["verify_linear_enabled"] is False
@@ -160,16 +158,19 @@ def test_real_gemma4_dflash_matches_mlx_lm_greedy_tokens():
         target_fa_window=0,
         verify_mode="auto",
     )
-    target_model, tokenizer, target_meta = load_target_bundle(
-        target_path,
-        lazy=True,
+    bundle = load_runtime_bundle(
+        model_ref=target_path,
+        draft_ref=draft_path,
         verify_config=VerifyConfig.from_mode("auto"),
     )
+    target_model = bundle.target_model
+    tokenizer = bundle.tokenizer
+    target_meta = bundle.target_meta
+    draft_model = bundle.draft_model
+    draft_backend = bundle.draft_backend
+    target_ops = bundle.target_ops
     assert target_meta["verify_linear_enabled"] is True
     assert int(target_meta.get("verify_linear_swapped") or 0) > 0
-    draft_model, _ = load_draft_bundle(draft_path, lazy=True)
-    target_ops = resolve_target_ops(target_model)
-    bind_draft_to_target(draft_model, target_model, target_ops=target_ops)
 
     max_tokens = 16
     prompt_ids = _prompt_token_ids(tokenizer)
@@ -180,8 +181,10 @@ def test_real_gemma4_dflash_matches_mlx_lm_greedy_tokens():
     summary = None
     for event in stream_dflash_generate(
         target_model=target_model,
+        target_ops=target_ops,
         tokenizer=tokenizer,
         draft_model=draft_model,
+        draft_backend=draft_backend,
         prompt="",
         max_new_tokens=max_tokens,
         use_chat_template=False,

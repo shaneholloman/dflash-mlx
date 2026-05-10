@@ -97,20 +97,20 @@ The server wraps `mlx_lm.server` rather than replacing it.
 
 1. `dflash_mlx.server.config` parses CLI flags, resolves profiles, diagnostics,
    and Metal limits.
-2. `dflash_mlx.server.model_provider` loads the target and draft bundles.
+2. `dflash_mlx.server.model_provider` loads a shared `RuntimeBundle`.
 3. `dflash_mlx.serve.DFlashServer` receives OpenAI-compatible requests through
    the upstream `mlx_lm.server` machinery.
 4. For short-output requests, the server may use a target-only upstream path.
-5. For DFlash requests, `server.prefix_cache_flow` performs prefix lookup and
-   computes the stable prefix.
+5. For DFlash requests, `server.prefix_cache_flow` computes the stable prefix
+   and delegates lookup to `cache.manager`.
 6. `server.request_loop` drives `engine.spec_epoch.stream_dflash_generate_impl`
    and forwards token, cache, timing, and snapshot events.
-7. At snapshot-ready events, `PrefixCacheFlow` builds and inserts prefix
-   snapshots.
+7. At snapshot-ready events, the engine has already built a
+   `DFlashPrefixSnapshot`; `PrefixCacheFlow` delegates snapshot admission to the
+   runtime cache manager.
 
-The prefix cache is process-local. The current implementation uses a documented
-server singleton keyed by relevant runtime config so repeated requests can share
-state.
+The prefix cache is process-local. The runtime cache manager owns the singleton
+lifecycle keyed by relevant runtime config so repeated requests can share state.
 
 ## Offline Generate Flow
 
@@ -223,13 +223,17 @@ Public surface:
 
 - `dflash_mlx/cli.py` - root command dispatcher;
 - `dflash_mlx/serve.py` - OpenAI-compatible server wrapper;
-- `dflash_mlx/generate.py` - one-shot generation and draft registry;
+- `dflash_mlx/generate.py` - one-shot generation command;
 - `dflash_mlx/benchmark.py` - public baseline-vs-DFlash benchmark;
 - `dflash_mlx/doctor.py` - local environment/config checks.
 
 Runtime/config:
 
-- `dflash_mlx/runtime.py` - model loading, verify config, and stream entry;
+- `dflash_mlx/runtime.py` - verify config and stream entry;
+- `dflash_mlx/runtime_registry.py` - supported target-to-draft registry;
+- `dflash_mlx/runtime_loading.py` - target/draft loading and load-time
+  target optimization;
+- `dflash_mlx/runtime_bundle.py` - shared target/draft/TargetOps/draft-backend binding;
 - `dflash_mlx/runtime_profiles.py` - profiles and effective runtime config;
 - `dflash_mlx/runtime_context.py` - typed runtime context carrier;
 - `dflash_mlx/diagnostics.py` - diagnostics config;
@@ -261,11 +265,12 @@ Prefix cache:
 - `dflash_mlx/cache/snapshot.py` - snapshot dataclasses;
 - `dflash_mlx/cache/fingerprints.py` - key/fingerprint helpers;
 - `dflash_mlx/cache/codecs.py` - snapshot serialization helpers;
+- `dflash_mlx/cache/manager.py` - runtime prefix cache lifecycle, lookup, and
+  snapshot admission;
 - `dflash_mlx/cache/prefix_l1.py` - RAM prefix cache;
 - `dflash_mlx/cache/prefix_l2.py` - SSD prefix cache;
-- `dflash_mlx/server/prefix_cache_flow.py` - request-time prefix flow and
-  singleton boundary;
-- `dflash_mlx/server/prefix_cache_manager.py` - cache construction.
+- `dflash_mlx/server/prefix_cache_flow.py` - request-time stable-prefix flow;
+- `dflash_mlx/server/prefix_cache_manager.py` - server request key helpers.
 
 Server package:
 

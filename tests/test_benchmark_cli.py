@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import random
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -530,6 +531,18 @@ def test_benchmark_runtime_context_is_required():
     with pytest.raises(ValueError, match="runtime_context is required"):
         next(stream)
 
+def test_dflash_stream_target_ops_is_required():
+    stream = benchmark.stream_dflash_generate(runtime_context=object())
+    with pytest.raises(ValueError, match="target_ops is required"):
+        next(stream)
+
+
+def test_dflash_stream_draft_backend_is_required():
+    stream = benchmark.stream_dflash_generate(runtime_context=object(), target_ops=object())
+    with pytest.raises(ValueError, match="draft_backend is required"):
+        next(stream)
+
+
 class _BenchmarkTokenizer:
     eos_token_ids = []
     eos_token_id = None
@@ -590,16 +603,7 @@ def _patch_benchmark_target(monkeypatch, *, resolved_model_ref: str = "target"):
         "_generate_stock_baseline_once",
         lambda **kwargs: _fake_baseline_result(),
     )
-    monkeypatch.setattr(
-        benchmark,
-        "load_target_bundle",
-        lambda *args, **kwargs: (
-            target,
-            tokenizer,
-            {"resolved_model_ref": resolved_model_ref},
-        ),
-    )
-    return target
+    return target, tokenizer, {"resolved_model_ref": resolved_model_ref}
 
 
 def _run_one_fake_benchmark(*, draft_model_ref: str | None = None) -> dict:
@@ -618,29 +622,34 @@ def _run_one_fake_benchmark(*, draft_model_ref: str | None = None) -> dict:
 
 def test_benchmark_dflash_path_binds_draft_before_generation(monkeypatch):
     events: list[str] = []
-    target = _patch_benchmark_target(monkeypatch)
+    target, tokenizer, target_meta = _patch_benchmark_target(monkeypatch)
     draft = _BindableBenchmarkDraft(events)
+    draft_backend = object()
     ops = object()
-    resolved_drafts: list[tuple[str, str | None]] = []
+    bundle_calls: list[dict] = []
 
-    monkeypatch.setattr(
-        benchmark,
-        "load_draft_bundle",
-        lambda draft_ref, **kwargs: (draft, {"resolved_model_ref": draft_ref}),
-    )
-    monkeypatch.setattr(benchmark, "resolve_target_ops", lambda target_model: ops)
-    monkeypatch.setattr(
-        benchmark,
-        "resolve_optional_draft_ref",
-        lambda model_ref, draft_ref: resolved_drafts.append((model_ref, draft_ref))
-        or "auto-draft",
-    )
+    def fake_load_runtime_bundle(**kwargs):
+        bundle_calls.append(kwargs)
+        draft.bind_target_model(target, target_ops=ops)
+        return SimpleNamespace(
+            target_model=target,
+            tokenizer=tokenizer,
+            target_meta=target_meta,
+            draft_model=draft,
+            draft_meta={"resolved_model_ref": "auto-draft"},
+            draft_backend=draft_backend,
+            target_ops=ops,
+        )
+
+    monkeypatch.setattr(benchmark, "load_runtime_bundle", fake_load_runtime_bundle)
 
     def fake_generate(**kwargs):
         events.append("generate")
         assert kwargs["draft_model"].bound is True
         assert kwargs["draft_model"].bound_target is target
         assert kwargs["draft_model"].bound_ops is ops
+        assert kwargs["draft_backend"] is draft_backend
+        assert kwargs["target_ops"] is ops
         return _fake_dflash_result()
 
     monkeypatch.setattr(benchmark, "_generate_dflash_stream_once", fake_generate)
@@ -648,26 +657,30 @@ def test_benchmark_dflash_path_binds_draft_before_generation(monkeypatch):
     report = _run_one_fake_benchmark()
 
     assert events == ["bind", "generate"]
-    assert resolved_drafts == [("target", None)]
+    assert len(bundle_calls) == 1
+    assert bundle_calls[0]["model_ref"] == "target"
+    assert bundle_calls[0]["draft_ref"] is None
+    assert bundle_calls[0]["draft_quant"] is None
+    assert bundle_calls[0]["verify_config"] is not None
+    assert bundle_calls[0]["split_full_attention_sdpa"] is True
     assert report["draft_meta"]["resolved_model_ref"] == "auto-draft"
     assert report["token_match"] is True
 
 
 def test_benchmark_preserves_dflash_phase_timings_in_artifact_entry(monkeypatch):
-    _patch_benchmark_target(monkeypatch)
+    target, tokenizer, target_meta = _patch_benchmark_target(monkeypatch)
     monkeypatch.setattr(
         benchmark,
-        "load_draft_bundle",
-        lambda draft_ref, **kwargs: (
-            _BindableBenchmarkDraft(),
-            {"resolved_model_ref": draft_ref},
+        "load_runtime_bundle",
+        lambda **kwargs: SimpleNamespace(
+            target_model=target,
+            tokenizer=tokenizer,
+            target_meta=target_meta,
+            draft_model=_BindableBenchmarkDraft(),
+            draft_meta={"resolved_model_ref": "auto-draft"},
+            draft_backend=object(),
+            target_ops=object(),
         ),
-    )
-    monkeypatch.setattr(benchmark, "resolve_target_ops", lambda target_model: object())
-    monkeypatch.setattr(
-        benchmark,
-        "resolve_optional_draft_ref",
-        lambda model_ref, draft_ref: "auto-draft",
     )
     monkeypatch.setattr(
         benchmark,
@@ -688,19 +701,25 @@ def test_benchmark_preserves_dflash_phase_timings_in_artifact_entry(monkeypatch)
 
 
 def test_benchmark_explicit_draft_wins_over_registry(monkeypatch):
-    loaded_drafts: list[str] = []
-
-    _patch_benchmark_target(
+    loaded_bundle_args: list[dict] = []
+    target, tokenizer, target_meta = _patch_benchmark_target(
         monkeypatch,
         resolved_model_ref="mlx-community/gemma-4-26b-a4b-it-4bit",
     )
-    monkeypatch.setattr(
-        benchmark,
-        "load_draft_bundle",
-        lambda draft_ref, **kwargs: loaded_drafts.append(draft_ref)
-        or (_BindableBenchmarkDraft(), {"resolved_model_ref": draft_ref}),
-    )
-    monkeypatch.setattr(benchmark, "resolve_target_ops", lambda target_model: object())
+
+    def fake_load_runtime_bundle(**kwargs):
+        loaded_bundle_args.append(kwargs)
+        return SimpleNamespace(
+            target_model=target,
+            tokenizer=tokenizer,
+            target_meta=target_meta,
+            draft_model=_BindableBenchmarkDraft(),
+            draft_meta={"resolved_model_ref": kwargs["draft_ref"]},
+            draft_backend=object(),
+            target_ops=object(),
+        )
+
+    monkeypatch.setattr(benchmark, "load_runtime_bundle", fake_load_runtime_bundle)
     monkeypatch.setattr(
         benchmark,
         "_generate_dflash_stream_once",
@@ -709,7 +728,7 @@ def test_benchmark_explicit_draft_wins_over_registry(monkeypatch):
 
     report = _run_one_fake_benchmark(draft_model_ref="manual/draft")
 
-    assert loaded_drafts == ["manual/draft"]
+    assert [call["draft_ref"] for call in loaded_bundle_args] == ["manual/draft"]
     assert report["draft_meta"]["resolved_model_ref"] == "manual/draft"
 
 
@@ -717,14 +736,9 @@ def _patch_missing_auto_draft(monkeypatch) -> None:
     _patch_benchmark_target(monkeypatch, resolved_model_ref="unknown/model")
     monkeypatch.setattr(
         benchmark,
-        "resolve_optional_draft_ref",
-        lambda model_ref, draft_ref: None,
-    )
-    monkeypatch.setattr(
-        benchmark,
-        "load_draft_bundle",
+        "load_runtime_bundle",
         lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("load_draft_bundle should not be called")
+            ValueError("No DFlash draft model found for 'unknown/model'")
         ),
     )
 

@@ -17,15 +17,13 @@ from typing import Any, Optional
 
 import mlx.core as mx
 
-from dflash_mlx.cache.prefix_l2 import DFlashPrefixL2Cache
-from dflash_mlx.generate import load_runtime_components
-from dflash_mlx.cache.codecs import (
-    build_snapshot,
-    target_cache_is_serializable,
-)
+from dflash_mlx.cache.codecs import PrefixSnapshotBuilder
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
 from dflash_mlx.cache.prefix_l1 import DFlashPrefixCache
+from dflash_mlx.cache.prefix_l2 import DFlashPrefixL2Cache
+from dflash_mlx.draft_backend import DraftBackend
 from dflash_mlx.runtime import stream_dflash_generate
+from dflash_mlx.runtime_bundle import load_runtime_bundle
 from dflash_mlx.runtime_context import build_runtime_context, runtime_config_from_profile
 
 def rss_mb() -> float:
@@ -78,8 +76,10 @@ def _make_long_prompt(tok: Any, n_tokens: int, label: str) -> list[int]:
 def _run_turn(
     *,
     target_model,
+    target_ops,
     tokenizer,
     draft_model,
+    draft_backend: DraftBackend,
     prompt_tokens: list[int],
     max_tokens: int,
     cache: DFlashPrefixCache,
@@ -94,13 +94,21 @@ def _run_turn(
     breakdown: dict[str, Any] = {}
     stream = stream_dflash_generate(
         target_model=target_model,
+        target_ops=target_ops,
         tokenizer=tokenizer,
         draft_model=draft_model,
+        draft_backend=draft_backend,
         prompt="",
         max_new_tokens=max_tokens,
         use_chat_template=False,
         prompt_tokens_override=prompt_tokens,
         prefix_snapshot=prefix_snap,
+        prefix_snapshot_builder=PrefixSnapshotBuilder(
+            key=key,
+            draft_model=draft_model,
+            draft_sink_size=int(runtime_context.runtime.draft_sink_size),
+            draft_window_size=int(runtime_context.runtime.draft_window_size),
+        ),
         runtime_context=runtime_context,
     )
     try:
@@ -115,23 +123,8 @@ def _run_turn(
                 continue
             if kind == "prefill_snapshot_ready":
                 from_snap = bool(ev.get("from_snapshot", False))
-                tc = ev.get("target_cache")
-                th = ev.get("target_hidden")
-                ll = ev.get("last_logits")
-                tk = ev.get("token_ids") or []
-                if (
-                    tc is not None
-                    and th is not None
-                    and ll is not None
-                    and target_cache_is_serializable(tc)
-                ):
-                    snap = build_snapshot(
-                        token_ids=list(tk),
-                        target_cache=tc,
-                        target_hidden=th,
-                        last_logits=ll,
-                        key=key,
-                    )
+                snap = ev.get("snapshot")
+                if snap is not None and snap.key == key:
                     cache.insert(snap)
                 continue
             if kind == "token":
@@ -156,8 +149,10 @@ def _run_turn(
 def _run_session(
     *,
     target_model,
+    target_ops,
     tokenizer,
     draft_model,
+    draft_backend: DraftBackend,
     prompts: list[list[int]],
     max_tokens: int,
     cache: DFlashPrefixCache,
@@ -177,8 +172,15 @@ def _run_session(
 
     for i, prompt in enumerate(prompts, 1):
         r = _run_turn(
-            target_model=target_model, tokenizer=tokenizer, draft_model=draft_model,
-            prompt_tokens=prompt, max_tokens=max_tokens, cache=cache, key=key,
+            target_model=target_model,
+            target_ops=target_ops,
+            tokenizer=tokenizer,
+            draft_model=draft_model,
+            draft_backend=draft_backend,
+            prompt_tokens=prompt,
+            max_tokens=max_tokens,
+            cache=cache,
+            key=key,
             runtime_context=runtime_context,
         )
 
@@ -215,8 +217,15 @@ def _run_session(
     revisits: list[dict[str, Any]] = []
     for idx in revisit_indices:
         r = _run_turn(
-            target_model=target_model, tokenizer=tokenizer, draft_model=draft_model,
-            prompt_tokens=prompts[idx - 1], max_tokens=max_tokens, cache=cache, key=key,
+            target_model=target_model,
+            target_ops=target_ops,
+            tokenizer=tokenizer,
+            draft_model=draft_model,
+            draft_backend=draft_backend,
+            prompt_tokens=prompts[idx - 1],
+            max_tokens=max_tokens,
+            cache=cache,
+            key=key,
             runtime_context=runtime_context,
         )
         gc.collect()
@@ -300,10 +309,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"L1 max_entries={l1_max_entries}  max_bytes={l1_max_bytes/(1024**3):.1f} GB  "
           f"L2 max_bytes={l2_max_bytes/(1024**3):.0f} GB  control_pass={run_control}")
 
-    target_model, tokenizer, draft_model, resolved_draft = load_runtime_components(
+    bundle = load_runtime_bundle(
         model_ref=target_ref,
         draft_ref=draft_ref,
     )
+    target_model = bundle.target_model
+    target_ops = bundle.target_ops
+    tokenizer = bundle.tokenizer
+    draft_model = bundle.draft_model
+    draft_backend = bundle.draft_backend
+    resolved_draft = bundle.resolved_draft_ref
     runtime_context = build_runtime_context(runtime_config_from_profile(profile="balanced"))
     print(f"Loaded. resolved_draft={resolved_draft}")
 
@@ -314,8 +329,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     warm_cache = DFlashPrefixCache(max_entries=1, max_bytes=4 * 1024 * 1024 * 1024)
     warm_key = _build_key(target_ref, resolved_draft or draft_ref, draft_model, runtime_context)
     _run_turn(
-        target_model=target_model, tokenizer=tokenizer, draft_model=draft_model,
-        prompt_tokens=prompts[0][:64], max_tokens=8, cache=warm_cache, key=warm_key,
+        target_model=target_model,
+        target_ops=target_ops,
+        tokenizer=tokenizer,
+        draft_model=draft_model,
+        draft_backend=draft_backend,
+        prompt_tokens=prompts[0][:64],
+        max_tokens=8,
+        cache=warm_cache,
+        key=warm_key,
         runtime_context=runtime_context,
     )
     del warm_cache
@@ -332,8 +354,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         cache_ctl = DFlashPrefixCache(max_entries=l1_max_entries, max_bytes=l1_max_bytes)
         key_ctl = _build_key(target_ref, resolved_draft or draft_ref, draft_model, runtime_context)
         ctl = _run_session(
-            target_model=target_model, tokenizer=tokenizer, draft_model=draft_model,
-            prompts=prompts, max_tokens=max_tokens, cache=cache_ctl, key=key_ctl,
+            target_model=target_model,
+            target_ops=target_ops,
+            tokenizer=tokenizer,
+            draft_model=draft_model,
+            draft_backend=draft_backend,
+            prompts=prompts,
+            max_tokens=max_tokens,
+            cache=cache_ctl,
+            key=key_ctl,
             runtime_context=runtime_context,
             label="control_no_L2", revisit_indices=revisits,
         )
@@ -353,8 +382,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         key_l2 = _build_key(target_ref, resolved_draft or draft_ref, draft_model, runtime_context)
         with_l2 = _run_session(
-            target_model=target_model, tokenizer=tokenizer, draft_model=draft_model,
-            prompts=prompts, max_tokens=max_tokens, cache=cache_l2, key=key_l2,
+            target_model=target_model,
+            target_ops=target_ops,
+            tokenizer=tokenizer,
+            draft_model=draft_model,
+            draft_backend=draft_backend,
+            prompts=prompts,
+            max_tokens=max_tokens,
+            cache=cache_l2,
+            key=key_l2,
             runtime_context=runtime_context,
             label="with_L2", revisit_indices=revisits,
         )

@@ -7,7 +7,7 @@ from __future__ import annotations
 import pytest
 
 from dflash_mlx import generate
-from dflash_mlx.runtime import parse_draft_quant_spec
+from dflash_mlx.runtime_loading import parse_draft_quant_spec
 
 def test_generate_cli_passes_verify_mode(monkeypatch):
     calls = []
@@ -76,7 +76,7 @@ def test_generate_cli_rejects_invalid_prefill_step_size(monkeypatch):
 
 def test_draft_quant_parser_no_env_fallback(monkeypatch):
     monkeypatch.setenv("DFLASH_DRAFT_QUANT", "w4")
-    from dflash_mlx.runtime import _resolve_draft_quant
+    from dflash_mlx.runtime_loading import _resolve_draft_quant
 
     assert _resolve_draft_quant(None) is None
     assert parse_draft_quant_spec("w4").weight_bits == 4

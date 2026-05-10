@@ -12,6 +12,7 @@ import pytest
 from mlx_lm.models.cache import KVCache
 
 from dflash_mlx.cache.codecs import (
+    PrefixSnapshotBuilder,
     build_snapshot,
     hydrate_target_cache,
     serialize_target_cache,
@@ -117,6 +118,38 @@ def test_l1_generation_snapshot_without_logits_is_prefix_only():
     prefix_len, prefix = cache.lookup([1, 2, 3, 4], key)
     assert prefix_len == 3
     assert prefix is snapshot
+
+
+def test_prefix_snapshot_builder_matches_build_snapshot_shape():
+    key = _make_key()
+    target_cache = [_make_kv_cache_populated(n_tokens=3), _make_gdn_cache_populated()]
+    target_hidden = mx.arange(1 * 3 * 4, dtype=mx.float32).reshape(1, 3, 4)
+    last_logits = mx.arange(16, dtype=mx.float32).reshape(1, 16)
+    builder = PrefixSnapshotBuilder(
+        key=key,
+        draft_sink_size=16,
+        draft_window_size=2048,
+    )
+
+    snapshot = builder.build(
+        token_ids=[1, 2, 3],
+        target_cache=target_cache,
+        target_hidden=target_hidden,
+        last_logits=last_logits,
+        kind="prefill",
+    )
+
+    assert snapshot.key == key
+    assert snapshot.kind == "prefill"
+    assert snapshot.token_ids == (1, 2, 3)
+    assert len(snapshot.fa_states) == 2
+    assert len(snapshot.gdn_states) == 2
+    assert snapshot.last_logits is not None
+
+    target_cache[0].keys = mx.zeros_like(target_cache[0].keys)
+    mx.eval(target_cache[0].keys)
+    snap_k, _, _ = snapshot.fa_states[0]
+    assert not mx.all(snap_k == 0).item()
 
 class TestSerializeHydrate:
     def test_kv_only_round_trip(self):

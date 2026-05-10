@@ -81,7 +81,7 @@ def _print_profiles() -> int:
     return 0
 
 def _print_models() -> int:
-    from dflash_mlx.generate import DRAFT_REGISTRY
+    from dflash_mlx.runtime_registry import DRAFT_REGISTRY
 
     for target, draft in DRAFT_REGISTRY.items():
         print(f"{target:22} {draft}")

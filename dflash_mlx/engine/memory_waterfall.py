@@ -29,13 +29,13 @@ def collect_memory_waterfall(
     draft_cache: Any = None,
     target_hidden: Any = None,
     gen_hidden_chunks: Any = None,
-    prefix_cache: Any = None,
+    prefix_cache_memory: Optional[dict[str, Any]] = None,
     extra: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     process = process_memory_bytes()
     target = target_cache_bytes(target_cache)
     draft = draft_cache_bytes(draft_cache)
-    prefix = prefix_cache_bytes(prefix_cache)
+    prefix = prefix_cache_memory_fields(prefix_cache_memory)
     hidden_seen: set[int] = set()
     target_hidden_bytes = tree_nbytes(target_hidden, hidden_seen)
     gen_hidden_chunks_bytes = tree_nbytes(gen_hidden_chunks, hidden_seen)
@@ -116,7 +116,7 @@ def draft_cache_bytes(draft_cache: Any) -> dict[str, int]:
         total = _kv_cache_nbytes(draft_cache)
     return {"draft_kv_bytes": int(total)}
 
-def prefix_cache_bytes(prefix_cache: Any) -> dict[str, int]:
+def prefix_cache_memory_bytes(prefix_cache_memory: Optional[dict[str, Any]]) -> dict[str, int]:
     out = {
         "l1_snapshot_bytes": 0,
         "l1_snapshot_fa_kv_bytes": 0,
@@ -131,40 +131,17 @@ def prefix_cache_bytes(prefix_cache: Any) -> dict[str, int]:
         "l2_writes": 0,
         "l2_misses": 0,
     }
-    if prefix_cache is None:
+    if prefix_cache_memory is None:
         return out
-    try:
-        stats = dict(prefix_cache.stats())
-    except Exception:
-        stats = {}
-    out["l1_snapshot_bytes"] = int(stats.get("current_bytes", 0) or 0)
-    out["prefix_prunes"] = int(stats.get("prefix_prunes", 0) or 0)
-    out["cross_kind_prunes"] = int(stats.get("cross_kind_prunes", 0) or 0)
-    out["byte_budget_evictions"] = int(stats.get("byte_budget_evictions", 0) or 0)
-    out["l2_hits"] = int(stats.get("l2_hits", 0) or 0)
-    out["l2_misses"] = int(stats.get("l2_misses", 0) or 0)
-    l2 = stats.get("l2") if isinstance(stats.get("l2"), dict) else {}
-    out["l2_disk_bytes"] = int(l2.get("current_bytes", 0) or 0)
-    out["l2_writes"] = int(l2.get("writes", 0) or 0)
+    for key in out:
+        out[key] = int(prefix_cache_memory.get(key, out[key]) or 0)
+    return out
 
-    entries = _prefix_entries(prefix_cache)
-    if entries:
-        fa = gdn = hidden = logits = total = 0
-        for snapshot in entries:
-            try:
-                breakdown = dict(snapshot.nbytes_breakdown())
-            except Exception:
-                breakdown = {}
-            fa += int(breakdown.get("fa_kv", 0) or 0)
-            gdn += int(breakdown.get("gdn_state", 0) or 0)
-            hidden += int(breakdown.get("target_hidden", 0) or 0)
-            logits += int(breakdown.get("last_logits", 0) or 0)
-            total += int(getattr(snapshot, "nbytes", 0) or 0)
-        out["l1_snapshot_bytes"] = total or out["l1_snapshot_bytes"]
-        out["l1_snapshot_fa_kv_bytes"] = fa
-        out["l1_snapshot_gdn_state_bytes"] = gdn
-        out["l1_snapshot_target_hidden_bytes"] = hidden
-        out["l1_snapshot_last_logits_bytes"] = logits
+def prefix_cache_memory_fields(prefix_cache_memory: Optional[dict[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = prefix_cache_memory_bytes(prefix_cache_memory)
+    for key, value in list(out.items()):
+        if key.endswith("_bytes"):
+            out[key[:-6] + "_gb"] = _to_gb(value)
     return out
 
 def merge_memory_waterfall_peak(
@@ -318,16 +295,3 @@ def _kv_cache_nbytes(cache: Any) -> int:
     if state is not None:
         total += tree_nbytes(state)
     return int(total)
-
-def _prefix_entries(prefix_cache: Any) -> list[Any]:
-    lock = getattr(prefix_cache, "_lock", None)
-    entries = getattr(prefix_cache, "_entries", None)
-    if not isinstance(entries, dict):
-        return []
-    if lock is None:
-        return list(entries.values())
-    try:
-        with lock:
-            return list(entries.values())
-    except Exception:
-        return []

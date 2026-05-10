@@ -10,10 +10,8 @@ import time
 import mlx.core as mx
 import mlx_lm.server as mlx_server
 
-from dflash_mlx.generate import (
-    load_runtime_components,
-    resolve_optional_draft_ref,
-)
+from dflash_mlx.runtime_bundle import load_runtime_bundle
+from dflash_mlx.runtime_registry import resolve_optional_draft_ref
 
 # mlx_lm 0.31.x ModelProvider / ResponseGenerator read these attrs directly.
 _MLX_LM_SERVER_DEFAULTS: dict[str, object | None] = {
@@ -32,6 +30,8 @@ class DFlashModelProvider(mlx_server.ModelProvider):
             if not hasattr(cli_args, attr):
                 setattr(cli_args, attr, default)
         super().__init__(cli_args)
+        self.target_ops = None
+        self.draft_backend = None
 
     def load(self, model_path, adapter_path=None, draft_model_path=None):
         default_map = getattr(self, "_model_map", None)
@@ -55,20 +55,31 @@ class DFlashModelProvider(mlx_server.ModelProvider):
             draft_ref = None
         resolved_draft_ref = resolve_optional_draft_ref(model_ref, draft_ref)
 
-        if self.model_key == (model_ref, None, resolved_draft_ref):
+        if (
+            self.model_key == (model_ref, None, resolved_draft_ref)
+            and self.target_ops is not None
+            and self.draft_backend is not None
+        ):
             return self.model, self.tokenizer
 
         self.model = None
         self.tokenizer = None
         self.model_key = None
         self.draft_model = None
+        self.target_ops = None
+        self.draft_backend = None
 
-        model, tokenizer, draft_model, resolved_draft_ref = load_runtime_components(
+        bundle = load_runtime_bundle(
             model_ref=model_ref,
             draft_ref=draft_ref,
             draft_quant=getattr(self.cli_args, "draft_quant", None) or None,
             verify_config=self.cli_args.runtime_context.verify,
         )
+        model = bundle.target_model
+        tokenizer = bundle.tokenizer
+        draft_model = bundle.draft_model
+        draft_backend = bundle.draft_backend
+        target_ops = bundle.target_ops
 
         if self.cli_args.chat_template:
             tokenizer.chat_template = self.cli_args.chat_template
@@ -78,7 +89,9 @@ class DFlashModelProvider(mlx_server.ModelProvider):
         self.model = model
         self.tokenizer = tokenizer
         self.draft_model = draft_model
-        self.model_key = (model_ref, None, resolved_draft_ref)
+        self.draft_backend = draft_backend
+        self.target_ops = target_ops
+        self.model_key = (model_ref, None, bundle.resolved_draft_ref)
 
         try:
             mx.eval(model.parameters())
