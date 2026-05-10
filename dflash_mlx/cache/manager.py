@@ -72,11 +72,17 @@ class RuntimeCacheManager:
         self,
         tokens: list[int] | tuple[int, ...],
         key: DFlashPrefixKey,
+        *,
+        request_id: int | None = None,
     ) -> PrefixCacheLookupResult:
         lookup_t0 = time.perf_counter_ns()
         with self._state_lock:
             self._ensure_open_locked()
-            matched_len, snapshot = self._store.lookup(tokens, key)
+            matched_len, snapshot = self._store.lookup(
+                tokens,
+                key,
+                request_id=request_id,
+            )
         return PrefixCacheLookupResult(
             matched_tokens=int(matched_len),
             snapshot=snapshot,

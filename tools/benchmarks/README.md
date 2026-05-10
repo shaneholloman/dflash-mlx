@@ -11,6 +11,7 @@ belong to that public command, not to these lab tools.
 
 ```bash
 PYTHONPATH=$PWD python -m tools.benchmarks.agentic_trace --help
+PYTHONPATH=$PWD python -m tools.benchmarks.context_grid --help
 PYTHONPATH=$PWD python -m tools.benchmarks.prefix_cache_survival_gate --help
 PYTHONPATH=$PWD python -m tools.benchmarks.prefix_cache_probe --help
 PYTHONPATH=$PWD python -m tools.benchmarks.analyze_trace --help
@@ -19,6 +20,16 @@ PYTHONPATH=$PWD python -m tools.benchmarks.analyze_trace --help
 `agentic_trace.py`
 : Agentic session/proxy trace tooling. Use it to study server behavior under a
 real client shape, not as a public speed claim by default.
+
+`context_grid.py`
+: Long-context speed grid. It runs `mlx_lm` and DFlash as separate backend
+phases, one heavy backend at a time, and writes durable `rows.jsonl`,
+`memory_samples.jsonl`, `summary.json`, and `summary.md` with
+prompt-processing speed, generation speed, MLX peak memory, and Darwin physical
+footprint start/peak/end/delta by context bucket. Treat this as private
+roofline/memory evidence, not a public throughput claim. Use
+`--clear-cache-between-cases` to separate per-bucket allocator pressure from a
+long-lived process ladder.
 
 `prefix_cache_survival_gate.py`
 : Long-context prefix-cache correctness gate. It is not a statistical NIAH benchmark.
@@ -42,6 +53,16 @@ and writes a fresh `summary.json` / `compare.md`. Use replay when a live
 OpenCode/pi trajectory would add noise to a runtime or cache A/B. Replay fixes
 the request bodies, not the model's generated token stream, so decode length can
 still vary.
+
+Both `run` and `replay` also write table-ready `rows.jsonl` and `rows.md`.
+Those files normalize one row per OpenAI-compatible POST: `cold` / `warm` /
+`warm-l2` cache class, `cache_hit_source` (`L1`, `L2`, `disk`, or `unknown`),
+prompt/cached/computed tokens, TTFT, prefill/decode timing, decode TPS,
+acceptance/cycles, tool calls, finish reason, and server-process physical
+footprint start/end/delta when DFlash diagnostics emit boundary samples.
+Prefer `--diagnostics basic` for throughput rows. `--diagnostics full` is for
+mechanism evidence and can depress TPS because it records heavier cycle/memory
+events.
 
 ## Cross-runtime opencode comparison (dflash vs mlxlm)
 
@@ -88,10 +109,15 @@ python -m tools.benchmarks.agentic_trace replay \
     --source-trace .artifacts/dflash/traces/<captured_dir> \
     --backend dflash --target <model> --draft <draft> \
     --draft-quant w4 --profile long-session --prefill-step-size 1024 \
-    --fastpath-max-tokens 0 --prefix-cache --prefix-cache-l2 \
+    --prefix-cache --prefix-cache-l2 \
     --diagnostics basic --label dflash_replay \
     --compare-to .artifacts/dflash/traces/<mlx_replay_dir>
 ```
+
+For DFlash trace/replay, the harness passes `--fastpath-max-tokens 0` by
+default so short POSTs still exercise the DFlash path and emit prefix-cache and
+boundary-memory events. Override it only when deliberately measuring target-only
+fastpath behavior.
 
 Private `_*.py` files are implementation modules for these wrappers.
 
@@ -100,6 +126,7 @@ Private `_*.py` files are implementation modules for these wrappers.
 | Tool | Verdict | One-sentence question |
 | --- | --- | --- |
 | `agentic_trace.py` | KEEP | On a real OpenCode/pi loop, how many POSTs, tokens, cache hits, tok/s, and acceptance did the runtime produce? |
+| `context_grid.py` | KEEP | How do prompt-processing speed, generation speed, wall time, and peak memory scale across long-context buckets for `mlx_lm` vs DFlash? |
 | `prefix_cache_survival_gate.py` | KEEP | Does a warm prefix-cache request preserve the correct long-context record after a divergent suffix and reject a stale wrong-haystack answer? |
 | `_agentic_trace.py` | KEEP | How does the orchestrated server+proxy+client capture build the trace and compare it to a peer run? |
 | `_agentic_proxy.py` | KEEP | What exact OpenAI-compatible requests and SSE events did the client send and receive? |

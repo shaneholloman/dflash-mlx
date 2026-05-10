@@ -19,7 +19,7 @@ def format_profiles() -> str:
         "balanced": "recommended default for normal agentic coding",
         "fast": "more throughput, higher memory",
         "low-memory": "lower memory pressure, slower prefill",
-        "long-session": "prefix/L2 oriented for multi-turn revisits",
+        "long-session": "prefix/L2 revisits; serve cache 4GB",
     }
     for profile in _PROFILES.values():
         rows.append(

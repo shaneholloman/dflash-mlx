@@ -196,7 +196,7 @@ PROFILES: dict[str, RuntimeProfile] = {
         prefix_cache=True,
         prefix_cache_max_entries=8,
         prefix_cache_max_bytes=8 * GiB,
-        clear_cache_boundaries=False,
+        clear_cache_boundaries=True,
         max_snapshot_tokens=32000,
         prefix_cache_l2=True,
         prefix_cache_l2_max_bytes=50 * GiB,
@@ -543,8 +543,8 @@ def runtime_config_env_markdown_table() -> str:
 
 def _profiles_markdown_table() -> str:
     rows = [
-        "| Profile | Prefill | Draft window | Prefix cache | L1 entries / byte budget | L2 | Intent |",
-        "| --- | ---: | --- | --- | --- | --- | --- |",
+        "| Profile | Prefill | Draft window | Prefix cache | L1 entries / byte budget | Clear cache | L2 | Intent |",
+        "| --- | ---: | --- | --- | --- | --- | --- | --- |",
     ]
     notes = {
         "balanced": "default normal coding",
@@ -561,6 +561,7 @@ def _profiles_markdown_table() -> str:
                     f"`{profile.draft_sink_size}+{profile.draft_window_size}`",
                     _on_off(profile.prefix_cache),
                     f"`{profile.prefix_cache_max_entries} / {_format_gib(profile.prefix_cache_max_bytes)}`",
+                    _clear_policy_markdown(profile.clear_cache_boundaries),
                     _l2_markdown(profile),
                     f"{notes[profile.name]} |",
                 ]
@@ -582,6 +583,10 @@ def _markdown_flag(option: RuntimeConfigFieldSpec) -> str:
 
 def _on_off(value: bool) -> str:
     return "on" if value else "off"
+
+
+def _clear_policy_markdown(enabled: bool) -> str:
+    return "boundary" if enabled else "off"
 
 
 def _format_gib(value: int) -> str:

@@ -43,16 +43,23 @@ class PrefixSnapshotStore:
         self,
         req_tokens: list[int] | tuple[int, ...],
         key: DFlashPrefixKey,
+        *,
+        request_id: int | None = None,
     ) -> tuple[int, DFlashPrefixSnapshot | None]:
         req_tuple = tuple(int(t) for t in req_tokens)
         t_start = time.perf_counter_ns()
         if self._l2 is None:
-            return self._l1.lookup(req_tuple, key)
+            return self._l1_lookup(req_tuple, key, request_id=request_id)
 
-        matched_len, snapshot = self._l1.lookup(req_tuple, key, record=False)
+        matched_len, snapshot = self._l1_lookup(
+            req_tuple,
+            key,
+            record=False,
+            request_id=request_id,
+        )
         if snapshot is not None or matched_len > 0:
             if matched_len == len(req_tuple):
-                return self._l1.lookup(req_tuple, key)
+                return self._l1_lookup(req_tuple, key, request_id=request_id)
             l2_snapshot = self._l2.lookup(
                 req_tuple,
                 key,
@@ -63,22 +70,24 @@ class PrefixSnapshotStore:
                     l2_snapshot,
                     req_tuple=req_tuple,
                     t_start=t_start,
+                    request_id=request_id,
                 )
             else:
                 with self._lock:
                     self._stats["l2_misses"] += 1
-            return self._l1.lookup(req_tuple, key)
+            return self._l1_lookup(req_tuple, key, request_id=request_id)
 
         l2_snapshot = self._l2.lookup(req_tuple, key)
         if l2_snapshot is None:
             with self._lock:
                 self._stats["l2_misses"] += 1
-            return self._l1.lookup(req_tuple, key)
+            return self._l1_lookup(req_tuple, key, request_id=request_id)
 
         return self._record_l2_hit(
             l2_snapshot,
             req_tuple=req_tuple,
             t_start=t_start,
+            request_id=request_id,
         )
 
     def _record_l2_hit(
@@ -87,6 +96,7 @@ class PrefixSnapshotStore:
         *,
         req_tuple: tuple[int, ...],
         t_start: int,
+        request_id: int | None = None,
     ) -> tuple[int, DFlashPrefixSnapshot]:
         l2_len = len(l2_snapshot.token_ids)
         promote = self._l1.insert_with_evictions(l2_snapshot, skip_too_long=False)
@@ -103,12 +113,27 @@ class PrefixSnapshotStore:
             self._trace_config,
             op="lookup",
             result="l2_hit",
+            request_id=request_id,
             req_tokens=len(req_tuple),
             matched_len=int(l2_len),
             entries=int(self._l1.stats().get("current_entries", 0)),
             elapsed_us=(time.perf_counter_ns() - t_start) / 1_000.0,
         )
         return l2_len, l2_snapshot
+
+    def _l1_lookup(
+        self,
+        req_tuple: tuple[int, ...],
+        key: DFlashPrefixKey,
+        *,
+        record: bool = True,
+        request_id: int | None = None,
+    ) -> tuple[int, DFlashPrefixSnapshot | None]:
+        if request_id is None and record:
+            return self._l1.lookup(req_tuple, key)
+        if request_id is None:
+            return self._l1.lookup(req_tuple, key, record=record)
+        return self._l1.lookup(req_tuple, key, record=record, request_id=request_id)
 
     def insert(self, snapshot: DFlashPrefixSnapshot) -> bool:
         inserted_l2_admitted = False

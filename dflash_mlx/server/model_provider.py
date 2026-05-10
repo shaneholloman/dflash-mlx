@@ -31,6 +31,8 @@ class DFlashModelProvider(mlx_server.ModelProvider):
                 setattr(cli_args, attr, default)
         self.target_ops = None
         self.draft_backend = None
+        self.draft_meta = None
+        self.effective_draft_quant = None
         super().__init__(cli_args)
 
     def load(self, model_path, adapter_path=None, draft_model_path=None):
@@ -68,6 +70,8 @@ class DFlashModelProvider(mlx_server.ModelProvider):
         self.draft_model = None
         self.target_ops = None
         self.draft_backend = None
+        self.draft_meta = None
+        self.effective_draft_quant = None
 
         bundle = load_runtime_bundle(
             model_ref=model_ref,
@@ -80,6 +84,8 @@ class DFlashModelProvider(mlx_server.ModelProvider):
         draft_model = bundle.draft_model
         draft_backend = bundle.draft_backend
         target_ops = bundle.target_ops
+        draft_meta = dict(getattr(bundle, "draft_meta", {}) or {})
+        effective_draft_quant = getattr(bundle, "effective_draft_quant", None)
 
         if self.cli_args.chat_template:
             tokenizer.chat_template = self.cli_args.chat_template
@@ -103,6 +109,8 @@ class DFlashModelProvider(mlx_server.ModelProvider):
         self.tokenizer = tokenizer
         self.draft_model = draft_model
         self.draft_backend = draft_backend
+        self.draft_meta = draft_meta
+        self.effective_draft_quant = effective_draft_quant
         self.target_ops = target_ops
         self.model_key = (model_ref, None, bundle.resolved_draft_ref)
 

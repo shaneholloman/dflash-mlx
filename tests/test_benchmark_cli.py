@@ -71,7 +71,7 @@ def test_benchmark_help_documents_public_flags(capsys):
         "--no-chat-template",
         "Default: chat template enabled.",
         "--draft-quant SPEC",
-        "Optional in-memory draft quantization, e.g. w4:gs64.",
+        "Draft quantization override, e.g. w4:gs64; use 'none' to disable model defaults.",
         "--no-eos",
         "Default: EOS enabled.",
         "--split-sdpa",
@@ -450,6 +450,24 @@ def test_benchmark_summary_markdown_handles_missing_metrics():
 
     assert "| smoke | 1 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a |" in text
     assert "- draft_quant: w4" in text
+
+
+def test_benchmark_uses_effective_runtime_default_draft_quant_label():
+    assert (
+        benchmark._effective_draft_quant_label(
+            None,
+            {"draft_quant_spec": "w4"},
+        )
+        == "w4"
+    )
+    assert (
+        benchmark._effective_draft_quant_label(
+            "none",
+            {"draft_quant_spec": None},
+        )
+        == "none"
+    )
+
 
 def test_benchmark_manifest_config_fields_are_suite_aware(monkeypatch):
     monkeypatch.setattr(

@@ -129,7 +129,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         "--draft-quant",
         default=None,
         metavar="SPEC",
-        help="Optional in-memory draft quantization, e.g. w4:gs64.",
+        help="Draft quantization override, e.g. w4:gs64; use 'none' to disable model defaults.",
     )
     add_offline_runtime_arguments(parser, GENERATE_RUNTIME_FIELDS)
     args = parser.parse_args(list(argv) if argv is not None else None)

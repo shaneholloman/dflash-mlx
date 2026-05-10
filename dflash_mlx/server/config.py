@@ -18,11 +18,13 @@ from dflash_mlx.diagnostics import (
     TraceConfig,
 )
 from dflash_mlx.metal_limits import (
+    MemoryLimit,
     MetalLimitConfig,
     apply_metal_limits,
     parse_memory_limit,
 )
 from dflash_mlx.runtime.config import (
+    GiB,
     add_runtime_config_arguments,
     resolve_runtime_config,
 )
@@ -82,9 +84,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--cache-limit",
         metavar="auto|none|BYTES",
         type=parse_memory_limit,
-        default="auto",
+        default=None,
         help=(
-            "MLX cache memory limit. auto keeps the current wired-limit/4 policy; "
+            "MLX cache memory limit. Default follows the runtime profile "
+            "(long-session: 4GB, others: auto); auto uses wired-limit/4; "
             "none skips mx.set_cache_limit; BYTES accepts suffixes like 8GB."
         ),
     )
@@ -92,7 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--draft-quant",
         default=None,
         metavar="SPEC",
-        help="Optional in-memory draft quantization, e.g. w4:gs64.",
+        help="Draft quantization override, e.g. w4:gs64; use 'none' to disable model defaults.",
     )
     parser.add_argument(
         "--log-level",
@@ -311,10 +314,19 @@ def _write_diagnostics_bootstrap(
 def configure_metal_limits(args: argparse.Namespace) -> MetalLimitConfig:
     limits = apply_metal_limits(
         wired_request=getattr(args, "wired_limit", "auto"),
-        cache_request=getattr(args, "cache_limit", "auto"),
+        cache_request=_resolve_profile_cache_limit(args),
     )
     args.metal_limits = limits
     return limits
+
+def _resolve_profile_cache_limit(args: argparse.Namespace) -> MemoryLimit:
+    explicit = getattr(args, "cache_limit", None)
+    if explicit is not None:
+        return explicit
+    runtime_config = getattr(args, "runtime_config", None)
+    if getattr(runtime_config, "profile", None) == "long-session":
+        return 4 * GiB
+    return "auto"
 
 def configure_logging(log_level: str) -> None:
     logging.basicConfig(

@@ -61,6 +61,7 @@ class DFlashPrefixCache:
         key: DFlashPrefixKey,
         *,
         record: bool = True,
+        request_id: int | None = None,
     ) -> tuple[int, Optional[DFlashPrefixSnapshot]]:
         req_tuple = tuple(int(t) for t in req_tokens)
         t_start = time.perf_counter_ns()
@@ -117,6 +118,7 @@ class DFlashPrefixCache:
                         self._log_cache(
                             op="lookup",
                             result="exact_hit" if exact else "prefix_hit",
+                            request_id=request_id,
                             req_tokens=len(req_tuple),
                             matched_len=int(best_len),
                             entries=entries_count_log,
@@ -148,6 +150,7 @@ class DFlashPrefixCache:
         self._log_cache(
             op="lookup",
             result="miss",
+            request_id=request_id,
             req_tokens=len(req_tuple),
             matched_len=0,
             entries=entries_count,

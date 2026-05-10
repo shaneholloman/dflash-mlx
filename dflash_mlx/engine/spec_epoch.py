@@ -980,6 +980,7 @@ class SpeculativeSession:
                     rollback_us=ns_to_us(replay_cycle_ns),
                     other_us=ns_to_us(other_cycle_ns),
                     cycle_total_us=ns_to_us(cycle_total_ns),
+                    verify_token_count=int(verify_token_count),
                 )
                 cycle_profiles.append(cycle_profile_entry)
                 _pre_yield = yield_pause.mark()

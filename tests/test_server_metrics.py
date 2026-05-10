@@ -68,6 +68,8 @@ def _configure_metrics(runtime_config=None):
         model_provider=SimpleNamespace(
             model_key=("target-model", None, "draft-model"),
             draft_model=SimpleNamespace(target_layer_ids=(3, 7)),
+            effective_draft_quant="w4",
+            draft_meta={"draft_quant_source": "model_default"},
             cli_args=SimpleNamespace(
                 model="target-model",
                 draft_model=None,
@@ -221,6 +223,14 @@ def test_diagnostics_post_event_records_prefill_details(tmp_path):
         cache_insert_ms=0.0,
         finish_reason="length",
         max_tokens=1,
+        memory_waterfall_start={
+            "phys_footprint_bytes": 10_000_000_000,
+            "phys_footprint_gb": 10.0,
+        },
+        memory_waterfall_end={
+            "phys_footprint_bytes": 12_500_000_000,
+            "phys_footprint_gb": 12.5,
+        },
         prefill_event=_prefill_event(
             prompt_token_count=4096,
             logical_ctx_tokens=4096,
@@ -256,6 +266,8 @@ def test_diagnostics_post_event_records_prefill_details(tmp_path):
     assert row["prefill_tokens_computed"] == 1024
     assert row["runtime_config"]["prefill_step_size"] == 8192
     assert "memory_waterfall" not in row["runtime_config"]
+    assert row["memory_boundary_start"]["phys_footprint_bytes"] == 10_000_000_000
+    assert row["memory_boundary_end"]["phys_footprint_gb"] == 12.5
     assert row["prefill_phase_timings_us"] == {
         "phase_cold_us": 1_900_000.0,
         "phase_seam_us": 100_000.0,
@@ -447,6 +459,8 @@ def test_metrics_endpoint_returns_json_before_request(monkeypatch):
     assert payload["server"]["version"] == "test-version"
     assert payload["server"]["model"] == "target-model"
     assert payload["server"]["draft"] == "draft-model"
+    assert payload["server"]["draft_quant"] == "w4"
+    assert payload["server"]["draft_quant_source"] == "model_default"
     assert payload["runtime"]["prefill_step_size"] == 4096
     assert payload["memory"].keys() >= {
         "rss_gb",

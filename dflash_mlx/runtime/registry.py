@@ -12,19 +12,25 @@ class ModelSupportSpec:
     target_names: tuple[str, ...]
     draft_ref: str
     target_family: str | None = None
+    default_draft_quant: str | None = None
 
 
 MODEL_SUPPORT_SPECS: tuple[ModelSupportSpec, ...] = (
     ModelSupportSpec(("Qwen3.5-4B",), "z-lab/Qwen3.5-4B-DFlash", "hybrid_gdn"),
-    ModelSupportSpec(("Qwen3.5-9B",), "z-lab/Qwen3.5-9B-DFlash", "hybrid_gdn"),
-    ModelSupportSpec(("Qwen3.5-27B",), "z-lab/Qwen3.5-27B-DFlash", "hybrid_gdn"),
-    ModelSupportSpec(("Qwen3.5-35B-A3B",), "z-lab/Qwen3.5-35B-A3B-DFlash", "hybrid_gdn"),
-    ModelSupportSpec(("Qwen3.6-27B",), "z-lab/Qwen3.6-27B-DFlash", "hybrid_gdn"),
-    ModelSupportSpec(("Qwen3.6-35B-A3B",), "z-lab/Qwen3.6-35B-A3B-DFlash", "hybrid_gdn"),
+    ModelSupportSpec(("Qwen3.5-9B",), "z-lab/Qwen3.5-9B-DFlash", "hybrid_gdn", "w4"),
+    ModelSupportSpec(("Qwen3.5-27B",), "z-lab/Qwen3.5-27B-DFlash", "hybrid_gdn", "w4"),
+    ModelSupportSpec(("Qwen3.5-35B-A3B",), "z-lab/Qwen3.5-35B-A3B-DFlash", "hybrid_gdn", "w4"),
+    ModelSupportSpec(("Qwen3.6-27B",), "z-lab/Qwen3.6-27B-DFlash", "hybrid_gdn", "w4"),
+    ModelSupportSpec(("Qwen3.6-35B-A3B",), "z-lab/Qwen3.6-35B-A3B-DFlash", "hybrid_gdn", "w4"),
     ModelSupportSpec(("Qwen3-4B",), "z-lab/Qwen3-4B-DFlash-b16", "pure_attention"),
     ModelSupportSpec(("Qwen3-8B",), "z-lab/Qwen3-8B-DFlash-b16", "pure_attention"),
-    ModelSupportSpec(("gemma-4-31b-it",), "z-lab/gemma-4-31B-it-DFlash", "gemma4_swa"),
-    ModelSupportSpec(("gemma-4-26b-a4b-it",), "z-lab/gemma-4-26B-A4B-it-DFlash", "gemma4_swa"),
+    ModelSupportSpec(("gemma-4-31b-it",), "z-lab/gemma-4-31B-it-DFlash", "gemma4_swa", "w4"),
+    ModelSupportSpec(
+        ("gemma-4-26b-a4b-it",),
+        "z-lab/gemma-4-26B-A4B-it-DFlash",
+        "gemma4_swa",
+        "w4",
+    ),
 )
 
 DRAFT_REGISTRY: dict[str, str] = {
@@ -75,6 +81,24 @@ def resolve_optional_draft_ref(model_ref: str, draft_ref: str | None) -> str | N
         return draft_ref
     spec = resolve_model_support_spec(model_ref)
     return spec.draft_ref if spec is not None else None
+
+
+def resolve_effective_draft_quant(
+    *,
+    draft_quant: str | None,
+    resolved_draft_ref: str | None,
+    support_spec: ModelSupportSpec | None,
+) -> str | None:
+    requested = (draft_quant or "").strip()
+    if requested:
+        if requested.lower() == "none":
+            return None
+        return requested
+    if support_spec is None or not support_spec.default_draft_quant:
+        return None
+    if resolved_draft_ref != support_spec.draft_ref:
+        return None
+    return support_spec.default_draft_quant
 
 
 def validate_support_spec_family(

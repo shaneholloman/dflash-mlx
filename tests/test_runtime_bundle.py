@@ -9,6 +9,7 @@ import pytest
 from dflash_mlx.runtime import bundle as runtime_bundle
 from dflash_mlx.runtime.registry import (
     DRAFT_REGISTRY,
+    resolve_effective_draft_quant,
     resolve_model_support_spec,
     resolve_optional_draft_ref,
 )
@@ -59,6 +60,48 @@ def test_runtime_registry_preserves_draft_resolution():
     assert (
         resolve_model_support_spec("mlx-community/gemma-4-31b-it-4bit").target_family
         == "gemma4_swa"
+    )
+    assert resolve_model_support_spec("Qwen/Qwen3.5-9B").default_draft_quant == "w4"
+    assert (
+        resolve_model_support_spec("mlx-community/gemma-4-31b-it-4bit").default_draft_quant
+        == "w4"
+    )
+
+
+def test_runtime_registry_resolves_effective_draft_quant():
+    spec = resolve_model_support_spec("Qwen/Qwen3.5-9B")
+    assert spec is not None
+    assert (
+        resolve_effective_draft_quant(
+            draft_quant=None,
+            resolved_draft_ref="z-lab/Qwen3.5-9B-DFlash",
+            support_spec=spec,
+        )
+        == "w4"
+    )
+    assert (
+        resolve_effective_draft_quant(
+            draft_quant="none",
+            resolved_draft_ref="z-lab/Qwen3.5-9B-DFlash",
+            support_spec=spec,
+        )
+        is None
+    )
+    assert (
+        resolve_effective_draft_quant(
+            draft_quant=None,
+            resolved_draft_ref="manual/draft",
+            support_spec=spec,
+        )
+        is None
+    )
+    assert (
+        resolve_effective_draft_quant(
+            draft_quant="w8:gs128",
+            resolved_draft_ref="z-lab/Qwen3.5-9B-DFlash",
+            support_spec=spec,
+        )
+        == "w8:gs128"
     )
 
 
@@ -146,6 +189,87 @@ def test_runtime_bundle_loads_and_binds_draft(monkeypatch):
         {"lazy": True, "draft_quant": "w4"},
     )
     assert calls[1] == ("bind", draft_model, target_model, ops)
+
+
+def test_runtime_bundle_applies_model_default_draft_quant(monkeypatch):
+    target_model = object()
+    tokenizer = object()
+    draft_model = SimpleNamespace(bound=False)
+    draft_backend = object()
+    ops = SimpleNamespace(family=lambda _target_model: "hybrid_gdn")
+    draft_calls = []
+
+    monkeypatch.setattr(
+        runtime_bundle,
+        "load_target_bundle",
+        lambda *args, **kwargs: _loaded_target(
+            target_model,
+            tokenizer,
+            {"resolved_model_ref": "Qwen/Qwen3.5-9B"},
+            ops,
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_bundle,
+        "load_draft_bundle",
+        lambda draft_ref, **kwargs: draft_calls.append((draft_ref, kwargs))
+        or (draft_model, {"resolved_model_ref": draft_ref}),
+    )
+    monkeypatch.setattr(runtime_bundle, "bind_draft_to_target", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runtime_bundle, "make_draft_backend", lambda: draft_backend)
+
+    bundle = runtime_bundle.load_runtime_bundle(
+        model_ref="Qwen/Qwen3.5-9B",
+        draft_ref=None,
+    )
+
+    assert draft_calls == [
+        ("z-lab/Qwen3.5-9B-DFlash", {"lazy": True, "draft_quant": "w4"})
+    ]
+    assert bundle.effective_draft_quant == "w4"
+    assert bundle.draft_meta["draft_quant_spec"] == "w4"
+    assert bundle.draft_meta["draft_quant_source"] == "model_default"
+
+
+def test_runtime_bundle_draft_quant_none_disables_model_default(monkeypatch):
+    target_model = object()
+    tokenizer = object()
+    draft_model = SimpleNamespace(bound=False)
+    draft_backend = object()
+    ops = SimpleNamespace(family=lambda _target_model: "hybrid_gdn")
+    draft_calls = []
+
+    monkeypatch.setattr(
+        runtime_bundle,
+        "load_target_bundle",
+        lambda *args, **kwargs: _loaded_target(
+            target_model,
+            tokenizer,
+            {"resolved_model_ref": "Qwen/Qwen3.5-9B"},
+            ops,
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_bundle,
+        "load_draft_bundle",
+        lambda draft_ref, **kwargs: draft_calls.append((draft_ref, kwargs))
+        or (draft_model, {"resolved_model_ref": draft_ref}),
+    )
+    monkeypatch.setattr(runtime_bundle, "bind_draft_to_target", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runtime_bundle, "make_draft_backend", lambda: draft_backend)
+
+    bundle = runtime_bundle.load_runtime_bundle(
+        model_ref="Qwen/Qwen3.5-9B",
+        draft_ref=None,
+        draft_quant="none",
+    )
+
+    assert draft_calls == [
+        ("z-lab/Qwen3.5-9B-DFlash", {"lazy": True, "draft_quant": None})
+    ]
+    assert bundle.effective_draft_quant is None
+    assert bundle.draft_meta["draft_quant_spec"] is None
+    assert bundle.draft_meta["draft_quant_source"] == "none"
 
 
 def test_runtime_bundle_draft_override_still_exposes_support_spec(monkeypatch):

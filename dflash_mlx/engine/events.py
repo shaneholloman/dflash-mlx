@@ -96,9 +96,10 @@ class CycleCompleteEvent:
     rollback_us: float
     other_us: float
     cycle_total_us: float
+    verify_token_count: int | None = None
 
     def to_payload(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "cycle": int(self.cycle),
             "block_len": int(self.block_len),
             "commit_count": int(self.commit_count),
@@ -111,6 +112,9 @@ class CycleCompleteEvent:
             "other_us": float(self.other_us),
             "cycle_total_us": float(self.cycle_total_us),
         }
+        if self.verify_token_count is not None:
+            payload["verify_token_count"] = int(self.verify_token_count)
+        return payload
 
 
 @dataclass(frozen=True)

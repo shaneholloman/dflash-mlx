@@ -16,7 +16,9 @@ from dflash_mlx.engine.events import (
     SummaryEvent,
     TokenEvent,
 )
+from dflash_mlx.diagnostics import DiagnosticsConfig, TraceConfig
 from dflash_mlx.server import metrics as metrics_mod
+from dflash_mlx.server import request_loop as request_loop_mod
 from dflash_mlx.server import runtime as server_runtime_mod
 from dflash_mlx.server.metrics import (
     get_live_metrics_payload,
@@ -435,3 +437,55 @@ def test_memory_waterfall_events_are_enriched_with_prefix_cache_memory():
     assert result.memory_waterfall_peak["l1_snapshot_bytes"] == 123
     assert result.memory_waterfall_peak["l1_snapshot_target_hidden_bytes"] == 45
     assert result.memory_waterfall_peak["l1_snapshot_gb"] > 0.0
+
+
+def test_basic_diagnostics_records_boundary_memory_snapshots(monkeypatch):
+    snapshots = iter(
+        [
+            {"phys_footprint_bytes": 10_000_000_000, "mlx_cache_bytes": 1_000_000},
+            {"phys_footprint_bytes": 12_500_000_000, "mlx_cache_bytes": 2_000_000},
+        ]
+    )
+    monkeypatch.setattr(
+        request_loop_mod,
+        "process_memory_snapshot",
+        lambda include_system_wired=False: next(snapshots),
+    )
+    runtime_context = SimpleNamespace(
+        diagnostics=DiagnosticsConfig(
+            mode="basic",
+            memory_waterfall=False,
+            trace=TraceConfig(),
+        )
+    )
+    events = ClosableEvents(
+        [
+            SummaryEvent(
+                elapsed_us=10.0,
+                prompt_token_count=3,
+                generated_token_ids=(),
+                generation_tokens=0,
+                accepted_from_draft=0,
+                acceptance_ratio=0.0,
+                cycles_completed=0,
+                phase_timings_us={},
+            ),
+        ]
+    )
+
+    result = consume_dflash_events(
+        event_iter=events,
+        rqueue=SimpleQueue(),
+        ctx=FakeContext(),
+        tokenizer=FakeTokenizer(),
+        prompt=[1, 2, 3],
+        max_tokens=16,
+        eos_token_ids=set(),
+        request_start_ns=0,
+        runtime_context=runtime_context,
+    )
+
+    assert result.memory_waterfall_start["memory_phase"] == "request_start"
+    assert result.memory_waterfall_start["phys_footprint_gb"] == 10.0
+    assert result.memory_waterfall_end["memory_phase"] == "request_end"
+    assert result.memory_waterfall_end["phys_footprint_gb"] == 12.5

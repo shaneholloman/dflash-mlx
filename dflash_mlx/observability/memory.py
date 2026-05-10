@@ -15,6 +15,52 @@ from typing import Any
 import mlx.core as mx
 
 GB = 1_000_000_000.0
+_TASK_VM_INFO = 22
+_DARWIN_TASK_VM_BYTE_FIELDS = (
+    "virtual_size",
+    "resident_size",
+    "resident_size_peak",
+    "device",
+    "device_peak",
+    "internal",
+    "internal_peak",
+    "external",
+    "external_peak",
+    "reusable",
+    "reusable_peak",
+    "purgeable_volatile_pmap",
+    "purgeable_volatile_resident",
+    "purgeable_volatile_virtual",
+    "compressed",
+    "compressed_peak",
+    "compressed_lifetime",
+    "phys_footprint",
+)
+
+
+class _DarwinTaskVmInfo(ctypes.Structure):
+    _fields_ = [
+        ("virtual_size", ctypes.c_uint64),
+        ("region_count", ctypes.c_int32),
+        ("page_size", ctypes.c_int32),
+        ("resident_size", ctypes.c_uint64),
+        ("resident_size_peak", ctypes.c_uint64),
+        ("device", ctypes.c_uint64),
+        ("device_peak", ctypes.c_uint64),
+        ("internal", ctypes.c_uint64),
+        ("internal_peak", ctypes.c_uint64),
+        ("external", ctypes.c_uint64),
+        ("external_peak", ctypes.c_uint64),
+        ("reusable", ctypes.c_uint64),
+        ("reusable_peak", ctypes.c_uint64),
+        ("purgeable_volatile_pmap", ctypes.c_uint64),
+        ("purgeable_volatile_resident", ctypes.c_uint64),
+        ("purgeable_volatile_virtual", ctypes.c_uint64),
+        ("compressed", ctypes.c_uint64),
+        ("compressed_peak", ctypes.c_uint64),
+        ("compressed_lifetime", ctypes.c_uint64),
+        ("phys_footprint", ctypes.c_uint64),
+    ]
 
 
 def process_memory_snapshot(
@@ -24,8 +70,19 @@ def process_memory_snapshot(
     rss = current_rss_bytes()
     mlx_active = mlx_memory_bytes("get_active_memory")
     mlx_cache = mlx_memory_bytes("get_cache_memory")
+    task_vm = darwin_task_vm_info_bytes()
     return {
         "rss_bytes": rss,
+        "phys_footprint_bytes": _task_vm_value(task_vm, "phys_footprint"),
+        "darwin_resident_bytes": _task_vm_value(task_vm, "resident_size"),
+        "darwin_resident_peak_bytes": _task_vm_value(task_vm, "resident_size_peak"),
+        "darwin_device_bytes": _task_vm_value(task_vm, "device"),
+        "darwin_device_peak_bytes": _task_vm_value(task_vm, "device_peak"),
+        "darwin_internal_bytes": _task_vm_value(task_vm, "internal"),
+        "darwin_internal_peak_bytes": _task_vm_value(task_vm, "internal_peak"),
+        "darwin_external_bytes": _task_vm_value(task_vm, "external"),
+        "darwin_reusable_bytes": _task_vm_value(task_vm, "reusable"),
+        "darwin_compressed_bytes": _task_vm_value(task_vm, "compressed"),
         "system_wired_bytes": system_wired_bytes() if include_system_wired else None,
         "mlx_active_bytes": mlx_active,
         "mlx_cache_bytes": mlx_cache,
@@ -43,6 +100,7 @@ def live_memory_payload(*, wired_limit_bytes: int | None = None) -> dict[str, An
     return {
         "rss_gb": _gb_or_none(snapshot["rss_bytes"]),
         "rss_peak_gb": _gb_or_none(rss_peak_bytes()),
+        "phys_footprint_gb": _gb_or_none(snapshot["phys_footprint_bytes"]),
         "mlx_active_gb": _gb_or_none(snapshot["mlx_active_bytes"]),
         "mlx_cache_gb": _gb_or_none(snapshot["mlx_cache_bytes"]),
         "mlx_peak_gb": _gb_or_none(snapshot["mlx_peak_bytes"]),
@@ -163,6 +221,44 @@ def darwin_task_resident_size_bytes() -> int | None:
         return None
 
 
+def darwin_phys_footprint_bytes() -> int | None:
+    task_vm = darwin_task_vm_info_bytes()
+    return _task_vm_value(task_vm, "phys_footprint")
+
+
+def darwin_task_vm_info_bytes() -> dict[str, int] | None:
+    if sys.platform != "darwin":
+        return None
+
+    try:
+        libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+        task_info = libc.task_info
+        task_info.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_int32,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        task_info.restype = ctypes.c_int32
+        libc.mach_task_self.restype = ctypes.c_uint32
+        info = _DarwinTaskVmInfo()
+        count = ctypes.c_uint32(ctypes.sizeof(info) // ctypes.sizeof(ctypes.c_int32))
+        result = task_info(
+            libc.mach_task_self(),
+            _TASK_VM_INFO,
+            ctypes.byref(info),
+            ctypes.byref(count),
+        )
+        if result != 0 or info.phys_footprint <= 0:
+            return None
+        return {
+            field: int(getattr(info, field))
+            for field in _DARWIN_TASK_VM_BYTE_FIELDS
+        }
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
 def system_wired_bytes() -> int | None:
     if sys.platform != "darwin":
         return None
@@ -229,3 +325,12 @@ def _gb_or_none(value: int | None) -> float | None:
     if value is None:
         return None
     return float(value) / GB
+
+
+def _task_vm_value(task_vm: dict[str, int] | None, key: str) -> int | None:
+    if task_vm is None:
+        return None
+    value = task_vm.get(key)
+    if value is None:
+        return None
+    return int(value)

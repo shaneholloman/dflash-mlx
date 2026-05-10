@@ -30,15 +30,20 @@ dflash profiles
 Current profiles:
 
 <!-- dflash-runtime-config:profiles:start -->
-| Profile | Prefill | Draft window | Prefix cache | L1 entries / byte budget | L2 | Intent |
-| --- | ---: | --- | --- | --- | --- | --- |
-| `balanced` | 4096 | `64+1024` | on | `4 / 8GiB` | off | default normal coding |
-| `fast` | 8192 | `64+1024` | on | `4 / 16GiB` | off | throughput first |
-| `low-memory` | 1024 | `64+1024` | on | `2 / 2GiB` | off | lower pressure, slower prefill |
-| `long-session` | 4096 | `64+1024` | on | `8 / 8GiB` | on / `50GiB` | revisit-oriented long sessions |
+| Profile | Prefill | Draft window | Prefix cache | L1 entries / byte budget | Clear cache | L2 | Intent |
+| --- | ---: | --- | --- | --- | --- | --- | --- |
+| `balanced` | 4096 | `64+1024` | on | `4 / 8GiB` | off | off | default normal coding |
+| `fast` | 8192 | `64+1024` | on | `4 / 16GiB` | off | off | throughput first |
+| `low-memory` | 1024 | `64+1024` | on | `2 / 2GiB` | off | off | lower pressure, slower prefill |
+| `long-session` | 4096 | `64+1024` | on | `8 / 8GiB` | boundary | on / `50GiB` | prefix revisits; serve cache `4GB` |
 <!-- dflash-runtime-config:profiles:end -->
 
-`clear_cache_boundaries` is currently off in all profiles.
+`clear_cache_boundaries` is enabled by `long-session` to release MLX scratch cache at safe boundaries while preserving prefix-cache state; other profiles keep it off.
+
+In `dflash serve`, `long-session` also uses a tighter default MLX cache limit
+of `4GB` based on Qwen3.6 27B OpenCode long-session probes. Explicit
+`--cache-limit auto` restores the generic wired-limit/4 policy, and
+`--cache-limit none` skips `mx.set_cache_limit`.
 
 Gemma4 long-context memory-pressure note: use the existing `low-memory` profile,
 or keep another profile and set `--prefill-step-size 1024` explicitly. The
@@ -95,12 +100,12 @@ Draft loading:
 
 | Flag | Meaning |
 | --- | --- |
-| `--draft-quant SPEC` | optional in-memory draft quantization, e.g. `w4:gs64` |
+| `--draft-quant SPEC` | draft quantization override, e.g. `w4:gs64`; use `none` to disable model defaults |
 
-Draft quantization is deliberately explicit. Current Gemma4 probes keep
-`--draft-quant w4` as a 31B memory-headroom option; 26B-A4B should be treated as
-a measured speed tradeoff because its peak memory increased in the local long
-context probe.
+Validated large DFlash drafts default to `w4` in memory because current Qwen3.5,
+Qwen3.6, and Gemma4 README-prompt probes showed the best practical
+memory/throughput tradeoff. Use `--draft-quant none` for bf16/non-quant draft
+debugging or A/B comparisons.
 
 Prefix cache:
 
@@ -147,7 +152,7 @@ Metal limits:
 | Flag | Meaning |
 | --- | --- |
 | `--wired-limit auto\|none\|BYTES` | MLX wired memory limit policy |
-| `--cache-limit auto\|none\|BYTES` | MLX cache limit policy |
+| `--cache-limit auto\|none\|BYTES` | MLX cache limit policy; omitted follows the runtime profile |
 
 ## `dflash generate`
 
@@ -164,7 +169,7 @@ Flags:
 | `--max-tokens INT` | generated token cap |
 | `--no-chat-template` | use raw prompt text |
 | `--draft REF_OR_PATH` | draft override |
-| `--draft-quant SPEC` | optional in-memory draft quantization, e.g. `w4:gs64` |
+| `--draft-quant SPEC` | draft quantization override, e.g. `w4:gs64`; use `none` to disable model defaults |
 
 Runtime override flags:
 
@@ -221,7 +226,7 @@ Flags:
 | `--model REF_OR_PATH` | target model |
 | `--draft REF_OR_PATH` | draft override |
 | `--no-chat-template` | raw prompt mode |
-| `--draft-quant SPEC` | optional in-memory draft quantization, e.g. `w4:gs64` |
+| `--draft-quant SPEC` | draft quantization override, e.g. `w4:gs64`; use `none` to disable model defaults |
 | `--no-eos` | suppress EOS so generation reaches token cap |
 | `--split-sdpa`, `--no-split-sdpa` | target split-SDPA verifier path; enabled by default |
 

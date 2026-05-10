@@ -141,6 +141,7 @@ class ServerRuntime:
             tokenizer=tokenizer,
             prompt=prepared.prompt,
             request=request,
+            request_id=request_id,
             runtime_context=runtime_context,
         )
         ctx.prompt_cache_count = prefix_flow.hit_tokens
@@ -204,6 +205,8 @@ class ServerRuntime:
             max_tokens=args.max_tokens,
             prompt_regime=build_prompt_regime(args, tokenizer, request),
             memory_waterfall_peak=loop_result.memory_waterfall_peak,
+            memory_waterfall_start=loop_result.memory_waterfall_start,
+            memory_waterfall_end=loop_result.memory_waterfall_end,
             diagnostics=runtime_context.diagnostics,
             prefill_event=loop_result.prefill_event,
             runtime_config=runtime_context.runtime,
@@ -329,6 +332,12 @@ def _print_startup_banner(
         draft_suffix = " (explicit)"
     else:
         draft_suffix = " (auto-detected)"
+    draft_quant = getattr(model_provider, "effective_draft_quant", None)
+    draft_meta = getattr(model_provider, "draft_meta", {}) or {}
+    draft_quant_source = draft_meta.get("draft_quant_source")
+    draft_quant_line = (
+        f"{draft_quant} ({draft_quant_source})" if draft_quant else "none"
+    )
     chat_template_args = getattr(model_provider.cli_args, "chat_template_args", {})
     if not isinstance(chat_template_args, dict):
         chat_template_args = {}
@@ -353,6 +362,7 @@ def _print_startup_banner(
         f"DFlash v{version} - speculative decoding engine",
         f"Target:       {target_ref}",
         f"Draft:        {draft_ref}{draft_suffix}",
+        f"Draft quant:  {draft_quant_line}",
         "Mode:         DFlash (speculative decoding active)",
         f"Thinking:     {'enabled' if thinking_enabled else 'disabled'}",
         (

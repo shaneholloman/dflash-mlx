@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 import threading
 
@@ -23,6 +24,7 @@ from dflash_mlx.cache.fingerprints import DFlashPrefixKey
 from dflash_mlx.cache.prefix_l1 import DFlashPrefixCache
 from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
 from dflash_mlx.cache.store import PrefixSnapshotStore
+from dflash_mlx.diagnostics import TraceConfig
 from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
 from dflash_mlx.server.prefix_cache_flow import (
     compute_request_stable_prefix_len,
@@ -160,6 +162,91 @@ def test_l1_generation_snapshot_without_logits_is_prefix_only():
     prefix_len, prefix = cache.lookup([1, 2, 3, 4], key)
     assert prefix_len == 3
     assert prefix is snapshot
+
+
+def test_l1_lookup_cache_event_records_request_id(tmp_path):
+    cache = DFlashPrefixCache(max_entries=8, max_bytes=8 * 1024 * 1024 * 1024)
+    cache.set_trace_config(TraceConfig(log_dir=tmp_path))
+    key = _make_key()
+    cache.insert(_make_synthetic_snapshot([1, 2, 3], key))
+
+    matched_len, snapshot = cache.lookup([1, 2, 3, 4], key, request_id=42)
+
+    assert matched_len == 3
+    assert snapshot is not None
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "cache_events.jsonl").read_text().splitlines()
+    ]
+    lookup = [row for row in rows if row.get("op") == "lookup"][-1]
+    assert lookup["request_id"] == 42
+    assert lookup["result"] == "prefix_hit"
+
+
+def test_store_l2_miss_cache_event_records_request_id(tmp_path):
+    class _MissL2:
+        def lookup(self, _tokens, _key, **_kwargs):
+            return None
+
+        def stats(self):
+            return {}
+
+    key = _make_key()
+    store = PrefixSnapshotStore(
+        l1=DFlashPrefixCache(max_entries=8, max_bytes=8 * 1024 * 1024 * 1024),
+        l2=_MissL2(),
+    )
+    store.set_trace_config(TraceConfig(log_dir=tmp_path))
+
+    matched_len, snapshot = store.lookup([9, 10], key, request_id=99)
+
+    assert matched_len == 0
+    assert snapshot is None
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "cache_events.jsonl").read_text().splitlines()
+    ]
+    lookup = [row for row in rows if row.get("op") == "lookup"][-1]
+    assert lookup["request_id"] == 99
+    assert lookup["result"] == "miss"
+
+
+def test_store_l2_hit_cache_event_records_request_id(tmp_path):
+    key = _make_key()
+    l2_snapshot = _make_synthetic_snapshot([1, 2, 3], key)
+
+    class _HitL2:
+        def __init__(self, snapshot):
+            self.snapshot = snapshot
+            self.inserts = []
+
+        def lookup(self, _tokens, _key, **_kwargs):
+            return self.snapshot
+
+        def insert_async(self, snapshot):
+            self.inserts.append(snapshot)
+            return True
+
+        def stats(self):
+            return {}
+
+    store = PrefixSnapshotStore(
+        l1=DFlashPrefixCache(max_entries=8, max_bytes=8 * 1024 * 1024 * 1024),
+        l2=_HitL2(l2_snapshot),
+    )
+    store.set_trace_config(TraceConfig(log_dir=tmp_path))
+
+    matched_len, snapshot = store.lookup([1, 2, 3, 4], key, request_id=123)
+
+    assert matched_len == 3
+    assert snapshot is l2_snapshot
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "cache_events.jsonl").read_text().splitlines()
+    ]
+    lookup = [row for row in rows if row.get("op") == "lookup"][-1]
+    assert lookup["request_id"] == 123
+    assert lookup["result"] == "l2_hit"
 
 
 def test_prefix_snapshot_builder_matches_build_snapshot_shape():
@@ -847,6 +934,14 @@ class TestStablePrefixLen:
     GEMMA_MODEL = 4368
     GEMMA_NEWLINE = 107
 
+    class QwenTokenizer:
+        unk_token_id = 3
+
+        def convert_tokens_to_ids(self, tokens):
+            if tokens == ["<|im_start|>", "assistant"]:
+                return [TestStablePrefixLen.IM_START, TestStablePrefixLen.ASST]
+            return [3 for _ in tokens]
+
     class GemmaTokenizer:
         unk_token_id = 3
 
@@ -982,17 +1077,18 @@ class TestStablePrefixLen:
         assert compute_stable_prefix_len([], im_start_id=1, assistant_id=2) == 0
         assert compute_stable_prefix_len([5], im_start_id=1, assistant_id=2) == 1
 
-    def test_request_stable_prefix_keeps_tool_tail(self):
+    def test_request_stable_prefix_tool_turn_strips_next_assistant_prompt(self):
         tokens = [
             10,
             11,
-            self.GEMMA_TURN,
-            self.GEMMA_MODEL,
-            self.GEMMA_NEWLINE,
+            self.IM_START,
+            self.ASST,
             100,
             200,
             300,
             400,
+            self.IM_START,
+            self.ASST,
         ]
         request = SimpleNamespace(
             request_type="chat",
@@ -1007,10 +1103,10 @@ class TestStablePrefixLen:
         assert (
             compute_request_stable_prefix_len(
                 tokens,
-                tokenizer=self.GemmaTokenizer(),
+                tokenizer=self.QwenTokenizer(),
                 request=request,
             )
-            == len(tokens)
+            == 8
         )
 
     def test_request_stable_prefix_user_turn_uses_marker_boundary(self):

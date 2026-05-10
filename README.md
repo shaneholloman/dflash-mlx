@@ -144,16 +144,21 @@ Gemma4 31B and 26B-A4B exact repeated-prompt restore and long-chat continuation
 restore, but those diagnostics are cache-latency evidence, not public benchmark
 throughput claims.
 
-For Gemma4 31B, `--draft-quant w4` is the current measured opt-in when memory
-headroom matters. Keep it explicit and rebenchmark on the target prompt; the
-same option improved 26B-A4B speed in local probes but did not reduce peak
-memory.
+Validated large DFlash drafts default to `w4` in memory. Current Qwen3.5,
+Qwen3.6, and Gemma4 probes showed this is the best practical memory/throughput
+tradeoff; pass `--draft-quant none` when you need a bf16/non-quant draft A/B.
 
 For Gemma4 long-context memory pressure, use `--profile low-memory` or keep your
 current profile and set `--prefill-step-size 1024` explicitly. For Gemma4 31B
 under tighter long-context memory limits, `--prefill-step-size 512` reduced peak
 memory and TTFT in local `dflash serve` probes, but it is prompt-sensitive and
 not a public benchmark throughput claim. The balanced default remains `4096`.
+
+For Qwen3.6 27B long OpenCode sessions, `dflash serve --profile long-session`
+now applies a `4GB` MLX cache limit by default. That keeps the validated `w4`
+draft path and lowers process physical footprint on long-context rows without a
+measured decode regression in local first56 replay. Pass `--cache-limit auto`
+to restore the generic wired-limit/4 MLX policy.
 
 | Target | Draft |
 |--------|-------|
@@ -189,12 +194,12 @@ dflash models     # list supported target/draft pairs
 
 Readable defaults. Explicit CLI flags override them.
 
-| Profile | Prefill | Prefix cache | L1 budget | L2 | Intent |
-|---|---:|---|---|---|---|
-| `balanced` | 4096 | on | 4 / 8 GiB | off | default coding sessions |
-| `fast` | 8192 | on | 4 / 16 GiB | off | throughput first |
-| `low-memory` | 1024 | on | 2 / 2 GiB | off | lower memory pressure |
-| `long-session` | 4096 | on | 8 / 8 GiB | on / 50 GiB | prefix revisits |
+| Profile | Prefill | Prefix cache | L1 budget | Clear cache | L2 | Intent |
+|---|---:|---|---|---|---|---|
+| `balanced` | 4096 | on | 4 / 8 GiB | off | off | default coding sessions |
+| `fast` | 8192 | on | 4 / 16 GiB | off | off | throughput first |
+| `low-memory` | 1024 | on | 2 / 2 GiB | off | off | lower memory pressure |
+| `long-session` | 4096 | on | 8 / 8 GiB | boundary | on / 50 GiB | prefix revisits; serve cache 4GB |
 
 ```bash
 dflash profiles

@@ -38,6 +38,8 @@ _LIVE_SERVER: dict[str, Any] = {
     "version": None,
     "model": None,
     "draft": None,
+    "draft_quant": None,
+    "draft_quant_source": None,
     "mode": "dflash",
     "profile": None,
 }
@@ -101,6 +103,8 @@ class _RequestAccounting:
     phase_timings_us: Optional[dict[str, float]] = None
     runtime_config: Optional[dict[str, Any]] = None
     memory_waterfall_peak: Optional[dict[str, Any]] = None
+    memory_waterfall_start: Optional[dict[str, Any]] = None
+    memory_waterfall_end: Optional[dict[str, Any]] = None
 
     @classmethod
     def target_only(
@@ -137,8 +141,10 @@ class _RequestAccounting:
         max_tokens: int,
         prompt_regime: Optional[dict[str, Any]],
         memory_waterfall_peak: Optional[dict[str, Any]],
-        prefill_event: Optional[PrefillCompleteEvent],
-        runtime_config: Optional[Any],
+        memory_waterfall_start: Optional[dict[str, Any]] = None,
+        memory_waterfall_end: Optional[dict[str, Any]] = None,
+        prefill_event: Optional[PrefillCompleteEvent] = None,
+        runtime_config: Optional[Any] = None,
     ) -> "_RequestAccounting":
         wall_ms = (request_done_ns - request_start_ns) / 1e6
         ttft_ms = (
@@ -224,6 +230,8 @@ class _RequestAccounting:
             phase_timings_us=dict(summary_event.phase_timings_us if summary_event else {}),
             runtime_config=runtime_config_payload,
             memory_waterfall_peak=dict(memory_waterfall_peak or {}),
+            memory_waterfall_start=dict(memory_waterfall_start or {}),
+            memory_waterfall_end=dict(memory_waterfall_end or {}),
         )
 
     @property
@@ -302,6 +310,10 @@ class _RequestAccounting:
                 "phase_timings_us": dict(self.phase_timings_us or {}),
                 "runtime_config": dict(self.runtime_config or {}),
                 "memory_waterfall_peak": dict(self.memory_waterfall_peak or {}),
+                "memory_waterfall_start": dict(self.memory_waterfall_start or {}),
+                "memory_waterfall_end": dict(self.memory_waterfall_end or {}),
+                "memory_boundary_start": dict(self.memory_waterfall_start or {}),
+                "memory_boundary_end": dict(self.memory_waterfall_end or {}),
             }
         )
         return payload
@@ -316,6 +328,7 @@ def configure_live_metrics(
     model_key = getattr(model_provider, "model_key", None) or ()
     target_ref = model_key[0] if len(model_key) > 0 else getattr(cli_args, "model", None)
     draft_ref = model_key[2] if len(model_key) > 2 else getattr(cli_args, "draft_model", None)
+    draft_meta = getattr(model_provider, "draft_meta", {}) or {}
     target_fa_window = _int_or_none(getattr(runtime_config, "target_fa_window", None))
     prefix_cache_enabled = bool(
         runtime_config is not None
@@ -337,6 +350,8 @@ def configure_live_metrics(
                 "version": version,
                 "model": str(target_ref) if target_ref is not None else None,
                 "draft": str(draft_ref) if draft_ref is not None else None,
+                "draft_quant": getattr(model_provider, "effective_draft_quant", None),
+                "draft_quant_source": draft_meta.get("draft_quant_source"),
                 "mode": "dflash",
                 "profile": getattr(runtime_config, "profile", None),
             }
@@ -558,6 +573,8 @@ def finalize_request_observability(
     max_tokens: int,
     prompt_regime: Optional[dict[str, Any]] = None,
     memory_waterfall_peak: Optional[dict[str, Any]] = None,
+    memory_waterfall_start: Optional[dict[str, Any]] = None,
+    memory_waterfall_end: Optional[dict[str, Any]] = None,
     diagnostics: Optional[DiagnosticsConfig] = None,
     prefill_event: Optional[PrefillCompleteEvent] = None,
     runtime_config: Optional[Any] = None,
@@ -578,6 +595,8 @@ def finalize_request_observability(
         max_tokens=max_tokens,
         prompt_regime=prompt_regime,
         memory_waterfall_peak=memory_waterfall_peak,
+        memory_waterfall_start=memory_waterfall_start,
+        memory_waterfall_end=memory_waterfall_end,
         prefill_event=prefill_event,
         runtime_config=runtime_config,
     )
@@ -716,6 +735,8 @@ def record_request_metrics(
     max_tokens: int,
     prompt_regime: Optional[dict[str, Any]] = None,
     memory_waterfall_peak: Optional[dict[str, Any]] = None,
+    memory_waterfall_start: Optional[dict[str, Any]] = None,
+    memory_waterfall_end: Optional[dict[str, Any]] = None,
     diagnostics: Optional[DiagnosticsConfig] = None,
     prefill_event: Optional[PrefillCompleteEvent] = None,
     runtime_config: Optional[Any] = None,
@@ -736,6 +757,8 @@ def record_request_metrics(
         max_tokens=int(max_tokens),
         prompt_regime=prompt_regime,
         memory_waterfall_peak=memory_waterfall_peak,
+        memory_waterfall_start=memory_waterfall_start,
+        memory_waterfall_end=memory_waterfall_end,
         prefill_event=prefill_event,
         runtime_config=runtime_config,
     )

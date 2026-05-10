@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import http.client
 import json
 import os
@@ -144,6 +145,7 @@ class TraceHandler(BaseHTTPRequestHandler):
             "headers": {k: v for k, v in self.headers.items() if k.lower() != "authorization"},
             "body": body_obj,
             "body_bytes": len(body_bytes),
+            "body_sha256": hashlib.sha256(body_bytes).hexdigest(),
         }
         req_path.write_bytes(json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"))
 

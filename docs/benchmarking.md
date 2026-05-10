@@ -99,7 +99,7 @@ selected row indices, and selected prompt ids.
 | `--model REF_OR_PATH` | target model |
 | `--draft REF_OR_PATH` | draft override |
 | `--no-chat-template` | raw prompt text |
-| `--draft-quant SPEC` | optional in-memory draft quantization, e.g. `w4:gs64` |
+| `--draft-quant SPEC` | draft quantization override, e.g. `w4:gs64`; use `none` to disable model defaults |
 | `--no-eos` | suppress EOS for fixed-length runs |
 | `--split-sdpa`, `--no-split-sdpa` | benchmark verifier split-SDPA mode |
 | `--target-fa-window INT` | experimental target FA rotating window |
@@ -120,10 +120,11 @@ Each public benchmark run writes:
 - `summary.json` - aggregate numbers;
 - `summary.md` - human-readable report.
 
-When comparing `--draft-quant`, use separate artifact directories. Compact
-reports include the selected `draft_quant` value in `summary.md` and
-`runs.jsonl` so quantized and non-quantized runs do not collapse into the same
-row during review.
+Validated large DFlash drafts default to `w4` in memory. When comparing draft
+quantization, use separate artifact directories and pass `--draft-quant none`
+for the bf16/non-quant draft leg. Compact reports include the effective
+`draft_quant` value in `summary.md` and `runs.jsonl` so quantized and
+non-quantized runs do not collapse into the same row during review.
 
 The artifact directory is local by default. New raw benchmark outputs should not
 be committed.

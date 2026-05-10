@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -17,11 +18,12 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -176,6 +178,155 @@ def _spawn(cmd: list[str], stdout_path: Path, stderr_path: Path, env: dict[str, 
         preexec_fn=os.setsid if os.name != "nt" else None,
     )
 
+def _run_capture(cmd: list[str], *, timeout_s: float = 2.0) -> dict[str, Any]:
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"cmd": cmd, "error": repr(exc)}
+    return {
+        "cmd": cmd,
+        "returncode": proc.returncode,
+        "stdout": proc.stdout.strip(),
+        "stderr": proc.stderr.strip(),
+    }
+
+def _parse_ps_resource(raw: str) -> dict[str, Any] | None:
+    parts = raw.strip().split()
+    if len(parts) < 4:
+        return None
+    try:
+        rss_kb = int(parts[0])
+        vsz_kb = int(parts[1])
+        cpu_pct = float(parts[2])
+        mem_pct = float(parts[3])
+    except ValueError:
+        return None
+    return {
+        "rss_gb": rss_kb * 1024 / 1e9,
+        "vsz_gb": vsz_kb * 1024 / 1e9,
+        "cpu_pct": cpu_pct,
+        "mem_pct": mem_pct,
+    }
+
+def _parse_vm_stat(raw: str) -> dict[str, Any]:
+    page_size = 16384
+    size_match = re.search(r"page size of (\d+) bytes", raw)
+    if size_match:
+        page_size = int(size_match.group(1))
+    pages: dict[str, int] = {}
+    for line in raw.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        value_match = re.search(r"(-?\d+)", value.replace(".", ""))
+        if not value_match:
+            continue
+        normalized = re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_")
+        pages[normalized] = int(value_match.group(1))
+
+    def gb(name: str) -> float | None:
+        value = pages.get(name)
+        if value is None:
+            return None
+        return value * page_size / 1e9
+
+    return {
+        "page_size": page_size,
+        "pages": pages,
+        "free_gb": gb("pages_free"),
+        "active_gb": gb("pages_active"),
+        "inactive_gb": gb("pages_inactive"),
+        "speculative_gb": gb("pages_speculative"),
+        "wired_gb": gb("pages_wired_down"),
+        "compressor_gb": gb("pages_used_by_compressor"),
+    }
+
+def _thermal_flags(raw: str) -> dict[str, bool]:
+    lowered = raw.lower()
+    return {
+        "thermal_warning_recorded": "no thermal warning" not in lowered,
+        "performance_warning_recorded": "no performance warning" not in lowered,
+        "cpu_power_status_recorded": "no cpu power status" not in lowered,
+    }
+
+def _system_sample(*, server_pid: int, start_perf: float) -> dict[str, Any]:
+    ps_raw = _run_capture(["ps", "-p", str(int(server_pid)), "-o", "rss=,vsz=,pcpu=,pmem="])
+    vm_raw = _run_capture(["vm_stat"])
+    therm_raw = _run_capture(["pmset", "-g", "therm"])
+    sample: dict[str, Any] = {
+        "ts": _iso_now(),
+        "mono_s": time.perf_counter() - start_perf,
+        "server_pid": int(server_pid),
+        "server_ps": _parse_ps_resource(str(ps_raw.get("stdout") or "")),
+        "server_ps_raw": ps_raw,
+        "vm_stat_raw": vm_raw,
+        "thermal_raw": therm_raw,
+    }
+    if isinstance(vm_raw.get("stdout"), str):
+        sample["vm_stat"] = _parse_vm_stat(vm_raw["stdout"])
+    if isinstance(therm_raw.get("stdout"), str):
+        sample["thermal"] = _thermal_flags(therm_raw["stdout"])
+    return sample
+
+class _SystemSampler:
+    def __init__(self, *, run_dir: Path, server_pid: int, interval_s: float) -> None:
+        self.path = run_dir / "system_samples.jsonl"
+        self.server_pid = int(server_pid)
+        self.interval_s = float(interval_s)
+        self._start_perf = time.perf_counter()
+        self._stop = threading.Event()
+        self._write_lock = threading.Lock()
+        self._thread = threading.Thread(target=self._run, name="dflash-system-sampler", daemon=True)
+
+    def start(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=max(1.0, self.interval_s + 1.0))
+        if not self._thread.is_alive():
+            self._write_sample()
+
+    def _run(self) -> None:
+        self._write_sample()
+        while not self._stop.wait(self.interval_s):
+            self._write_sample()
+
+    def _write_sample(self) -> None:
+        with self._write_lock:
+            sample = _system_sample(server_pid=self.server_pid, start_perf=self._start_perf)
+            with self.path.open("a", buffering=1) as f:
+                f.write(json.dumps(sample, ensure_ascii=False) + "\n")
+
+def _start_system_sampler(
+    *, run_dir: Path, server_pid: int, interval_s: float
+) -> _SystemSampler | None:
+    if interval_s <= 0:
+        return None
+    sampler = _SystemSampler(run_dir=run_dir, server_pid=server_pid, interval_s=interval_s)
+    sampler.start()
+    return sampler
+
+def _stop_system_sampler(sampler: _SystemSampler | None) -> dict[str, Any] | None:
+    if sampler is None:
+        return None
+    try:
+        sampler.stop()
+    except Exception as exc:
+        return {
+            "ts": _iso_now(),
+            "error": repr(exc),
+        }
+    return None
+
 def _terminate(proc: subprocess.Popen, label: str, term_grace_s: float = 5.0) -> None:
     if proc.poll() is not None:
         return
@@ -235,6 +386,7 @@ def read_dflash_events(events_dir: Path) -> tuple[list[dict[str, Any]], dict[int
     return posts, cycles_by_req, cache
 
 def summarize_cycles(cycles: list[dict[str, Any]]) -> dict[str, Any] | None:
+    cycles = [cycle for cycle in cycles if _is_engine_cycle_event(cycle)]
     if not cycles:
         return None
     n = len(cycles)
@@ -254,7 +406,24 @@ def summarize_cycles(cycles: list[dict[str, Any]]) -> dict[str, Any] | None:
         "verify_us_p99": sorted_verify[min(n - 1, max(0, int(n * 0.99) - 1))] if n else None,
     }
 
-def post_event_to_server_metric(pe: dict[str, Any], cycles_summary: dict[str, Any] | None) -> dict[str, Any]:
+
+def _is_engine_cycle_event(event: dict[str, Any]) -> bool:
+    return any(
+        key in event
+        for key in (
+            "commit_count",
+            "acceptance_len",
+            "block_len",
+            "verify_us",
+        )
+    )
+
+
+def post_event_to_server_metric(
+    pe: dict[str, Any],
+    cycles_summary: dict[str, Any] | None,
+    cache_lookup_event: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     wall_ms = pe.get("wall_ms") or 0.0
     gen = pe.get("generated_tokens") or 0
     tps = (gen / (wall_ms / 1000.0)) if wall_ms > 0 else None
@@ -273,12 +442,29 @@ def post_event_to_server_metric(pe: dict[str, Any], cycles_summary: dict[str, An
         "ttft_ms_server": pe.get("ttft_ms"),
         "prefill_ms_server": pe.get("prefill_ms"),
         "decode_ms_server": pe.get("decode_ms"),
+        "decode_tok_s": pe.get("decode_tok_s"),
+        "prefill_tok_s": pe.get("prefill_tok_s"),
+        "prefill_tok_s_physical": pe.get("prefill_tok_s_physical"),
+        "prefill_tok_s_apparent": pe.get("prefill_tok_s_apparent"),
+        "logical_ctx_tokens": pe.get("logical_ctx_tokens"),
+        "physical_prefill_tokens": pe.get("physical_prefill_tokens"),
+        "prefill_tokens_restored": pe.get("prefill_tokens_restored"),
+        "prefill_tokens_computed": pe.get("prefill_tokens_computed"),
         "cycles_completed": pe.get("cycles_completed"),
         "finish_reason_server": pe.get("finish_reason"),
         "cache_lookup_ms": pe.get("cache_lookup_ms"),
         "cache_insert_ms": pe.get("cache_insert_ms"),
         "mode_used": pe.get("mode_used"),
         "prompt_regime": pe.get("prompt_regime") or {},
+        "memory_waterfall_peak": pe.get("memory_waterfall_peak") or {},
+        "memory_waterfall_start": pe.get("memory_waterfall_start") or {},
+        "memory_waterfall_end": pe.get("memory_waterfall_end") or {},
+        "memory_boundary_start": pe.get("memory_boundary_start") or {},
+        "memory_boundary_end": pe.get("memory_boundary_end") or {},
+        "cache_hit_source": _cache_hit_source(cache_lookup_event),
+        "cache_lookup_result": (
+            cache_lookup_event.get("result") if cache_lookup_event else None
+        ),
         "request_id": pe.get("request_id"),
         "cycles_summary": cycles_summary,
         "_source": "events",
@@ -290,6 +476,11 @@ def summarize_cache_events(cache: list[dict[str, Any]]) -> dict[str, Any]:
     hits = [e for e in lookups if e.get("result") and e.get("result") != "miss"]
     inserts = [e for e in cache if e.get("op") == "insert"]
     fingerprint_reject = sum(1 for e in lookups if e.get("fingerprint_reject"))
+    miss_reasons: dict[str, int] = {}
+    for event in lookups:
+        if event.get("result") == "miss":
+            reason = str(event.get("miss_reason") or "unknown")
+            miss_reasons[reason] = miss_reasons.get(reason, 0) + 1
     return {
         "n_lookups": len(lookups),
         "n_hits": len(hits),
@@ -297,7 +488,112 @@ def summarize_cache_events(cache: list[dict[str, Any]]) -> dict[str, Any]:
         "n_inserts": len(inserts),
         "fingerprint_rejects": fingerprint_reject,
         "total_matched_tokens": sum(e.get("matched_len", 0) for e in hits),
+        "miss_reasons": miss_reasons,
+        "deeper_hit_gate": summarize_deeper_hit_gate(lookups),
     }
+
+
+def summarize_deeper_hit_gate(lookups: list[dict[str, Any]]) -> dict[str, Any]:
+    ordered = sorted(
+        [event for event in lookups if isinstance(event.get("request_id"), int)],
+        key=lambda event: int(event["request_id"]),
+    )
+    if not ordered:
+        ordered = list(lookups)
+
+    previous_matched: int | None = None
+    advances = 0
+    stalled: list[dict[str, Any]] = []
+    regressions: list[dict[str, Any]] = []
+    resets: list[dict[str, Any]] = []
+
+    for index, event in enumerate(ordered, start=1):
+        request_id = event.get("request_id", index)
+        matched_len = _to_int(event.get("matched_len"), default=0)
+        if matched_len <= 0:
+            if previous_matched:
+                resets.append(
+                    {
+                        "request_id": request_id,
+                        "miss_reason": event.get("miss_reason"),
+                        "first_divergence_pos": event.get("first_divergence_pos"),
+                        "previous_matched_len": previous_matched,
+                    }
+                )
+                previous_matched = None
+            continue
+        if previous_matched is None or matched_len > previous_matched:
+            advances += 1
+        elif matched_len == previous_matched:
+            stalled.append(
+                {
+                    "request_id": request_id,
+                    "matched_len": matched_len,
+                    "previous_matched_len": previous_matched,
+                }
+            )
+        else:
+            regressions.append(
+                {
+                    "request_id": request_id,
+                    "matched_len": matched_len,
+                    "previous_matched_len": previous_matched,
+                }
+            )
+        previous_matched = matched_len
+
+    return {
+        "pass": not stalled and not regressions,
+        "advancing_hits": advances,
+        "stalled_hits": stalled,
+        "regressions": regressions,
+        "resets": resets,
+    }
+
+
+def _to_int(value: Any, *, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+def cache_lookup_events_by_request(
+    post_events: list[dict[str, Any]],
+    cache_events: list[dict[str, Any]],
+) -> dict[int, dict[str, Any]]:
+    lookups = [event for event in cache_events if event.get("op") == "lookup"]
+    request_tagged = [
+        event for event in lookups if isinstance(event.get("request_id"), int)
+    ]
+    if request_tagged:
+        return {int(event["request_id"]): event for event in request_tagged}
+    if len(lookups) != len(post_events):
+        return {}
+    out: dict[int, dict[str, Any]] = {}
+    for post_event, lookup_event in zip(
+        sorted(post_events, key=lambda e: e.get("request_id", 0)),
+        lookups,
+    ):
+        request_id = post_event.get("request_id")
+        if isinstance(request_id, int):
+            joined = dict(lookup_event)
+            joined["_join_status"] = "ordinal_unverified"
+            out[int(request_id)] = joined
+    return out
+
+def _cache_hit_source(cache_lookup_event: dict[str, Any] | None) -> str | None:
+    if not cache_lookup_event:
+        return None
+    if cache_lookup_event.get("_join_status") == "ordinal_unverified":
+        return "unknown"
+    result = str(cache_lookup_event.get("result") or "")
+    if result in ("exact_hit", "prefix_hit"):
+        return "L1"
+    if result == "l2_hit":
+        return "L2"
+    if "disk" in result:
+        return "disk"
+    return None
 
 _DFLASH_TPS_RE = re.compile(
     r"\[dflash\]\s+([\d.]+)\s+tok/s\s+\|\s+([\d.]+)%\s+accepted\s+\|\s+(\d+)\s+tokens\s+\|\s+([\d.]+)s\s+\|\s+prompt:\s+(\d+)\s+tokens"
@@ -307,6 +603,14 @@ _DFLASH_HIT_RE = re.compile(
 )
 _DFLASH_STATS_RE = re.compile(
     r"\[dflash\]\s+prefix-cache-stats.*?prefill_tokens_saved=(\d+)"
+)
+_PROXY_POST_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) req#(?P<idx>\d+) "
+    r"/v1/chat/completions .*?body_bytes=(?P<body_bytes>\d+)"
+)
+_PROXY_DONE_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) req#(?P<idx>\d+) "
+    r"done t_total_ms=(?P<total_ms>[\d.]+)"
 )
 
 def parse_dflash_stderr(text: str) -> list[dict[str, Any]]:
@@ -508,6 +812,186 @@ def derive_request_summary(req_path: Path) -> dict[str, Any]:
         "total_message_chars": sum(len(str(m.get("content", ""))) for m in msgs),
     }
 
+
+def summarize_prompt_transitions(
+    request_files: Sequence[Path],
+    cache_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    bodies = [_load_request_body(path) for path in request_files]
+    transitions = [
+        _classify_prompt_transition(bodies[i - 1], bodies[i], request_id=i + 1)
+        for i in range(1, len(bodies))
+    ]
+    kinds: dict[str, int] = {}
+    for transition in transitions:
+        kind = str(transition.get("kind") or "unknown")
+        kinds[kind] = kinds.get(kind, 0) + 1
+
+    reset_by_request: dict[int, dict[str, Any]] = {}
+    gate = (cache_summary or {}).get("deeper_hit_gate")
+    if isinstance(gate, dict):
+        for reset in gate.get("resets") or []:
+            request_id = reset.get("request_id")
+            if isinstance(request_id, int):
+                reset_by_request[request_id] = reset
+
+    reset_annotations = []
+    for transition in transitions:
+        request_id = transition.get("request_id")
+        if not isinstance(request_id, int) or request_id not in reset_by_request:
+            continue
+        reset = reset_by_request[request_id]
+        reset_annotations.append(
+            {
+                "request_id": request_id,
+                "miss_reason": reset.get("miss_reason"),
+                "first_divergence_pos": reset.get("first_divergence_pos"),
+                "prompt_change_kind": transition.get("kind"),
+                "common_message_prefix": transition.get("common_message_prefix"),
+                "first_diff_index": transition.get("first_diff_index"),
+                "first_diff_roles": transition.get("first_diff_roles"),
+            }
+        )
+
+    return {
+        "n_transitions": len(transitions),
+        "change_kinds": kinds,
+        "cache_reset_annotations": reset_annotations,
+        "transitions": transitions,
+    }
+
+
+def _load_request_body(req_path: Path) -> dict[str, Any]:
+    obj = json.loads(req_path.read_text())
+    body = obj.get("body")
+    return body if isinstance(body, dict) else {}
+
+
+def _classify_prompt_transition(
+    previous: dict[str, Any],
+    current: dict[str, Any],
+    *,
+    request_id: int,
+) -> dict[str, Any]:
+    previous_messages = _request_messages(previous)
+    current_messages = _request_messages(current)
+    common_messages = _common_json_prefix_len(previous_messages, current_messages)
+    common_suffix = _common_json_suffix_len(
+        previous_messages,
+        current_messages,
+        common_prefix_len=common_messages,
+    )
+    first_diff_index = (
+        common_messages
+        if common_messages < min(len(previous_messages), len(current_messages))
+        else None
+    )
+    first_diff_roles = None
+    if first_diff_index is not None:
+        first_diff_roles = (
+            f"{_message_role(previous_messages[first_diff_index])}"
+            f"->{_message_role(current_messages[first_diff_index])}"
+        )
+
+    added_roles = [_message_role(message) for message in current_messages[common_messages:]]
+    removed_roles = [_message_role(message) for message in previous_messages[common_messages:]]
+    system_changed = _system_message_changed(previous_messages, current_messages)
+    tools_changed = _canonical_json(previous.get("tools")) != _canonical_json(current.get("tools"))
+    option_changes = _request_option_changes(previous, current)
+    prompt_shrunk = len(current_messages) < len(previous_messages)
+
+    if system_changed:
+        kind = "system_prompt_mutation"
+    elif tools_changed:
+        kind = "tool_schema_mutation"
+    elif common_messages == len(previous_messages) and len(current_messages) > len(previous_messages):
+        kind = "tool_result_append" if "tool" in added_roles else "append_only"
+    elif prompt_shrunk and (common_messages == len(current_messages) or common_suffix > 0):
+        kind = "prompt_truncation"
+    elif first_diff_index is None and option_changes:
+        kind = "request_config_change"
+    elif first_diff_index is None:
+        kind = "unchanged"
+    elif common_messages >= max(0, min(len(previous_messages), len(current_messages)) - 2):
+        kind = "tail_rewrite"
+    else:
+        kind = "transcript_rewrite"
+
+    return {
+        "request_id": request_id,
+        "kind": kind,
+        "common_message_prefix": common_messages,
+        "common_message_suffix": common_suffix,
+        "previous_messages": len(previous_messages),
+        "current_messages": len(current_messages),
+        "previous_last_role": _message_role(previous_messages[-1]) if previous_messages else None,
+        "current_last_role": _message_role(current_messages[-1]) if current_messages else None,
+        "first_diff_index": first_diff_index,
+        "first_diff_roles": first_diff_roles,
+        "added_roles": added_roles,
+        "removed_roles": removed_roles,
+        "tools_changed": tools_changed,
+        "option_changes": option_changes,
+    }
+
+
+def _request_messages(body: dict[str, Any]) -> list[Any]:
+    messages = body.get("messages")
+    return messages if isinstance(messages, list) else []
+
+
+def _common_json_prefix_len(left: Sequence[Any], right: Sequence[Any]) -> int:
+    count = 0
+    for left_item, right_item in zip(left, right):
+        if _canonical_json(left_item) != _canonical_json(right_item):
+            break
+        count += 1
+    return count
+
+
+def _common_json_suffix_len(
+    left: Sequence[Any],
+    right: Sequence[Any],
+    *,
+    common_prefix_len: int,
+) -> int:
+    count = 0
+    max_count = max(0, min(len(left), len(right)) - common_prefix_len)
+    while count < max_count:
+        if _canonical_json(left[-1 - count]) != _canonical_json(right[-1 - count]):
+            break
+        count += 1
+    return count
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def _message_role(message: Any) -> str | None:
+    if isinstance(message, dict):
+        role = message.get("role")
+        return str(role) if role is not None else None
+    return None
+
+
+def _system_message_changed(left: Sequence[Any], right: Sequence[Any]) -> bool:
+    if not left or not right:
+        return False
+    if _message_role(left[0]) != "system" or _message_role(right[0]) != "system":
+        return False
+    return _canonical_json(left[0]) != _canonical_json(right[0])
+
+
+def _request_option_changes(left: dict[str, Any], right: dict[str, Any]) -> list[str]:
+    ignored = {"messages", "tools"}
+    return [
+        key
+        for key in sorted((set(left) | set(right)) - ignored)
+        if _canonical_json(left.get(key)) != _canonical_json(right.get(key))
+    ]
+
+
 def _build_server_cmd(args) -> tuple[list[str], int, str]:
     if args.backend == "dflash":
         port = args.dflash_port
@@ -529,14 +1013,34 @@ def _build_server_cmd(args) -> tuple[list[str], int, str]:
         ]
         if args.draft_quant:
             cmd.extend(["--draft-quant", args.draft_quant])
+        if args.wired_limit:
+            cmd.extend(["--wired-limit", args.wired_limit])
+        if args.cache_limit:
+            cmd.extend(["--cache-limit", args.cache_limit])
         if args.profile:
             cmd.extend(["--profile", args.profile])
         if args.prefill_step_size is not None:
             cmd.extend(["--prefill-step-size", str(int(args.prefill_step_size))])
-        if args.fastpath_max_tokens is not None:
-            cmd.extend(["--fastpath-max-tokens", str(int(args.fastpath_max_tokens))])
+        if args.draft_sink_size is not None:
+            cmd.extend(["--draft-sink-size", str(int(args.draft_sink_size))])
+        if args.draft_window_size is not None:
+            cmd.extend(["--draft-window-size", str(int(args.draft_window_size))])
+        fastpath_max_tokens = (
+            0 if args.fastpath_max_tokens is None else int(args.fastpath_max_tokens)
+        )
+        cmd.extend(["--fastpath-max-tokens", str(fastpath_max_tokens)])
+        if args.verify_len_cap is not None:
+            cmd.extend(["--verify-len-cap", str(int(args.verify_len_cap))])
         if args.max_snapshot_tokens is not None:
             cmd.extend(["--max-snapshot-tokens", str(int(args.max_snapshot_tokens))])
+        if args.verify_mode:
+            cmd.extend(["--verify-mode", str(args.verify_mode)])
+        if args.clear_cache_boundaries is not None:
+            cmd.append(
+                "--clear-cache-boundaries"
+                if args.clear_cache_boundaries
+                else "--no-clear-cache-boundaries"
+            )
         if int(args.target_fa_window) > 0:
             cmd.extend(["--target-fa-window", str(int(args.target_fa_window))])
         return cmd, port, f"http://127.0.0.1:{port}"
@@ -581,6 +1085,9 @@ def _replay_body_bytes(request_obj: dict[str, Any], target: str) -> bytes:
     body = dict(request_obj.get("body") or {})
     body["model"] = target
     return json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+def _body_sha256(body_bytes: bytes) -> str:
+    return hashlib.sha256(body_bytes).hexdigest()
 
 def _replay_headers(request_obj: dict[str, Any], body_bytes: bytes) -> dict[str, str]:
     captured = request_obj.get("headers") or {}
@@ -630,6 +1137,9 @@ def _post_replay_request(
                 "headers": _replay_headers(request_obj, body_bytes),
                 "body": body,
                 "body_bytes": len(body_bytes),
+                "body_sha256": _body_sha256(body_bytes),
+                "source_body_sha256": request_obj.get("body_sha256"),
+                "source_body_bytes": request_obj.get("body_bytes"),
                 "source_request": str(request_path),
             },
             ensure_ascii=False,
@@ -751,14 +1261,20 @@ def _run_replay_requests(
     target: str,
     request_limit: int,
     request_timeout_s: float,
+    pause_before_request: dict[int, float] | None = None,
 ) -> tuple[int, float]:
     source_requests = sorted((source_trace / "requests").glob("*.json"))
     if request_limit > 0:
         source_requests = source_requests[:request_limit]
     if not source_requests:
         raise SystemExit(f"no captured requests found under {source_trace / 'requests'}")
+    pauses = pause_before_request or {}
     start = time.perf_counter()
     for idx, request_path in enumerate(source_requests, start=1):
+        pause_s = pauses.get(idx)
+        if pause_s:
+            sys.stderr.write(f"[replay] pause {pause_s:.1f}s before POST {idx}\n")
+            time.sleep(pause_s)
         sys.stderr.write(f"[replay] POST {idx}/{len(source_requests)} from {request_path.name}\n")
         _post_replay_request(
             idx=idx,
@@ -769,6 +1285,22 @@ def _run_replay_requests(
             timeout_s=request_timeout_s,
         )
     return len(source_requests), time.perf_counter() - start
+
+def _parse_pause_before_request(raw_values: Sequence[str]) -> dict[int, float]:
+    pauses: dict[int, float] = {}
+    for raw in raw_values:
+        try:
+            request_raw, seconds_raw = raw.split(":", 1)
+            request_idx = int(request_raw)
+            pause_s = float(seconds_raw)
+        except ValueError as e:
+            raise SystemExit("--pause-before-request must be IDX:SECONDS") from e
+        if request_idx <= 0:
+            raise SystemExit("--pause-before-request IDX must be >= 1")
+        if pause_s < 0:
+            raise SystemExit("--pause-before-request SECONDS must be >= 0")
+        pauses[request_idx] = pause_s
+    return pauses
 
 def _build_opencode_cmd(args, workspace: Path, task: str, label: str) -> list[str]:
     cmd = [
@@ -828,20 +1360,41 @@ def replay_main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--server-ready-timeout-s", type=float, default=300.0)
     p.add_argument("--request-timeout-s", type=float, default=900.0)
     p.add_argument("--request-limit", type=int, default=0, help="0 means replay all captured POSTs.")
+    p.add_argument(
+        "--system-sample-interval-s",
+        type=float,
+        default=0.0,
+        help="Replay only: write low-overhead ps/vm_stat/thermal samples every N seconds.",
+    )
+    p.add_argument(
+        "--pause-before-request",
+        action="append",
+        default=[],
+        metavar="IDX:SECONDS",
+        help="Replay only: keep the server alive and sleep before request IDX.",
+    )
     p.add_argument("--prefix-cache", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--prefix-cache-l2", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--prefix-cache-l2-max-bytes", type=int, default=None)
     p.add_argument("--prefix-cache-l2-dir", default=None)
     p.add_argument("--diagnostics", choices=("off", "basic", "full"), default=None)
     p.add_argument("--draft-quant", default=None)
+    p.add_argument("--wired-limit", default=None, help="dflash only: forward --wired-limit to serve.")
+    p.add_argument("--cache-limit", default=None, help="dflash only: forward --cache-limit to serve.")
     p.add_argument("--profile", default=None)
     p.add_argument("--prefill-step-size", type=int, default=None)
+    p.add_argument("--draft-sink-size", type=int, default=None)
+    p.add_argument("--draft-window-size", type=int, default=None)
     p.add_argument("--fastpath-max-tokens", type=int, default=None)
+    p.add_argument("--verify-len-cap", type=int, default=None)
     p.add_argument("--max-snapshot-tokens", type=int, default=None)
+    p.add_argument("--verify-mode", choices=("auto", "off"), default=None)
+    p.add_argument("--clear-cache-boundaries", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--target-fa-window", type=int, default=None)
     p.add_argument("--chat-template-args", default='{"enable_thinking":true}')
     p.add_argument("--compare-to", default=None)
     args = p.parse_args(list(argv) if argv is not None else None)
+    pause_before_request = _parse_pause_before_request(args.pause_before_request)
 
     source_trace = Path(args.source_trace)
     if not (source_trace / "requests").is_dir():
@@ -856,10 +1409,17 @@ def replay_main(argv: Sequence[str] | None = None) -> int:
             "--prefix-cache-l2-dir": args.prefix_cache_l2_dir,
             "--diagnostics": args.diagnostics,
             "--draft-quant": args.draft_quant,
+            "--wired-limit": args.wired_limit,
+            "--cache-limit": args.cache_limit,
             "--profile": args.profile,
             "--prefill-step-size": args.prefill_step_size,
+            "--draft-sink-size": args.draft_sink_size,
+            "--draft-window-size": args.draft_window_size,
             "--fastpath-max-tokens": args.fastpath_max_tokens,
+            "--verify-len-cap": args.verify_len_cap,
             "--max-snapshot-tokens": args.max_snapshot_tokens,
+            "--verify-mode": args.verify_mode,
+            "--clear-cache-boundaries": args.clear_cache_boundaries,
             "--target-fa-window": args.target_fa_window,
         }
         used = [flag for flag, value in dflash_only.items() if value is not None]
@@ -867,13 +1427,18 @@ def replay_main(argv: Sequence[str] | None = None) -> int:
             raise SystemExit(f"{', '.join(used)} require --backend dflash")
     for flag_name in (
         "prefill_step_size",
+        "draft_sink_size",
+        "draft_window_size",
         "fastpath_max_tokens",
+        "verify_len_cap",
         "max_snapshot_tokens",
         "request_limit",
     ):
         value = getattr(args, flag_name)
         if value is not None and int(value) < 0:
             raise SystemExit(f"--{flag_name.replace('_', '-')} must be >= 0")
+    if args.system_sample_interval_s < 0:
+        raise SystemExit("--system-sample-interval-s must be >= 0")
     if args.target_fa_window is not None and args.target_fa_window < 0:
         raise SystemExit("--target-fa-window must be >= 0")
     if args.prefix_cache_l2_max_bytes is not None and int(args.prefix_cache_l2_max_bytes) < 0:
@@ -889,6 +1454,9 @@ def replay_main(argv: Sequence[str] | None = None) -> int:
             else int(args.prefix_cache_l2_max_bytes)
         )
         args.diagnostics = "basic" if args.diagnostics is None else args.diagnostics
+        args.fastpath_max_tokens = (
+            0 if args.fastpath_max_tokens is None else int(args.fastpath_max_tokens)
+        )
         args.target_fa_window = 0 if args.target_fa_window is None else int(args.target_fa_window)
 
     label = args.label or f"{args.backend}-{source_trace.name}"
@@ -944,6 +1512,8 @@ def replay_main(argv: Sequence[str] | None = None) -> int:
                     str(int(args.prefix_cache_l2_max_bytes)),
                 ]
             )
+        else:
+            server_cmd.append("--no-prefix-cache-l2")
 
     metadata = {
         "started_at": _iso_now(),
@@ -970,14 +1540,23 @@ def replay_main(argv: Sequence[str] | None = None) -> int:
         "server_cmd": server_cmd,
         "server_port": server_port,
         "request_limit": args.request_limit,
+        "pause_before_request": pause_before_request,
+        "system_sample_interval_s": args.system_sample_interval_s,
     }
     if args.backend == "dflash":
         metadata["dflash_runtime_overrides"] = {
             "draft_quant": args.draft_quant,
+            "wired_limit": args.wired_limit,
+            "cache_limit": args.cache_limit,
             "profile": args.profile,
             "prefill_step_size": args.prefill_step_size,
+            "draft_sink_size": args.draft_sink_size,
+            "draft_window_size": args.draft_window_size,
             "fastpath_max_tokens": args.fastpath_max_tokens,
+            "verify_len_cap": args.verify_len_cap,
             "max_snapshot_tokens": args.max_snapshot_tokens,
+            "verify_mode": args.verify_mode,
+            "clear_cache_boundaries": args.clear_cache_boundaries,
             "target_fa_window": args.target_fa_window,
             "prefix_cache": args.prefix_cache,
             "prefix_cache_l2": args.prefix_cache_l2,
@@ -999,6 +1578,8 @@ def replay_main(argv: Sequence[str] | None = None) -> int:
     (run_dir / "server" / "cmd.txt").write_text(shlex.join(server_cmd) + "\n")
 
     server_proc = None
+    system_sampler = None
+    system_sampler_error = None
     request_count = 0
     replay_wall_s = None
     try:
@@ -1014,6 +1595,11 @@ def replay_main(argv: Sequence[str] | None = None) -> int:
         if exited:
             raise SystemExit(exited)
         _verify_ready_model(f"{upstream_url}/v1/models", args.target)
+        system_sampler = _start_system_sampler(
+            run_dir=run_dir,
+            server_pid=int(server_proc.pid),
+            interval_s=float(args.system_sample_interval_s),
+        )
         request_count, replay_wall_s = _run_replay_requests(
             source_trace=source_trace,
             run_dir=run_dir,
@@ -1021,8 +1607,10 @@ def replay_main(argv: Sequence[str] | None = None) -> int:
             target=args.target,
             request_limit=int(args.request_limit),
             request_timeout_s=float(args.request_timeout_s),
+            pause_before_request=pause_before_request,
         )
     finally:
+        system_sampler_error = _stop_system_sampler(system_sampler)
         if server_proc is not None:
             _terminate(server_proc, "server")
 
@@ -1031,10 +1619,17 @@ def replay_main(argv: Sequence[str] | None = None) -> int:
     if args.backend == "dflash":
         events_dir = run_dir / "events"
         post_evts, cycles_by_req, cache_evts = read_dflash_events(events_dir)
+        cache_lookups_by_request = cache_lookup_events_by_request(post_evts, cache_evts)
         for pe in sorted(post_evts, key=lambda e: e.get("request_id", 0)):
             rid = pe.get("request_id")
             cycles_summary = summarize_cycles(cycles_by_req.get(rid, []))
-            per_post_metrics.append(post_event_to_server_metric(pe, cycles_summary))
+            per_post_metrics.append(
+                post_event_to_server_metric(
+                    pe,
+                    cycles_summary,
+                    cache_lookups_by_request.get(rid),
+                )
+            )
         cache_summary = summarize_cache_events(cache_evts)
         (run_dir / "server" / "metrics.jsonl").write_text(
             "\n".join(json.dumps(m) for m in per_post_metrics)
@@ -1044,6 +1639,7 @@ def replay_main(argv: Sequence[str] | None = None) -> int:
         (run_dir / "server" / "metrics.jsonl").write_text("")
 
     request_files = sorted((run_dir / "requests").glob("*.json"))
+    prompt_transitions = summarize_prompt_transitions(request_files, cache_summary)
     posts: list[dict[str, Any]] = []
     for i, req_path in enumerate(request_files, start=1):
         sse_path = run_dir / "sse" / req_path.name.replace(".json", ".jsonl")
@@ -1078,8 +1674,12 @@ def replay_main(argv: Sequence[str] | None = None) -> int:
         "workspace_files": [],
         "totals": totals,
         "cache_summary": cache_summary if args.backend == "dflash" else None,
+        "prompt_transitions": prompt_transitions,
     }
+    if system_sampler_error is not None:
+        summary["system_sampler_error"] = system_sampler_error
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False))
+    _write_post_rows(run_dir, summary)
 
     peer_summary = None
     if args.compare_to:
@@ -1161,6 +1761,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="dflash only: pass --draft-quant to dflash serve.",
     )
     p.add_argument(
+        "--wired-limit",
+        default=None,
+        help="dflash only: pass --wired-limit to dflash serve.",
+    )
+    p.add_argument(
+        "--cache-limit",
+        default=None,
+        help="dflash only: pass --cache-limit to dflash serve.",
+    )
+    p.add_argument(
         "--profile",
         default=None,
         help="dflash only: pass --profile to dflash serve.",
@@ -1172,16 +1782,46 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="dflash only: pass --prefill-step-size to dflash serve.",
     )
     p.add_argument(
+        "--draft-sink-size",
+        type=int,
+        default=None,
+        help="dflash only: pass --draft-sink-size to dflash serve.",
+    )
+    p.add_argument(
+        "--draft-window-size",
+        type=int,
+        default=None,
+        help="dflash only: pass --draft-window-size to dflash serve.",
+    )
+    p.add_argument(
         "--fastpath-max-tokens",
         type=int,
         default=None,
         help="dflash only: pass --fastpath-max-tokens to dflash serve.",
     )
     p.add_argument(
+        "--verify-len-cap",
+        type=int,
+        default=None,
+        help="dflash only: pass --verify-len-cap to dflash serve.",
+    )
+    p.add_argument(
         "--max-snapshot-tokens",
         type=int,
         default=None,
         help="dflash only: pass --max-snapshot-tokens to dflash serve.",
+    )
+    p.add_argument(
+        "--verify-mode",
+        choices=("auto", "off"),
+        default=None,
+        help="dflash only: pass --verify-mode to dflash serve.",
+    )
+    p.add_argument(
+        "--clear-cache-boundaries",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="dflash only: pass --clear-cache-boundaries/--no-clear-cache-boundaries to dflash serve.",
     )
     p.add_argument(
         "--target-fa-window",
@@ -1216,16 +1856,30 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--prefix-cache-l2-dir": args.prefix_cache_l2_dir,
             "--diagnostics": args.diagnostics,
             "--draft-quant": args.draft_quant,
+            "--wired-limit": args.wired_limit,
+            "--cache-limit": args.cache_limit,
             "--profile": args.profile,
             "--prefill-step-size": args.prefill_step_size,
+            "--draft-sink-size": args.draft_sink_size,
+            "--draft-window-size": args.draft_window_size,
             "--fastpath-max-tokens": args.fastpath_max_tokens,
+            "--verify-len-cap": args.verify_len_cap,
             "--max-snapshot-tokens": args.max_snapshot_tokens,
+            "--verify-mode": args.verify_mode,
+            "--clear-cache-boundaries": args.clear_cache_boundaries,
             "--target-fa-window": args.target_fa_window,
         }
         used = [flag for flag, value in dflash_only.items() if value is not None]
         if used:
             raise SystemExit(f"{', '.join(used)} require --backend dflash")
-    for flag_name in ("prefill_step_size", "fastpath_max_tokens", "max_snapshot_tokens"):
+    for flag_name in (
+        "prefill_step_size",
+        "draft_sink_size",
+        "draft_window_size",
+        "fastpath_max_tokens",
+        "verify_len_cap",
+        "max_snapshot_tokens",
+    ):
         value = getattr(args, flag_name)
         if value is not None and int(value) < 0:
             raise SystemExit(f"--{flag_name.replace('_', '-')} must be >= 0")
@@ -1244,6 +1898,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             else int(args.prefix_cache_l2_max_bytes)
         )
         args.diagnostics = "basic" if args.diagnostics is None else args.diagnostics
+        args.fastpath_max_tokens = (
+            0 if args.fastpath_max_tokens is None else int(args.fastpath_max_tokens)
+        )
         args.target_fa_window = 0 if args.target_fa_window is None else int(args.target_fa_window)
 
     client_timeout_s = args.client_timeout_s
@@ -1305,6 +1962,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "--prefix-cache-l2-max-bytes",
                 str(int(args.prefix_cache_l2_max_bytes)),
             ])
+        else:
+            server_cmd.append("--no-prefix-cache-l2")
 
     (run_dir / "server" / "cmd.txt").write_text(shlex.join(server_cmd) + "\n")
     (run_dir / "proxy" / "cmd.txt").write_text(shlex.join(proxy_cmd) + "\n")
@@ -1347,10 +2006,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.backend == "dflash":
         metadata["dflash_runtime_overrides"] = {
             "draft_quant": args.draft_quant,
+            "wired_limit": args.wired_limit,
+            "cache_limit": args.cache_limit,
             "profile": args.profile,
             "prefill_step_size": args.prefill_step_size,
+            "draft_sink_size": args.draft_sink_size,
+            "draft_window_size": args.draft_window_size,
             "fastpath_max_tokens": args.fastpath_max_tokens,
+            "verify_len_cap": args.verify_len_cap,
             "max_snapshot_tokens": args.max_snapshot_tokens,
+            "verify_mode": args.verify_mode,
+            "clear_cache_boundaries": args.clear_cache_boundaries,
             "target_fa_window": args.target_fa_window,
             "prefix_cache": args.prefix_cache,
             "prefix_cache_l2": args.prefix_cache_l2,
@@ -1430,11 +2096,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         events_dir = run_dir / "events"
         post_evts, cycles_by_req, cache_evts = read_dflash_events(events_dir)
         if post_evts:
-
+            cache_lookups_by_request = cache_lookup_events_by_request(
+                post_evts,
+                cache_evts,
+            )
             for pe in sorted(post_evts, key=lambda e: e.get("request_id", 0)):
                 rid = pe.get("request_id")
                 cycles_summary = summarize_cycles(cycles_by_req.get(rid, []))
-                per_post_metrics.append(post_event_to_server_metric(pe, cycles_summary))
+                per_post_metrics.append(
+                    post_event_to_server_metric(
+                        pe,
+                        cycles_summary,
+                        cache_lookups_by_request.get(rid),
+                    )
+                )
             cache_summary = summarize_cache_events(cache_evts)
         else:
             per_post_metrics = []
@@ -1446,6 +2121,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     request_files = sorted((run_dir / "requests").glob("*.json"))
     sse_files = sorted((run_dir / "sse").glob("*.jsonl"))
+    prompt_transitions = summarize_prompt_transitions(request_files, cache_summary)
 
     posts: list[dict[str, Any]] = []
     for i, req_path in enumerate(request_files, start=1):
@@ -1483,8 +2159,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "workspace_files": workspace_files,
         "totals": totals,
         "cache_summary": cache_summary if args.backend == "dflash" else None,
+        "prompt_transitions": prompt_transitions,
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False))
+    _write_post_rows(run_dir, summary)
 
     peer_summary = None
     if args.compare_to:
@@ -1536,6 +2214,496 @@ def _post_view(p: dict[str, Any]) -> dict[str, Any]:
         or sm.get("finish_reason_server"),
         "source": "server" if sm else ("usage" if usage else "none"),
     }
+
+def _int_value(value: Any) -> int | None:
+    return int(value) if isinstance(value, int) else None
+
+def _float_value(value: Any) -> float | None:
+    return float(value) if isinstance(value, (int, float)) else None
+
+def _memory_gb(memory: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        value = memory.get(key)
+        if isinstance(value, (int, float)):
+            return float(value) / 1_000_000_000.0 if key.endswith("_bytes") else float(value)
+    return None
+
+def _cache_class(cached_tok: int, cache_hit_source: str | None) -> str:
+    if cached_tok <= 0:
+        return "cold"
+    if cache_hit_source in ("L2", "disk"):
+        return "warm-l2"
+    return "warm"
+
+def _normalized_post_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
+    meta = summary.get("metadata") or {}
+    rows: list[dict[str, Any]] = []
+    for post in summary.get("posts") or []:
+        view = _post_view(post)
+        sm = post.get("server_metric") or {}
+        lm = post.get("landmarks") or {}
+        prompt_tok = _int_value(view.get("prompt_tokens"))
+        cached_tok = _int_value(view.get("cache_hit_tokens")) or 0
+        computed_tok = _int_value(sm.get("prefill_tokens_computed"))
+        if computed_tok is None and prompt_tok is not None:
+            computed_tok = max(0, prompt_tok - cached_tok)
+        ctx_tok = _int_value(sm.get("logical_ctx_tokens")) or prompt_tok
+        cache_hit = (
+            float(cached_tok) / float(prompt_tok)
+            if prompt_tok is not None and prompt_tok > 0
+            else None
+        )
+        memory = sm.get("memory_waterfall_peak") or {}
+        if not isinstance(memory, dict):
+            memory = {}
+        memory_start = sm.get("memory_boundary_start") or sm.get("memory_waterfall_start") or {}
+        if not isinstance(memory_start, dict):
+            memory_start = {}
+        memory_end = sm.get("memory_boundary_end") or sm.get("memory_waterfall_end") or {}
+        if not isinstance(memory_end, dict):
+            memory_end = {}
+        phys_start = _memory_gb(
+            memory_start,
+            "phys_footprint_gb",
+            "phys_footprint_bytes",
+        )
+        phys_end = _memory_gb(memory_end, "phys_footprint_gb", "phys_footprint_bytes")
+        phys_delta = (
+            phys_end - phys_start
+            if phys_start is not None and phys_end is not None
+            else None
+        )
+        cache_hit_source = sm.get("cache_hit_source")
+        decode_ms = _float_value(sm.get("decode_ms_server"))
+        if decode_ms is None and isinstance(view.get("wall_s"), (int, float)):
+            decode_ms = float(view["wall_s"]) * 1000.0
+        rows.append(
+            {
+                "run": meta.get("label"),
+                "backend": meta.get("backend"),
+                "mode": summary.get("client") or meta.get("client"),
+                "turn_post": post.get("idx"),
+                "cache": _cache_class(cached_tok, cache_hit_source),
+                "cache_hit_source": cache_hit_source,
+                "prompt_tok": prompt_tok,
+                "ctx_tok": ctx_tok,
+                "cached_tok": cached_tok,
+                "computed_tok": computed_tok,
+                "cache_hit": cache_hit,
+                "ttft_ms": _float_value(sm.get("ttft_ms_server"))
+                or _float_value(lm.get("first_content_token_ms"))
+                or _float_value(lm.get("first_tool_call_sent_ms"))
+                or _float_value(lm.get("first_byte_ms")),
+                "prefill_ms": _float_value(sm.get("prefill_ms_server")),
+                "decode_ms": decode_ms,
+                "decode_tok_s": _float_value(sm.get("decode_tok_s"))
+                or _float_value(view.get("tps")),
+                "out_tok": _int_value(view.get("decode_tokens")),
+                "wall_s": _float_value(view.get("wall_s")),
+                "acceptance": _float_value(view.get("accept")),
+                "tokens_per_cycle": _float_value(view.get("tokens_per_cycle")),
+                "cycles": _int_value(sm.get("cycles_completed")),
+                "phys_footprint_peak_gb": _memory_gb(
+                    memory,
+                    "phys_footprint_gb",
+                    "phys_footprint_peak_gb",
+                    "phys_footprint_bytes",
+                ),
+                "phys_footprint_start_gb": phys_start,
+                "phys_footprint_end_gb": phys_end,
+                "phys_footprint_delta_gb": phys_delta,
+                "rss_peak_gb": _memory_gb(memory, "rss_peak_gb", "rss_gb"),
+                "mlx_active_peak_gb": _memory_gb(memory, "mlx_active_gb"),
+                "mlx_cache_peak_gb": _memory_gb(memory, "mlx_cache_gb"),
+                "mlx_peak_gb": _memory_gb(memory, "mlx_peak_gb"),
+                "l1_snapshot_gb": _memory_gb(memory, "l1_snapshot_gb"),
+                "l2_disk_gb": _memory_gb(memory, "l2_disk_gb"),
+                "finish_reason": view.get("finish_reason"),
+                "tool_calls": _int_value(view.get("tool_call_count")) or 0,
+                "source": view.get("source"),
+            }
+        )
+    return rows
+
+_ROWS_MD_COLUMNS = (
+    ("turn_post", "#"),
+    ("cache", "cache"),
+    ("cache_hit_source", "src"),
+    ("prompt_tok", "prompt"),
+    ("cached_tok", "cached"),
+    ("computed_tok", "computed"),
+    ("cache_hit", "hit"),
+    ("ttft_ms", "TTFT ms"),
+    ("prefill_ms", "prefill ms"),
+    ("decode_ms", "decode ms"),
+    ("decode_tok_s", "decode tok/s"),
+    ("out_tok", "out"),
+    ("wall_s", "wall s"),
+    ("acceptance", "accept"),
+    ("tokens_per_cycle", "tpc"),
+    ("cycles", "cycles"),
+    ("phys_footprint_peak_gb", "foot GB"),
+    ("mlx_cache_peak_gb", "cache GB"),
+    ("finish_reason", "finish"),
+    ("tool_calls", "tools"),
+)
+
+def _rows_md_value(key: str, value: Any) -> str:
+    if value is None:
+        return "—"
+    if key == "cache_hit":
+        return f"{float(value) * 100:.1f}%" if isinstance(value, (int, float)) else str(value)
+    if key == "acceptance":
+        return f"{float(value) * 100:.1f}%" if isinstance(value, (int, float)) else str(value)
+    if key.endswith("_gb") or key in ("wall_s", "decode_tok_s", "tokens_per_cycle"):
+        return f"{float(value):.2f}" if isinstance(value, (int, float)) else str(value)
+    if key.endswith("_ms"):
+        return f"{float(value):.0f}" if isinstance(value, (int, float)) else str(value)
+    return str(value)
+
+def _render_rows_markdown(summary: dict[str, Any], rows: list[dict[str, Any]]) -> str:
+    meta = summary.get("metadata") or {}
+    md: list[str] = []
+    md.append(f"# Agentic rows — {meta.get('label', 'trace')}")
+    md.append("")
+    md.append(f"- backend: `{meta.get('backend')}`")
+    md.append(f"- mode: `{summary.get('client') or meta.get('client')}`")
+    md.append(f"- target: `{meta.get('target')}`")
+    md.append(f"- draft: `{meta.get('draft')}`")
+    md.append("")
+    headers = [label for _, label in _ROWS_MD_COLUMNS]
+    md.append("| " + " | ".join(headers) + " |")
+    md.append("| " + " | ".join("---" for _ in headers) + " |")
+    for row in rows:
+        md.append(
+            "| "
+            + " | ".join(_rows_md_value(key, row.get(key)) for key, _ in _ROWS_MD_COLUMNS)
+            + " |"
+        )
+    return "\n".join(md) + "\n"
+
+def _write_post_rows(run_dir: Path, summary: dict[str, Any]) -> None:
+    rows = _normalized_post_rows(summary)
+    (run_dir / "rows.jsonl").write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows)
+        + ("\n" if rows else "")
+    )
+    (run_dir / "rows.md").write_text(_render_rows_markdown(summary, rows))
+    _write_timeline_artifacts(run_dir, summary, rows)
+
+def _content_len(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return len(value)
+    return len(json.dumps(value, ensure_ascii=False))
+
+def _read_request_anatomy(req_path: Path) -> dict[str, Any]:
+    try:
+        obj = json.loads(req_path.read_text())
+    except OSError as e:
+        raise RuntimeError(f"could not read request anatomy from {req_path}: {e}") from e
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"malformed request JSON at {req_path}: {e.msg}") from e
+    body = obj.get("body") if isinstance(obj, dict) else None
+    if not isinstance(body, dict):
+        return {}
+    messages = body.get("messages") or []
+    if not isinstance(messages, list):
+        messages = []
+    role_counts: dict[str, int] = {}
+    roles: list[str] = []
+    tool_output_chars = 0
+    reasoning_chars = 0
+    prompt_tool_calls = 0
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "unknown")
+        roles.append(role)
+        role_counts[role] = role_counts.get(role, 0) + 1
+        if role == "tool":
+            tool_output_chars += _content_len(message.get("content"))
+        reasoning_chars += _content_len(message.get("reasoning_content"))
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            prompt_tool_calls += len(tool_calls)
+    tools = body.get("tools") or []
+    if not isinstance(tools, list):
+        tools = []
+    body_bytes = obj.get("body_bytes")
+    if not isinstance(body_bytes, int):
+        body_bytes = len(json.dumps(body, ensure_ascii=False).encode("utf-8"))
+    body_sha256 = obj.get("body_sha256")
+    if not isinstance(body_sha256, str):
+        body_sha256 = None
+    source_body_sha256 = obj.get("source_body_sha256")
+    if not isinstance(source_body_sha256, str):
+        source_body_sha256 = None
+    return {
+        "body_bytes": body_bytes,
+        "body_sha256": body_sha256,
+        "source_body_sha256": source_body_sha256,
+        "message_count": len(messages),
+        "role_counts": role_counts,
+        "role_ladder_tail": roles[-12:],
+        "tools_count": len(tools),
+        "tool_output_chars": tool_output_chars,
+        "assistant_reasoning_chars": reasoning_chars,
+        "prompt_tool_call_count": prompt_tool_calls,
+        "total_message_chars": sum(
+            _content_len(message.get("content"))
+            for message in messages
+            if isinstance(message, dict)
+        ),
+    }
+
+def _request_anatomy_by_post(run_dir: Path) -> dict[int, dict[str, Any]]:
+    requests_dir = run_dir / "requests"
+    out: dict[int, dict[str, Any]] = {}
+    if not requests_dir.is_dir():
+        return out
+    for idx, req_path in enumerate(sorted(requests_dir.glob("*.json")), start=1):
+        out[idx] = _read_request_anatomy(req_path)
+    return out
+
+def _parse_proxy_http_timeline(run_dir: Path) -> dict[int, dict[str, Any]]:
+    proxy_log = run_dir / "proxy.log"
+    if not proxy_log.exists():
+        return {}
+    starts: dict[int, datetime] = {}
+    body_bytes: dict[int, int] = {}
+    durations: dict[int, float] = {}
+    for line in proxy_log.read_text(errors="replace").splitlines():
+        start_match = _PROXY_POST_RE.match(line)
+        if start_match:
+            idx = int(start_match.group("idx"))
+            starts[idx] = datetime.strptime(start_match.group("ts"), "%Y-%m-%d %H:%M:%S")
+            body_bytes[idx] = int(start_match.group("body_bytes"))
+            continue
+        done_match = _PROXY_DONE_RE.match(line)
+        if done_match:
+            durations[int(done_match.group("idx"))] = float(done_match.group("total_ms")) / 1000.0
+    out: dict[int, dict[str, Any]] = {}
+    for idx in sorted(starts):
+        start = starts[idx]
+        duration_s = durations.get(idx)
+        out[idx] = {
+            "proxy_http_start": start.isoformat(sep=" "),
+            "proxy_http_duration_s": duration_s,
+            "proxy_http_gap_before_s": None,
+            "proxy_body_bytes": body_bytes.get(idx),
+            "proxy_gap_precision": "second_rounded",
+        }
+    previous_done = None
+    for idx in sorted(starts):
+        start = starts[idx]
+        duration_s = durations.get(idx)
+        if idx in out:
+            out[idx]["proxy_http_gap_before_s"] = (
+                (start - previous_done).total_seconds()
+                if previous_done is not None
+                else None
+            )
+        previous_done = start + timedelta(seconds=duration_s) if duration_s is not None else None
+    return out
+
+def _parse_opencode_step_timeline(run_dir: Path) -> dict[int, dict[str, Any]]:
+    stdout_jsonl = run_dir / "opencode" / "stdout.jsonl"
+    if not stdout_jsonl.exists():
+        return {}
+    out: dict[int, dict[str, Any]] = {}
+    message_to_step: dict[str, int] = {}
+    step_start_order = 0
+    step_by_finish_order = 0
+    for lineno, line in enumerate(stdout_jsonl.read_text(errors="replace").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"malformed OpenCode stdout JSONL at {stdout_jsonl}:{lineno}: {e.msg}"
+            ) from e
+        event_type = event.get("type")
+        timestamp = event.get("timestamp")
+        part = event.get("part") if isinstance(event.get("part"), dict) else {}
+        message_id = part.get("messageID")
+        if event_type == "step_start" and isinstance(timestamp, int):
+            step_start_order += 1
+            idx = step_start_order
+            row = out.setdefault(idx, {})
+            row["opencode_step_start_ts_ms"] = timestamp
+            if isinstance(message_id, str):
+                row["opencode_message_id"] = message_id
+                message_to_step[message_id] = idx
+        elif event_type == "step_finish" and isinstance(timestamp, int):
+            idx = message_to_step.get(message_id) if isinstance(message_id, str) else None
+            if idx is None:
+                step_by_finish_order += 1
+                idx = step_by_finish_order
+            row = out.setdefault(idx, {})
+            row["opencode_step_finish_ts_ms"] = timestamp
+            tokens = part.get("tokens")
+            if isinstance(tokens, dict):
+                row["opencode_input_tokens"] = tokens.get("input")
+                row["opencode_output_tokens"] = tokens.get("output")
+                cache = tokens.get("cache")
+                if isinstance(cache, dict):
+                    row["opencode_cache_read_tokens"] = cache.get("read")
+                    row["opencode_cache_write_tokens"] = cache.get("write")
+        elif event_type == "tool_use" and isinstance(timestamp, int):
+            idx = message_to_step.get(message_id) if isinstance(message_id, str) else None
+            if idx is None:
+                continue
+            row = out.setdefault(idx, {})
+            tools = row.setdefault("opencode_tool_names", [])
+            tool_name = part.get("tool")
+            if isinstance(tool_name, str):
+                tools.append(tool_name)
+            state = part.get("state") if isinstance(part.get("state"), dict) else {}
+            timing = state.get("time") if isinstance(state.get("time"), dict) else {}
+            start_ms = timing.get("start")
+            end_ms = timing.get("end")
+            if isinstance(start_ms, int) and isinstance(end_ms, int) and end_ms >= start_ms:
+                row["opencode_tool_exec_ms"] = row.get("opencode_tool_exec_ms", 0) + (end_ms - start_ms)
+    previous_finish: int | None = None
+    for idx in sorted(out):
+        row = out[idx]
+        start_ms = row.get("opencode_step_start_ts_ms")
+        finish_ms = row.get("opencode_step_finish_ts_ms")
+        if isinstance(start_ms, int) and isinstance(finish_ms, int) and finish_ms >= start_ms:
+            row["opencode_step_duration_s"] = (finish_ms - start_ms) / 1000.0
+        if isinstance(start_ms, int) and previous_finish is not None:
+            row["opencode_step_gap_before_s"] = (start_ms - previous_finish) / 1000.0
+        if isinstance(finish_ms, int):
+            previous_finish = finish_ms
+    return out
+
+def _build_timeline_rows(
+    run_dir: Path,
+    summary: dict[str, Any],
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    meta = summary.get("metadata") if isinstance(summary.get("metadata"), dict) else {}
+    pauses = meta.get("pause_before_request") if isinstance(meta.get("pause_before_request"), dict) else {}
+    anatomy = _request_anatomy_by_post(run_dir)
+    proxy = _parse_proxy_http_timeline(run_dir)
+    opencode = _parse_opencode_step_timeline(run_dir)
+    posts_by_idx = {
+        int(post["idx"]): post
+        for post in summary.get("posts", [])
+        if isinstance(post, dict) and isinstance(post.get("idx"), int)
+    }
+    timeline: list[dict[str, Any]] = []
+    for row in rows:
+        idx = row.get("turn_post")
+        if not isinstance(idx, int):
+            continue
+        post = posts_by_idx.get(idx, {})
+        landmarks = post.get("landmarks") if isinstance(post.get("landmarks"), dict) else {}
+        request = post.get("request") if isinstance(post.get("request"), dict) else {}
+        replay_pause = pauses[str(idx)] if str(idx) in pauses else pauses.get(idx)
+        proxy_gap = proxy.get(idx, {}).get("proxy_http_gap_before_s")
+        proxy_gap_excluding_replay_pause = (
+            max(
+                0.0,
+                float(proxy_gap)
+                - (float(replay_pause) if isinstance(replay_pause, (int, float)) else 0.0),
+            )
+            if isinstance(proxy_gap, (int, float))
+            else None
+        )
+        timeline_row = {
+            **row,
+            "replay_pause_before_s": replay_pause,
+            "body_bytes": anatomy.get(idx, {}).get("body_bytes") or proxy.get(idx, {}).get("proxy_body_bytes"),
+            "body_sha256": anatomy.get(idx, {}).get("body_sha256"),
+            "source_body_sha256": anatomy.get(idx, {}).get("source_body_sha256"),
+            "message_count": anatomy.get(idx, {}).get("message_count") or request.get("n_messages"),
+            "role_counts": anatomy.get(idx, {}).get("role_counts"),
+            "role_ladder_tail": anatomy.get(idx, {}).get("role_ladder_tail"),
+            "tools_count": anatomy.get(idx, {}).get("tools_count") or request.get("tools_count"),
+            "tool_output_chars": anatomy.get(idx, {}).get("tool_output_chars"),
+            "assistant_reasoning_chars": anatomy.get(idx, {}).get("assistant_reasoning_chars"),
+            "prompt_tool_call_count": anatomy.get(idx, {}).get("prompt_tool_call_count"),
+            "total_message_chars": anatomy.get(idx, {}).get("total_message_chars") or request.get("total_message_chars"),
+            "first_byte_ms": _float_value(landmarks.get("first_byte_ms")),
+            "first_content_token_ms": _float_value(landmarks.get("first_content_token_ms")),
+            "first_reasoning_ms": _float_value(landmarks.get("first_reasoning_ms")),
+            "first_tool_call_sent_ms": _float_value(landmarks.get("first_tool_call_sent_ms")),
+            "sse_end_ms": _float_value(landmarks.get("end_t_ms")),
+            "cache_lookup_result": (post.get("server_metric") or {}).get("cache_lookup_result"),
+            "cache_lookup_ms": (post.get("server_metric") or {}).get("cache_lookup_ms"),
+            "cache_insert_ms": (post.get("server_metric") or {}).get("cache_insert_ms"),
+            **proxy.get(idx, {}),
+            **opencode.get(idx, {}),
+        }
+        timeline_row["proxy_http_gap_excluding_replay_pause_s"] = proxy_gap_excluding_replay_pause
+        timeline.append(timeline_row)
+    return timeline
+
+_TIMELINE_MD_COLUMNS = (
+    ("turn_post", "#"),
+    ("prompt_tok", "prompt"),
+    ("cached_tok", "cached"),
+    ("computed_tok", "computed"),
+    ("cache", "cache"),
+    ("decode_tok_s", "tok/s"),
+    ("out_tok", "out"),
+    ("acceptance", "accept"),
+    ("body_bytes", "body KB"),
+    ("message_count", "msgs"),
+    ("tools_count", "tools"),
+    ("replay_pause_before_s", "replay sleep"),
+    ("proxy_http_gap_excluding_replay_pause_s", "http gap"),
+    ("opencode_step_gap_before_s", "step gap"),
+    ("opencode_tool_exec_ms", "tool ms"),
+    ("first_tool_call_sent_ms", "first tool"),
+    ("phys_footprint_peak_gb", "foot GB"),
+)
+
+def _timeline_md_value(key: str, value: Any) -> str:
+    if value is None:
+        return "—"
+    if key == "acceptance":
+        return f"{float(value) * 100:.1f}%" if isinstance(value, (int, float)) else str(value)
+    if key == "body_bytes":
+        return f"{float(value) / 1000.0:.1f}" if isinstance(value, (int, float)) else str(value)
+    if key.endswith("_gb") or key.endswith("_s") or key == "decode_tok_s":
+        return f"{float(value):.2f}" if isinstance(value, (int, float)) else str(value)
+    if key.endswith("_ms"):
+        return f"{float(value):.0f}" if isinstance(value, (int, float)) else str(value)
+    return str(value)
+
+def _render_timeline_markdown(summary: dict[str, Any], timeline: list[dict[str, Any]]) -> str:
+    meta = summary.get("metadata") or {}
+    md = [f"# Agentic timeline — {meta.get('label', 'trace')}", ""]
+    md.append("Joined per-POST view: request anatomy, SSE landmarks, server rows, proxy gaps, and OpenCode step gaps when present.")
+    md.append("")
+    headers = [label for _, label in _TIMELINE_MD_COLUMNS]
+    md.append("| " + " | ".join(headers) + " |")
+    md.append("| " + " | ".join("---" for _ in headers) + " |")
+    for row in timeline:
+        md.append(
+            "| "
+            + " | ".join(_timeline_md_value(key, row.get(key)) for key, _ in _TIMELINE_MD_COLUMNS)
+            + " |"
+        )
+    return "\n".join(md) + "\n"
+
+def _write_timeline_artifacts(
+    run_dir: Path,
+    summary: dict[str, Any],
+    rows: list[dict[str, Any]] | None = None,
+) -> None:
+    normalized = rows if rows is not None else _normalized_post_rows(summary)
+    timeline = _build_timeline_rows(run_dir, summary, normalized)
+    (run_dir / "timeline.jsonl").write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in timeline)
+        + ("\n" if timeline else "")
+    )
+    (run_dir / "rows_timeline.md").write_text(_render_timeline_markdown(summary, timeline))
 
 def _aggregate(posts: list[dict[str, Any]], wall_s: float | None) -> dict[str, Any]:
     total_decode_tokens = 0
@@ -1662,6 +2830,39 @@ def _render_compare(summary: dict[str, Any], peer: dict[str, Any] | None = None)
             if isinstance(cs.get("hit_rate"), float)
             else f"- prefix-cache: lookups={cs.get('n_lookups')} hits={cs.get('n_hits')}"
         )
+        gate = cs.get("deeper_hit_gate")
+        if isinstance(gate, dict):
+            md.append(
+                "- deeper-hit gate: "
+                f"{'pass' if gate.get('pass') else 'fail'} "
+                f"advancing_hits={gate.get('advancing_hits', 0)} "
+                f"stalled={len(gate.get('stalled_hits') or [])} "
+                f"regressions={len(gate.get('regressions') or [])} "
+                f"resets={len(gate.get('resets') or [])}"
+            )
+            reset = (gate.get("resets") or [])[:3]
+            if reset:
+                rendered = ", ".join(
+                    (
+                        f"#{item.get('request_id')} {item.get('miss_reason')}"
+                        f"@{item.get('first_divergence_pos')}"
+                    )
+                    for item in reset
+                )
+                md.append(f"- deeper-hit resets: {rendered}")
+    pt = summary.get("prompt_transitions")
+    if isinstance(pt, dict) and pt.get("n_transitions"):
+        md.append(f"- prompt transitions: {pt.get('change_kinds')}")
+        reset_annotations = (pt.get("cache_reset_annotations") or [])[:3]
+        if reset_annotations:
+            rendered = ", ".join(
+                (
+                    f"#{item.get('request_id')} {item.get('prompt_change_kind')} "
+                    f"msg_prefix={item.get('common_message_prefix')}"
+                )
+                for item in reset_annotations
+            )
+            md.append(f"- cache reset prompt causes: {rendered}")
     md.append("")
     if peer is not None:
         md.append(_render_peer_comparison(summary, peer))

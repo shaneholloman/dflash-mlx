@@ -17,6 +17,7 @@ from dflash_mlx.runtime.loading import (
 )
 from dflash_mlx.runtime.registry import (
     ModelSupportSpec,
+    resolve_effective_draft_quant,
     resolve_model_support_spec,
     resolve_optional_draft_ref,
     supported_base_models,
@@ -35,6 +36,7 @@ class RuntimeBundle:
     target_ops: TargetOps
     resolved_model_ref: str
     resolved_draft_ref: str
+    effective_draft_quant: str | None
     support_spec: ModelSupportSpec | None
 
 
@@ -77,11 +79,25 @@ def load_runtime_bundle(
             support_spec=support_spec,
             actual_family=target_ops.family(target_model),
         )
+    effective_draft_quant = resolve_effective_draft_quant(
+        draft_quant=draft_quant,
+        resolved_draft_ref=resolved_draft_ref,
+        support_spec=support_spec,
+    )
 
     draft_model, draft_meta = load_draft_bundle(
         resolved_draft_ref,
         lazy=lazy,
-        draft_quant=draft_quant,
+        draft_quant=effective_draft_quant,
+    )
+    draft_meta = dict(draft_meta)
+    draft_meta["draft_quant_spec"] = effective_draft_quant
+    draft_meta["draft_quant_source"] = (
+        "explicit"
+        if (draft_quant or "").strip() and (draft_quant or "").strip().lower() != "none"
+        else "model_default"
+        if effective_draft_quant is not None
+        else "none"
     )
     draft_backend = make_draft_backend()
     bind_draft_to_target(draft_model, target_model, target_ops=target_ops)
@@ -95,5 +111,6 @@ def load_runtime_bundle(
         target_ops=target_ops,
         resolved_model_ref=resolved_model_ref,
         resolved_draft_ref=resolved_draft_ref,
+        effective_draft_quant=effective_draft_quant,
         support_spec=support_spec,
     )

@@ -49,7 +49,7 @@ def compute_request_stable_prefix_len(
 ) -> int:
     im_start_id, assistant_id, boundary_offset = chat_template_stable_marker(tokenizer)
     role = _last_chat_role(request)
-    if role is not None and role != "user":
+    if role is not None and role not in {"user", "tool"}:
         return len(tokens)
     return compute_stable_prefix_len(
         tokens,
@@ -119,6 +119,7 @@ class PrefixCacheFlow:
         tokenizer: Any,
         prompt: list[int],
         request: Any = None,
+        request_id: int | None = None,
         runtime_context: Optional[Any] = None,
     ) -> "PrefixCacheFlow":
         if runtime_context is None:
@@ -141,7 +142,14 @@ class PrefixCacheFlow:
         )
         lookup_tokens = prompt[:stable_prefix_len]
         try:
-            lookup = cache_manager.lookup(lookup_tokens, key)
+            if request_id is None:
+                lookup = cache_manager.lookup(lookup_tokens, key)
+            else:
+                lookup = cache_manager.lookup(
+                    lookup_tokens,
+                    key,
+                    request_id=request_id,
+                )
         except RuntimeCacheManagerClosed:
             return cls(cache_manager=None)
         hit_tokens = int(lookup.matched_tokens)

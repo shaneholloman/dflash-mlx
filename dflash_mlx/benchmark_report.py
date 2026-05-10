@@ -84,7 +84,7 @@ def suite_report(
             "repeat": int(args.repeat),
             "cooldown": int(args.cooldown),
             "use_chat_template": not bool(args.no_chat_template),
-            "draft_quant": args.draft_quant,
+            "draft_quant": config.get("draft_quant", args.draft_quant),
             "no_eos": bool(args.no_eos),
             "split_sdpa": bool(args.split_sdpa),
             "target_fa_window": int(args.target_fa_window),

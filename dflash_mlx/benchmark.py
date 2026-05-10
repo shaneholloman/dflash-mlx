@@ -745,6 +745,17 @@ def _run_once_sequential(
         "pristine_target_meta": pristine_meta,
     }
 
+
+def _effective_draft_quant_label(
+    requested: str | None,
+    draft_meta: dict[str, Any] | None,
+) -> str | None:
+    effective = (draft_meta or {}).get("draft_quant_spec")
+    if effective is not None:
+        return str(effective)
+    return requested
+
+
 def benchmark_once(
     *,
     prompt: str,
@@ -797,7 +808,7 @@ def benchmark_once(
         model=target_meta["resolved_model_ref"],
         draft=draft_meta["resolved_model_ref"],
         use_chat_template=use_chat_template,
-        draft_quant=draft_quant,
+        draft_quant=_effective_draft_quant_label(draft_quant, draft_meta),
         no_eos=no_eos,
         split_sdpa=split_sdpa,
         **runtime_values,
@@ -871,7 +882,7 @@ def benchmark_repeated(
         model=target_meta["resolved_model_ref"] if target_meta is not None else "",
         draft=draft_meta["resolved_model_ref"] if draft_meta is not None else "",
         use_chat_template=use_chat_template,
-        draft_quant=draft_quant,
+        draft_quant=_effective_draft_quant_label(draft_quant, draft_meta),
         no_eos=no_eos,
         split_sdpa=split_sdpa,
         **runtime_values,
@@ -1037,7 +1048,7 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         "--draft-quant",
         metavar="SPEC",
         default=None,
-        help="Optional in-memory draft quantization, e.g. w4:gs64.",
+        help="Draft quantization override, e.g. w4:gs64; use 'none' to disable model defaults.",
     )
     parser.add_argument(
         "--no-eos",

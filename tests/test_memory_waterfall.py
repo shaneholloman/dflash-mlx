@@ -231,6 +231,40 @@ def test_system_wired_bytes_propagates_programmer_errors(monkeypatch):
         memory_obs.system_wired_bytes()
 
 
+def test_darwin_task_vm_info_bytes_parses_footprint_ledgers(monkeypatch):
+    class FakeFunc:
+        def __init__(self, impl):
+            self.impl = impl
+
+        def __call__(self, *args):
+            return self.impl(*args)
+
+    def fake_task_info(_task, flavor, info_ptr, _count_ptr):
+        assert flavor == 22
+        info = info_ptr._obj
+        info.phys_footprint = 5_000_000_000
+        info.device = 3_000_000_000
+        info.internal = 1_000_000_000
+        info.compressed = 500_000_000
+        info.resident_size = 4_000_000_000
+        return 0
+
+    fake_libc = SimpleNamespace(
+        task_info=FakeFunc(fake_task_info),
+        mach_task_self=FakeFunc(lambda: 1),
+    )
+    monkeypatch.setattr(memory_obs.sys, "platform", "darwin")
+    monkeypatch.setattr(memory_obs.ctypes, "CDLL", lambda *_args, **_kwargs: fake_libc)
+
+    payload = memory_obs.darwin_task_vm_info_bytes()
+
+    assert payload["phys_footprint"] == 5_000_000_000
+    assert payload["device"] == 3_000_000_000
+    assert payload["internal"] == 1_000_000_000
+    assert payload["compressed"] == 500_000_000
+    assert memory_obs.darwin_phys_footprint_bytes() == 5_000_000_000
+
+
 def test_mlx_memory_bytes_fallbacks_and_contract_errors(monkeypatch):
     monkeypatch.setattr(memory_obs.mx, "missing_memory_counter", None, raising=False)
     assert memory_obs.mlx_memory_bytes("missing_memory_counter") is None

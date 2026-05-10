@@ -179,9 +179,11 @@ def test_model_provider_adds_mlx_lm_server_boundary_defaults(monkeypatch):
             target_model=SimpleNamespace(parameters=lambda: []),
             tokenizer=SimpleNamespace(chat_template=None, default_chat_template=None),
             draft_model=SimpleNamespace(parameters=lambda: []),
+            draft_meta={"draft_quant_source": "model_default"},
             draft_backend=draft_backend,
             target_ops=target_ops,
             resolved_draft_ref="draft",
+            effective_draft_quant="w4",
         ),
     )
     args = build_parser().parse_args(["--model", "m"])
@@ -198,6 +200,8 @@ def test_model_provider_adds_mlx_lm_server_boundary_defaults(monkeypatch):
     provider.load("default_model")
     assert provider.target_ops is target_ops
     assert provider.draft_backend is draft_backend
+    assert provider.effective_draft_quant == "w4"
+    assert provider.draft_meta["draft_quant_source"] == "model_default"
 
 def test_model_provider_preserves_dflash_fields_if_parent_preloads(monkeypatch):
     _clear_profile_env(monkeypatch)
@@ -221,9 +225,11 @@ def test_model_provider_preserves_dflash_fields_if_parent_preloads(monkeypatch):
             target_model=SimpleNamespace(parameters=lambda: []),
             tokenizer=SimpleNamespace(chat_template=None, default_chat_template=None),
             draft_model=SimpleNamespace(parameters=lambda: []),
+            draft_meta={"draft_quant_source": "none"},
             draft_backend=draft_backend,
             target_ops=target_ops,
             resolved_draft_ref="draft",
+            effective_draft_quant=None,
         ),
     )
 
@@ -256,9 +262,11 @@ def test_model_provider_materialization_failure_does_not_publish_loaded_state(mo
             target_model=target_model,
             tokenizer=SimpleNamespace(chat_template=None, default_chat_template=None),
             draft_model=draft_model,
+            draft_meta={"draft_quant_source": "model_default"},
             draft_backend=draft_backend,
             target_ops=target_ops,
             resolved_draft_ref="draft",
+            effective_draft_quant="w4",
         ),
     )
     monkeypatch.setattr(
@@ -278,6 +286,8 @@ def test_model_provider_materialization_failure_does_not_publish_loaded_state(mo
     assert provider.tokenizer is None
     assert provider.draft_model is None
     assert provider.draft_backend is None
+    assert provider.draft_meta is None
+    assert provider.effective_draft_quant is None
     assert provider.target_ops is None
     assert provider.model_key is None
 
@@ -439,7 +449,7 @@ def test_serve_cli_rejects_invalid_memory_limit():
     with pytest.raises(SystemExit):
         build_parser().parse_args(["--model", "m", "--wired-limit", "bad"])
 
-def test_configure_metal_limits_preserves_current_default(monkeypatch):
+def _install_metal_limit_probe(monkeypatch):
     calls = []
     recommended = 64 * 1024**3
 
@@ -464,6 +474,10 @@ def test_configure_metal_limits_preserves_current_default(monkeypatch):
         "set_cache_limit",
         lambda value: calls.append(("cache", value)),
     )
+    return calls, recommended
+
+def test_configure_metal_limits_preserves_current_default(monkeypatch):
+    calls, recommended = _install_metal_limit_probe(monkeypatch)
 
     args = build_parser().parse_args(["--model", "m"])
     limits = configure_metal_limits(args)
@@ -474,31 +488,64 @@ def test_configure_metal_limits_preserves_current_default(monkeypatch):
     assert limits.cache_request == "auto"
     assert limits.cache_bytes == recommended // 4
 
+def test_long_session_profile_sets_tighter_default_cache_limit(monkeypatch):
+    _clear_profile_env(monkeypatch)
+    calls, recommended = _install_metal_limit_probe(monkeypatch)
+
+    args = build_parser().parse_args(["--model", "m", "--profile", "long-session"])
+    normalize_cli_args(args)
+    limits = configure_metal_limits(args)
+
+    assert calls == [("wired", recommended), ("cache", 4 * 1024**3)]
+    assert args.cache_limit is None
+    assert limits.cache_request == 4 * 1024**3
+    assert limits.cache_bytes == 4 * 1024**3
+
+def test_explicit_auto_cache_limit_overrides_long_session_profile(monkeypatch):
+    _clear_profile_env(monkeypatch)
+    calls, recommended = _install_metal_limit_probe(monkeypatch)
+
+    args = build_parser().parse_args(
+        ["--model", "m", "--profile", "long-session", "--cache-limit", "auto"]
+    )
+    normalize_cli_args(args)
+    limits = configure_metal_limits(args)
+
+    assert calls == [("wired", recommended), ("cache", recommended // 4)]
+    assert limits.cache_request == "auto"
+    assert limits.cache_bytes == recommended // 4
+
+def test_explicit_none_cache_limit_overrides_long_session_profile(monkeypatch):
+    _clear_profile_env(monkeypatch)
+    calls, recommended = _install_metal_limit_probe(monkeypatch)
+
+    args = build_parser().parse_args(
+        ["--model", "m", "--profile", "long-session", "--cache-limit", "none"]
+    )
+    normalize_cli_args(args)
+    limits = configure_metal_limits(args)
+
+    assert calls == [("wired", recommended)]
+    assert limits.cache_request == "none"
+    assert limits.cache_bytes is None
+    assert limits.cache_applied is False
+
+def test_explicit_byte_cache_limit_overrides_long_session_profile(monkeypatch):
+    _clear_profile_env(monkeypatch)
+    calls, recommended = _install_metal_limit_probe(monkeypatch)
+
+    args = build_parser().parse_args(
+        ["--model", "m", "--profile", "long-session", "--cache-limit", "8GB"]
+    )
+    normalize_cli_args(args)
+    limits = configure_metal_limits(args)
+
+    assert calls == [("wired", recommended), ("cache", 8 * 1024**3)]
+    assert limits.cache_request == 8 * 1024**3
+    assert limits.cache_bytes == 8 * 1024**3
+
 def test_configure_metal_limits_supports_none_and_explicit_cache(monkeypatch):
-    calls = []
-    recommended = 64 * 1024**3
-
-    class Metal:
-        @staticmethod
-        def is_available():
-            return True
-
-    monkeypatch.setattr(metal_limits.mx, "metal", Metal())
-    monkeypatch.setattr(
-        metal_limits.mx,
-        "device_info",
-        lambda: {"max_recommended_working_set_size": recommended},
-    )
-    monkeypatch.setattr(
-        metal_limits.mx,
-        "set_wired_limit",
-        lambda value: calls.append(("wired", value)),
-    )
-    monkeypatch.setattr(
-        metal_limits.mx,
-        "set_cache_limit",
-        lambda value: calls.append(("cache", value)),
-    )
+    calls, _recommended = _install_metal_limit_probe(monkeypatch)
 
     args = build_parser().parse_args(
         ["--model", "m", "--wired-limit", "none", "--cache-limit", "8GB"]
@@ -527,6 +574,8 @@ def test_startup_banner_prints_resolved_metal_limits(monkeypatch, capsys):
     )
     provider = SimpleNamespace(
         model_key=("target", None, "draft"),
+        effective_draft_quant="w4",
+        draft_meta={"draft_quant_source": "model_default"},
         cli_args=SimpleNamespace(
             model="target",
             draft_model=None,
@@ -546,6 +595,7 @@ def test_startup_banner_prints_resolved_metal_limits(monkeypatch, capsys):
     runtime.print_startup_banner()
 
     err = capsys.readouterr().err
+    assert "Draft quant:  w4 (model_default)" in err
     assert "Thinking:     enabled" in err
     assert "Fast path:    AR <= 256 tokens" in err
     assert "Wired limit: auto -> 64.0 GiB" in err
@@ -592,20 +642,21 @@ def test_profile_balanced_sets_product_defaults(monkeypatch):
     assert cfg.verify_mode == "auto"
 
 @pytest.mark.parametrize(
-    "profile,prefill,l2",
+    "profile,prefill,l2,clear",
     [
-        ("fast", "8192", "0"),
-        ("low-memory", "1024", "0"),
-        ("long-session", "4096", "1"),
+        ("fast", "8192", "0", "0"),
+        ("low-memory", "1024", "0", "0"),
+        ("long-session", "4096", "1", "1"),
     ],
 )
-def test_profiles_set_expected_values(monkeypatch, profile, prefill, l2):
+def test_profiles_set_expected_values(monkeypatch, profile, prefill, l2, clear):
     _clear_profile_env(monkeypatch)
     args = build_parser().parse_args(["--model", "m", "--profile", profile])
     normalize_cli_args(args)
     assert args.runtime_config.profile == profile
     assert args.runtime_config.prefill_step_size == int(prefill)
     assert args.runtime_config.prefix_cache_l2 is (l2 == "1")
+    assert args.runtime_config.clear_cache_boundaries is (clear == "1")
 
 def test_cli_explicit_overrides_profile(monkeypatch):
     _clear_profile_env(monkeypatch)

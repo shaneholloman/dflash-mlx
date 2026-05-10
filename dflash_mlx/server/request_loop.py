@@ -24,9 +24,12 @@ from dflash_mlx.engine.events import (
     SummaryEvent,
     TokenEvent,
 )
+from dflash_mlx.observability.memory import process_memory_snapshot
 from dflash_mlx.server.prefix_cache_flow import PrefixCacheFlow
 from dflash_mlx.server.metrics import record_cycle_diagnostic, update_live_request
 from dflash_mlx.server.protocol import make_response, match_stream_token
+
+_GB = 1_000_000_000.0
 
 @dataclass
 class RequestLoopResult:
@@ -41,6 +44,8 @@ class RequestLoopResult:
     cache_hit_tokens: int
     cache_insert_ms: float
     memory_waterfall_peak: Optional[dict[str, Any]] = None
+    memory_waterfall_start: Optional[dict[str, Any]] = None
+    memory_waterfall_end: Optional[dict[str, Any]] = None
 
 def consume_dflash_events(
     *,
@@ -80,12 +85,37 @@ def consume_dflash_events(
     printed_prefill_progress = False
     client_done = False
     memory_peak: Optional[dict[str, Any]] = None
+    memory_start: Optional[dict[str, Any]] = None
+    memory_end: Optional[dict[str, Any]] = None
     diagnostics = (
         runtime_context.diagnostics
         if runtime_context is not None
         else None
     )
     memory_enabled = bool(diagnostics is not None and diagnostics.memory_waterfall)
+    memory_boundary_enabled = bool(
+        diagnostics is not None and getattr(diagnostics, "mode", "off") != "off"
+    )
+    if memory_boundary_enabled:
+        memory_start = (
+            collect_memory_waterfall(
+                phase="request_start",
+                prefix_cache_memory=(
+                    prefix_flow.prefix_cache_memory_bytes()
+                    if prefix_flow is not None
+                    else None
+                ),
+            )
+            if memory_enabled
+            else _boundary_memory_snapshot("request_start")
+        )
+        memory_peak = merge_memory_waterfall_peak(memory_peak, memory_start)
+        if bench_active:
+            record_cycle_diagnostic(
+                diagnostics=diagnostics,
+                request_id=request_id,
+                fields=memory_start,
+            )
 
     try:
         for event in event_iter:
@@ -268,15 +298,20 @@ def consume_dflash_events(
         close = getattr(event_iter, "close", None)
         if close is not None:
             close()
-        if memory_enabled:
-            memory_event = collect_memory_waterfall(
-                phase="after_cleanup",
-                prefix_cache_memory=(
-                    prefix_flow.prefix_cache_memory_bytes()
-                    if prefix_flow is not None
-                    else None
-                ),
+        if memory_boundary_enabled:
+            memory_event = (
+                collect_memory_waterfall(
+                    phase="after_cleanup",
+                    prefix_cache_memory=(
+                        prefix_flow.prefix_cache_memory_bytes()
+                        if prefix_flow is not None
+                        else None
+                    ),
+                )
+                if memory_enabled
+                else _boundary_memory_snapshot("request_end")
             )
+            memory_end = memory_event
             memory_peak = merge_memory_waterfall_peak(memory_peak, memory_event)
             if bench_active:
                 record_cycle_diagnostic(
@@ -317,6 +352,8 @@ def consume_dflash_events(
         cache_hit_tokens=prefix_flow.hit_tokens if prefix_flow is not None else 0,
         cache_insert_ms=prefix_flow.insert_ms if prefix_flow is not None else 0.0,
         memory_waterfall_peak=memory_peak,
+        memory_waterfall_start=memory_start,
+        memory_waterfall_end=memory_end,
     )
 
 def _with_prefix_cache_memory(
@@ -329,6 +366,16 @@ def _with_prefix_cache_memory(
     if prefix_memory is None:
         return event
     return {**event, **prefix_cache_memory_fields(prefix_memory)}
+
+def _boundary_memory_snapshot(phase: str) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "memory_phase": str(phase),
+        **process_memory_snapshot(include_system_wired=False),
+    }
+    for key, value in list(payload.items()):
+        if key.endswith("_bytes") and value is not None:
+            payload[key[:-6] + "_gb"] = float(value) / _GB
+    return payload
 
 def _context_should_stop(ctx: Any) -> bool:
     return bool(getattr(ctx, "_should_stop", False))
