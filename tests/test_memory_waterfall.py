@@ -5,9 +5,13 @@
 from __future__ import annotations
 
 import json
+import subprocess
+from types import SimpleNamespace
 
 import mlx.core as mx
+import pytest
 
+from dflash_mlx.engine import memory_waterfall
 from tools.benchmarks.analyze_trace import (
     classify_verdict,
     compute_phase_deltas,
@@ -38,6 +42,11 @@ class FakeStateKVCache:
     def state(self):
         return self._state
 
+class BrokenStateKVCache:
+    @property
+    def state(self):
+        raise RuntimeError("broken state contract")
+
 class FakeRecurrentRollbackCache:
     def __init__(self):
         self.cache = [mx.zeros((1, 2, 3), dtype=mx.float16)]
@@ -56,6 +65,10 @@ def test_target_cache_bytes_splits_fa_gdn_and_tape():
 def test_draft_cache_bytes_counts_keys_values_and_state():
     out = draft_cache_bytes([FakeKVCache(), FakeStateKVCache()])
     assert out["draft_kv_bytes"] == 192
+
+def test_draft_cache_bytes_fails_fast_on_broken_state_property():
+    with pytest.raises(RuntimeError, match="broken state contract"):
+        draft_cache_bytes([BrokenStateKVCache()])
 
 def test_prefix_cache_memory_bytes_breakdown_and_stats():
     out = prefix_cache_memory_bytes(
@@ -112,6 +125,76 @@ def test_collect_memory_waterfall_deduplicates_hidden_buckets():
     )
     assert out["target_hidden_active_bytes"] == hidden.nbytes
     assert out["gen_hidden_chunks_bytes"] == 0
+
+def test_current_rss_bytes_falls_back_on_ps_parse_failure(monkeypatch):
+    monkeypatch.setattr(memory_waterfall.subprocess, "check_output", lambda *_args, **_kwargs: b"bad")
+    monkeypatch.setattr(
+        memory_waterfall.resource,
+        "getrusage",
+        lambda _kind: SimpleNamespace(ru_maxrss=1234),
+    )
+    monkeypatch.setattr(memory_waterfall.platform, "system", lambda: "Darwin")
+
+    assert memory_waterfall._current_rss_bytes() == 1234
+
+
+def test_current_rss_bytes_propagates_programmer_errors(monkeypatch):
+    def broken_check_output(*_args, **_kwargs):
+        raise TypeError("broken helper contract")
+
+    monkeypatch.setattr(memory_waterfall.subprocess, "check_output", broken_check_output)
+
+    with pytest.raises(TypeError, match="broken helper contract"):
+        memory_waterfall._current_rss_bytes()
+
+
+def test_system_wired_bytes_falls_back_on_vm_stat_failure(monkeypatch):
+    def fail_vm_stat(*_args, **_kwargs):
+        raise subprocess.CalledProcessError(1, ["vm_stat"])
+
+    monkeypatch.setattr(memory_waterfall.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(memory_waterfall.subprocess, "check_output", fail_vm_stat)
+
+    assert memory_waterfall._system_wired_bytes() == 0
+
+
+def test_system_wired_bytes_parses_vm_stat(monkeypatch):
+    out = (
+        "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
+        "Pages wired down: 2.\n"
+    )
+    monkeypatch.setattr(memory_waterfall.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(memory_waterfall.subprocess, "check_output", lambda *_args, **_kwargs: out)
+
+    assert memory_waterfall._system_wired_bytes() == 32768
+
+
+def test_system_wired_bytes_propagates_programmer_errors(monkeypatch):
+    def broken_check_output(*_args, **_kwargs):
+        raise TypeError("broken helper contract")
+
+    monkeypatch.setattr(memory_waterfall.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(memory_waterfall.subprocess, "check_output", broken_check_output)
+
+    with pytest.raises(TypeError, match="broken helper contract"):
+        memory_waterfall._system_wired_bytes()
+
+
+def test_mlx_memory_bytes_fallbacks_and_contract_errors(monkeypatch):
+    monkeypatch.setattr(memory_waterfall.mx, "missing_memory_counter", None, raising=False)
+    assert memory_waterfall._mlx_memory_bytes("missing_memory_counter") == 0
+
+    monkeypatch.setattr(
+        memory_waterfall.mx,
+        "runtime_failing_memory_counter",
+        lambda: (_ for _ in ()).throw(RuntimeError("mlx unavailable")),
+        raising=False,
+    )
+    assert memory_waterfall._mlx_memory_bytes("runtime_failing_memory_counter") == 0
+
+    monkeypatch.setattr(memory_waterfall.mx, "bad_memory_counter", lambda: object(), raising=False)
+    with pytest.raises(TypeError):
+        memory_waterfall._mlx_memory_bytes("bad_memory_counter")
 
 def test_analyzer_loads_jsonl_and_classifies_target_hidden(tmp_path):
     path = tmp_path / "cycle_events.jsonl"

@@ -96,14 +96,10 @@ class SpeculativeSession:
             try:
                 assert prefix_snapshot is not None
                 target_cache = hydrate_target_cache(prefix_snapshot, template_cache)
-            except (ValueError, TypeError):
-                snap_prefix_len = 0
-                target_cache = target_ops.make_cache(
-                    target_model,
-                    enable_speculative_linear_cache=True,
-                    quantize_kv_cache=quantize_kv_cache,
-                    target_fa_window=target_fa_window,
-                )
+            except (ValueError, TypeError) as exc:
+                raise RuntimeError(
+                    f"prefix snapshot hydrate failed for {snap_prefix_len} tokens"
+                ) from exc
             finally:
                 del template_cache
         else:
@@ -205,23 +201,15 @@ def _build_snapshot_ready_event(
     if snapshot_builder is None or target_hidden is None:
         return None
     if require_logits and last_logits is None:
-        return None
-    try:
-        snapshot = snapshot_builder.build(
-            token_ids=token_ids,
-            target_cache=target_cache,
-            target_hidden=target_hidden,
-            last_logits=last_logits,
-            kind=kind,
-            allow_full_attention_context=allow_full_context_draft_layers,
-        )
-    except Exception as snapshot_err:
-        sys.stderr.write(
-            f"{time.strftime('%Y-%m-%d %H:%M:%S')} "
-            f"[dflash] {event_name} build failed: {snapshot_err}\n"
-        )
-        sys.stderr.flush()
-        return None
+        raise ValueError(f"{event_name} requires last_logits")
+    snapshot = snapshot_builder.build(
+        token_ids=token_ids,
+        target_cache=target_cache,
+        target_hidden=target_hidden,
+        last_logits=last_logits,
+        kind=kind,
+        allow_full_attention_context=allow_full_context_draft_layers,
+    )
     event = {
         "event": event_name,
         "snapshot": snapshot,
@@ -592,6 +580,8 @@ def stream_dflash_generate_impl(
         gen_hidden_chunks: list[mx.array] = []
         last_cycle_logits: Optional[mx.array] = None
 
+        if prefill_logits is None:
+            raise RuntimeError("prefill logits unavailable after prefix snapshot restore")
         suppress_token_mask = build_suppress_token_mask(int(prefill_logits.shape[-1]), suppress_token_ids)
         staged_first = greedy_tokens_with_mask(prefill_logits[:, -1, :], suppress_token_mask).reshape(-1)
         prefill_tokens_restored = max(0, min(int(snap_prefix_len), int(prompt_len)))
@@ -951,54 +941,47 @@ def stream_dflash_generate_impl(
             and prefill_target_hidden_for_snapshot is not None
             and gen_hidden_chunks
         ):
-            try:
-                gen_hidden = (
-                    gen_hidden_chunks[0]
-                    if len(gen_hidden_chunks) == 1
-                    else mx.concatenate(gen_hidden_chunks, axis=1)
-                )
-                end_target_hidden = mx.concatenate(
-                    [prefill_target_hidden_for_snapshot, gen_hidden], axis=1
-                )
-                mx.eval(end_target_hidden)
-                if last_cycle_logits is not None:
-                    mx.eval(last_cycle_logits)
-                _clear_cache_boundary()
-                end_total_len = prompt_len + len(generated_token_ids)
-                _snapshot_build = yield_pause.mark()
-                snapshot_event = _build_snapshot_ready_event(
-                    event_name="generation_snapshot_ready",
-                    token_ids=list(prompt_tokens) + list(generated_token_ids),
-                    target_cache=target_cache,
-                    target_hidden=end_target_hidden,
-                    last_logits=last_cycle_logits,
-                    snapshot_builder=prefix_snapshot_builder,
-                    kind="generation",
-                    require_logits=False,
-                    snapshot_boundary=end_total_len,
-                    allow_full_context_draft_layers=allow_full_context_draft_layers,
-                )
-                yield_pause.done(_snapshot_build)
-                if snapshot_event is not None:
-                    _pre_yield = yield_pause.mark()
-                    yield snapshot_event
-                    yield_pause.done(_pre_yield)
-                evt = _waterfall_event(
-                    "after_generation_snapshot_build",
-                    target_hidden_value=end_target_hidden,
-                    gen_hidden_chunks_value=gen_hidden_chunks,
-                    extra={"snapshot_boundary": int(end_total_len)},
-                )
-                if evt is not None:
-                    _pre_yield = yield_pause.mark()
-                    yield evt
-                    yield_pause.done(_pre_yield)
-            except Exception as _gen_snap_err:
-                sys.stderr.write(
-                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} "
-                    f"[dflash] generation_snapshot_ready build failed: {_gen_snap_err}\n"
-                )
-                sys.stderr.flush()
+            gen_hidden = (
+                gen_hidden_chunks[0]
+                if len(gen_hidden_chunks) == 1
+                else mx.concatenate(gen_hidden_chunks, axis=1)
+            )
+            end_target_hidden = mx.concatenate(
+                [prefill_target_hidden_for_snapshot, gen_hidden], axis=1
+            )
+            mx.eval(end_target_hidden)
+            if last_cycle_logits is not None:
+                mx.eval(last_cycle_logits)
+            _clear_cache_boundary()
+            end_total_len = prompt_len + len(generated_token_ids)
+            _snapshot_build = yield_pause.mark()
+            snapshot_event = _build_snapshot_ready_event(
+                event_name="generation_snapshot_ready",
+                token_ids=list(prompt_tokens) + list(generated_token_ids),
+                target_cache=target_cache,
+                target_hidden=end_target_hidden,
+                last_logits=last_cycle_logits,
+                snapshot_builder=prefix_snapshot_builder,
+                kind="generation",
+                require_logits=False,
+                snapshot_boundary=end_total_len,
+                allow_full_context_draft_layers=allow_full_context_draft_layers,
+            )
+            yield_pause.done(_snapshot_build)
+            if snapshot_event is not None:
+                _pre_yield = yield_pause.mark()
+                yield snapshot_event
+                yield_pause.done(_pre_yield)
+            evt = _waterfall_event(
+                "after_generation_snapshot_build",
+                target_hidden_value=end_target_hidden,
+                gen_hidden_chunks_value=gen_hidden_chunks,
+                extra={"snapshot_boundary": int(end_total_len)},
+            )
+            if evt is not None:
+                _pre_yield = yield_pause.mark()
+                yield evt
+                yield_pause.done(_pre_yield)
 
         elapsed_us = (time.perf_counter_ns() - start_ns - yield_pause.pause_ns) / 1_000.0
         first_20 = acceptance_history[:20]

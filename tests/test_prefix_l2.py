@@ -5,11 +5,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from pathlib import Path
 
 import mlx.core as mx
+import pytest
 
 from dflash_mlx.cache.prefix_l1 import DFlashPrefixCache
 from dflash_mlx.cache.prefix_l2 import (
@@ -42,6 +44,48 @@ def _all_snapshot_files(cache_dir: Path) -> list[Path]:
 def _bucket_dir(cache_dir: Path, key) -> Path:
     kh = _key_hash(key)
     return cache_dir / L2_LAYOUT_ROOT / _runtime_layout_hash() / kh[:2] / kh
+
+def _write_tampered_snapshot_file(
+    cache_dir: Path,
+    key,
+    token_ids: list[int],
+    tamper,
+) -> Path:
+    snap = _make_synthetic_snapshot(token_ids, key)
+    arrays, meta_dict = _serialize(snap)
+    meta = json.loads(meta_dict["dflash_meta"])
+    replacement = tamper(meta)
+    if replacement is not None:
+        meta = replacement
+    meta_dict["dflash_meta"] = json.dumps(meta)
+    bucket = _bucket_dir(cache_dir, key)
+    bucket.mkdir(parents=True, exist_ok=True)
+    path = bucket / _format_filename(
+        token_len=len(token_ids),
+        token_hash=_token_hash(token_ids),
+        kind="prefill",
+        fp_short="0" * 16,
+    )
+    mx.save_safetensors(str(path), arrays, metadata=meta_dict)
+    return path
+
+def _set_metadata_field(name: str, value):
+    def _tamper(meta):
+        meta[name] = value
+
+    return _tamper
+
+def _set_key_metadata_field(name: str, value):
+    def _tamper(meta):
+        meta["key"][name] = value
+
+    return _tamper
+
+def _replace_metadata(value):
+    def _tamper(_meta):
+        return value
+
+    return _tamper
 
 def _wait_writes(l2: DFlashPrefixL2Cache, expected: int, timeout_s: float = 5.0) -> None:
     deadline = time.time() + timeout_s
@@ -296,6 +340,94 @@ class TestFailureModes:
         finally:
             l2.shutdown()
 
+    @pytest.mark.parametrize(
+        "tamper",
+        [
+            _set_metadata_field("schema_version", "bad-int"),
+            _set_metadata_field("schema_version", "1"),
+            _set_metadata_field("schema_version", 1.0),
+            _set_metadata_field("schema_version", True),
+            _replace_metadata(["not", "a", "dict"]),
+            _set_metadata_field("token_ids", None),
+            _set_metadata_field("token_ids", ["1", 2]),
+            _set_metadata_field("token_ids", [1.0, 2]),
+            _set_metadata_field("token_ids", [True, 2]),
+            _set_key_metadata_field("capture_layer_ids", ["10", 20]),
+            _set_key_metadata_field("draft_sink_size", "16"),
+            _set_key_metadata_field("draft_window_size", 2048.0),
+            _set_key_metadata_field("target_fa_window", False),
+            _set_key_metadata_field("format_version", True),
+        ],
+    )
+    def test_malformed_metadata_rejected(self, tmp_path, tamper):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            key = _make_key()
+            bad = _write_tampered_snapshot_file(
+                tmp_path,
+                key,
+                [1, 2],
+                tamper,
+            )
+
+            res = l2.lookup((1, 2), key)
+
+            assert res is None
+            assert not bad.exists()
+            assert l2.stats()["schema_rejects"] >= 1
+        finally:
+            l2.shutdown()
+
+    def test_snapshot_serialization_bug_propagates(self, tmp_path, monkeypatch):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            def _bad_serialize(_snapshot):
+                raise TypeError("broken serializer")
+
+            monkeypatch.setattr("dflash_mlx.cache.prefix_l2._serialize", _bad_serialize)
+            snap = _make_synthetic_snapshot([1, 2, 3], _make_key())
+
+            with pytest.raises(TypeError, match="broken serializer"):
+                l2.insert_async(snap)
+            assert l2._writer_slots.acquire(blocking=False)
+            l2._writer_slots.release()
+
+            with pytest.raises(TypeError, match="broken serializer"):
+                l2._write_one(snap)
+        finally:
+            l2.shutdown()
+
+    def test_key_parser_bug_propagates(self, tmp_path, monkeypatch):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            key = _make_key()
+            _write_tampered_snapshot_file(tmp_path, key, [1, 2], lambda _meta: None)
+
+            def _broken_key_parser(_meta):
+                raise RuntimeError("broken key parser")
+
+            monkeypatch.setattr(
+                "dflash_mlx.cache.prefix_l2._key_from_dict",
+                _broken_key_parser,
+            )
+
+            with pytest.raises(RuntimeError, match="broken key parser"):
+                l2.lookup((1, 2), key)
+        finally:
+            l2.shutdown()
+
+    def test_finalizer_logs_shutdown_failure(self, caplog):
+        class BrokenFinalizerL2(DFlashPrefixL2Cache):
+            def shutdown(self, wait: bool = True) -> None:
+                raise RuntimeError("broken finalizer")
+
+        l2 = object.__new__(BrokenFinalizerL2)
+
+        with caplog.at_level(logging.DEBUG, logger="dflash_mlx.cache.prefix_l2"):
+            l2.__del__()
+
+        assert "L2 finalizer shutdown failed: broken finalizer" in caplog.text
+
     def test_disk_full_does_not_crash(self, tmp_path, monkeypatch):
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
@@ -337,6 +469,29 @@ class TestEvictionAndStats:
             assert len(files) <= 2
             stats = l2.stats()
             assert stats["evictions"] >= 1
+        finally:
+            l2.shutdown()
+
+    def test_eviction_recomputes_after_external_parseable_file(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=1)
+        try:
+            key = _make_key()
+            bucket = _bucket_dir(tmp_path, key)
+            bucket.mkdir(parents=True, exist_ok=True)
+            external = bucket / _format_filename(
+                token_len=2,
+                token_hash=_token_hash([1, 2]),
+                kind="prefill",
+                fp_short="0" * 16,
+            )
+            external.write_bytes(b"x" * 5000)
+
+            l2._write_one(_make_synthetic_snapshot([3, 4, 5], key))
+
+            on_disk = sum(p.stat().st_size for p in _all_snapshot_files(tmp_path))
+            stats = l2.stats()
+            assert stats["evictions"] >= 1
+            assert stats["current_bytes"] == on_disk
         finally:
             l2.shutdown()
 
@@ -634,6 +789,35 @@ class TestStatsHotPath:
         finally:
             l2.shutdown()
 
+    def test_clear_failure_recomputes_tracked_bytes(self, tmp_path, monkeypatch):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            key = _make_key()
+            l2._write_one(_make_synthetic_snapshot([1, 2, 3], key))
+            l2._write_one(_make_synthetic_snapshot([4, 5, 6], key))
+            before = l2.stats()["current_bytes"]
+            assert before > 0
+            assert len(_all_snapshot_files(tmp_path)) == 2
+
+            def _fail_rmtree(_path):
+                _all_snapshot_files(tmp_path)[0].unlink()
+                raise OSError("cannot remove l2 cache")
+
+            monkeypatch.setattr("dflash_mlx.cache.prefix_l2.shutil.rmtree", _fail_rmtree)
+
+            try:
+                l2.clear()
+            except OSError as exc:
+                assert "cannot remove l2 cache" in str(exc)
+            else:
+                raise AssertionError("clear() should surface failed L2 deletion")
+
+            remaining = _all_snapshot_files(tmp_path)
+            assert len(remaining) == 1
+            assert l2.stats()["current_bytes"] == sum(p.stat().st_size for p in remaining)
+        finally:
+            l2.shutdown()
+
     def test_tracked_bytes_decremented_on_corrupt_unlink(self, tmp_path):
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
@@ -641,6 +825,7 @@ class TestStatsHotPath:
             l2._write_one(_make_synthetic_snapshot([1, 2, 3], key))
             initial = l2.stats()["current_bytes"]
             assert initial > 0
+            assert initial == sum(p.stat().st_size for p in _all_snapshot_files(tmp_path))
 
             bucket = _bucket_dir(tmp_path, key)
             corrupt_name = _format_filename(
@@ -652,14 +837,15 @@ class TestStatsHotPath:
             corrupt = bucket / corrupt_name
             corrupt.write_bytes(b"deadbeef" * 100)
             after_inject = l2.stats()["current_bytes"]
+            after_inject_disk = sum(p.stat().st_size for p in _all_snapshot_files(tmp_path))
+            assert after_inject_disk > after_inject
 
             l2.lookup((1, 2), key)
             assert not corrupt.exists()
             after = l2.stats()["current_bytes"]
 
-            assert after >= 0
-
-            assert after <= after_inject
+            assert after < after_inject_disk
+            assert after == sum(p.stat().st_size for p in _all_snapshot_files(tmp_path))
         finally:
             l2.shutdown()
 

@@ -4,8 +4,11 @@
 
 from __future__ import annotations
 
+import builtins
 import os
 from types import SimpleNamespace
+
+import pytest
 
 from dflash_mlx import runtime_loading
 from dflash_mlx.engine.config import (
@@ -45,6 +48,34 @@ def _pure_attention_ops(*, supports_verify_linear: bool = True):
         install_speculative_hooks=lambda model: None,
         configure_full_attention_split=lambda model, **kwargs: None,
     )
+
+
+def test_local_model_path_missing_huggingface_hub_reports_file_not_found(monkeypatch, tmp_path):
+    original_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "huggingface_hub":
+            raise ImportError("missing")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    with pytest.raises(FileNotFoundError, match="huggingface_hub is unavailable"):
+        runtime_loading._resolve_local_model_path(tmp_path / "missing-model")
+
+
+def test_local_model_path_propagates_unexpected_hub_import_errors(monkeypatch, tmp_path):
+    original_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "huggingface_hub":
+            raise RuntimeError("import side effect failed")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    with pytest.raises(RuntimeError, match="import side effect failed"):
+        runtime_loading._resolve_local_model_path(tmp_path / "missing-model")
 
 
 def test_verify_config_off_disables_target_verify_linears(monkeypatch):

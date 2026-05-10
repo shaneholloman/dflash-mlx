@@ -20,10 +20,11 @@ from dflash_mlx.runtime_context import (
 )
 
 def decode_token(tokenizer: Any, token_id: int) -> str:
+    token = int(token_id)
     try:
-        return str(tokenizer.decode([int(token_id)]))
-    except Exception:
-        return str(tokenizer.decode(int(token_id)))
+        return str(tokenizer.decode([token]))
+    except TypeError:
+        return str(tokenizer.decode(token))
 
 def generation_tps_from_summary(summary: dict[str, Any]) -> float:
     elapsed_us = float(summary.get("elapsed_us", 0.0))

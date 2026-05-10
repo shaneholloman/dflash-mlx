@@ -54,6 +54,8 @@ def _runtime_context(*, target_fa_window: int = 0, prefix_cache: bool = True):
         runtime=SimpleNamespace(
             target_fa_window=target_fa_window,
             prefix_cache=prefix_cache,
+            draft_sink_size=64,
+            draft_window_size=1024,
         ),
         diagnostics=SimpleNamespace(trace=None),
     )
@@ -187,10 +189,10 @@ def test_prefix_cache_flow_disabled_for_windowed_target(monkeypatch):
         return original_shutdown(self)
 
     class FakeProvider:
-        model_key = ("target", None, "draft")
+        pass
 
     class FakeDraft:
-        target_layer_ids = [3, 7]
+        pass
 
     class FakeTokenizer:
         unk_token_id = -1

@@ -551,6 +551,18 @@ class _BenchmarkTokenizer:
         return [1, 2, 3]
 
 
+class _ClosableBenchmarkStream:
+    def __init__(self, events):
+        self.events = list(events)
+        self.closed = False
+
+    def __iter__(self):
+        return iter(self.events)
+
+    def close(self):
+        self.closed = True
+
+
 class _BindableBenchmarkDraft:
     def __init__(self, events: list[str] | None = None) -> None:
         self.events = events
@@ -588,6 +600,130 @@ def _fake_dflash_result() -> dict:
         "acceptance_ratio": 1.0,
         "cycles_completed": 1,
     }
+
+
+def test_benchmark_omits_baseline_peak_memory_when_reset_fails(monkeypatch, capsys):
+    def reset_fails():
+        raise RuntimeError("reset failed")
+
+    monkeypatch.setattr(benchmark.mx, "reset_peak_memory", reset_fails, raising=False)
+    monkeypatch.setattr(
+        benchmark,
+        "mlx_stream_generate",
+        lambda *_args, **_kwargs: iter(
+            [
+                SimpleNamespace(
+                    token=7,
+                    prompt_tokens=3,
+                    prompt_tps=100.0,
+                    generation_tokens=1,
+                    generation_tps=10.0,
+                    peak_memory=42.0,
+                )
+            ]
+        ),
+    )
+
+    result = benchmark._generate_stock_baseline_once(
+        target_model=object(),
+        tokenizer=_BenchmarkTokenizer(),
+        prompt="prompt",
+        max_new_tokens=1,
+        no_eos=False,
+        use_chat_template=False,
+    )
+
+    assert result["peak_memory_gb"] is None
+    assert "baseline peak memory reset failed" in capsys.readouterr().err
+
+
+def test_benchmark_omits_dflash_peak_memory_when_reset_fails(monkeypatch, capsys):
+    def reset_fails():
+        raise RuntimeError("reset failed")
+
+    stream = _ClosableBenchmarkStream(
+        [
+            {"event": "token", "token_id": 7},
+            {
+                "event": "summary",
+                "elapsed_us": 1_000_000.0,
+                "phase_timings_us": {"prefill": 100_000.0},
+                "generated_token_ids": [7],
+                "generation_tokens": 1,
+                "peak_memory_gb": 42.0,
+            },
+        ]
+    )
+    monkeypatch.setattr(benchmark.mx, "reset_peak_memory", reset_fails, raising=False)
+    monkeypatch.setattr(benchmark, "stream_dflash_generate", lambda **_kwargs: stream)
+
+    result = benchmark._generate_dflash_stream_once(
+        target_model=object(),
+        target_ops=object(),
+        tokenizer=_BenchmarkTokenizer(),
+        draft_model=object(),
+        draft_backend=object(),
+        prompt="prompt",
+        max_new_tokens=1,
+        use_chat_template=False,
+        block_tokens=16,
+        stop_token_ids=[],
+        suppress_token_ids=None,
+        runtime_context=object(),
+    )
+
+    assert stream.closed is True
+    assert result["peak_memory_gb"] is None
+    assert "dflash peak memory reset failed" in capsys.readouterr().err
+
+
+def test_benchmark_cleanup_failure_is_reported(monkeypatch, capsys):
+    def clear_cache_fails():
+        raise RuntimeError("clear failed")
+
+    def metal_clear_cache_fails():
+        raise RuntimeError("metal clear failed")
+
+    monkeypatch.setattr(benchmark.mx, "clear_cache", clear_cache_fails, raising=False)
+    monkeypatch.setattr(
+        benchmark.mx,
+        "metal",
+        SimpleNamespace(clear_cache=metal_clear_cache_fails),
+        raising=False,
+    )
+
+    benchmark._release_loaded_models()
+
+    err = capsys.readouterr().err
+    assert "MLX cache cleanup failed" in err
+    assert "clear failed" in err
+    assert "metal clear failed" in err
+
+
+def test_benchmark_cleanup_primary_failure_with_fallback_success_is_reported(monkeypatch, capsys):
+    fallback_calls = 0
+
+    def clear_cache_fails():
+        raise RuntimeError("clear failed")
+
+    def metal_clear_cache_succeeds():
+        nonlocal fallback_calls
+        fallback_calls += 1
+
+    monkeypatch.setattr(benchmark.mx, "clear_cache", clear_cache_fails, raising=False)
+    monkeypatch.setattr(
+        benchmark.mx,
+        "metal",
+        SimpleNamespace(clear_cache=metal_clear_cache_succeeds),
+        raising=False,
+    )
+
+    benchmark._release_loaded_models()
+
+    err = capsys.readouterr().err
+    assert fallback_calls == 1
+    assert "used metal.clear_cache after clear_cache failed" in err
+    assert "clear failed" in err
 
 
 def _patch_benchmark_target(monkeypatch, *, resolved_model_ref: str = "target"):

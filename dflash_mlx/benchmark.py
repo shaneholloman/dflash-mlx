@@ -87,7 +87,7 @@ def _git_hash_short() -> str:
         return subprocess.check_output(
             ["git", "rev-parse", "--short", "HEAD"], text=True, stderr=subprocess.DEVNULL
         ).strip()
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         return "unknown"
 
 def _package_version(name: str) -> str:
@@ -125,8 +125,8 @@ def _get_thermal_pressure() -> str:
             if val >= 50:
                 return "serious"
             return "critical"
-    except Exception:
-        pass
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return "unknown"
     return "unknown"
 
 def _warn_if_throttled(thermal_pressure: str) -> None:
@@ -137,6 +137,28 @@ def _warn_if_throttled(thermal_pressure: str) -> None:
         "Increase --cooldown or wait for chip to cool.",
         file=sys.stderr,
     )
+
+def _warn_benchmark(message: str) -> None:
+    print(f"WARNING: {message}", file=sys.stderr)
+
+def _reset_peak_memory_for_benchmark(label: str) -> bool:
+    reset = getattr(mx, "reset_peak_memory", None)
+    if reset is None:
+        return False
+    try:
+        reset()
+        return True
+    except Exception as exc:
+        _warn_benchmark(
+            f"{label} peak memory reset failed: "
+            f"{type(exc).__name__}: {exc}; peak memory will be omitted."
+        )
+        return False
+
+def _peak_memory_gb_if_reset(reset_ok: bool) -> float | None:
+    if not reset_ok or not hasattr(mx, "get_peak_memory"):
+        return None
+    return float(mx.get_peak_memory()) / 1e9
 
 def _slugify_model_ref(model_ref: str | None) -> str:
     resolved = resolve_model_ref(model_ref, kind="target")
@@ -402,11 +424,7 @@ def _generate_stock_baseline_once(
     use_chat_template: bool = True,
     prompt_tokens_override: list[int] | None = None,
 ) -> dict[str, Any]:
-    if hasattr(mx, "reset_peak_memory"):
-        try:
-            mx.reset_peak_memory()
-        except Exception:
-            pass
+    memory_reset_ok = _reset_peak_memory_for_benchmark("baseline")
 
     if prompt_tokens_override is not None:
         baseline_input: Any = list(prompt_tokens_override)
@@ -424,12 +442,14 @@ def _generate_stock_baseline_once(
     if no_eos:
         try:
             tokenizer.eos_token_ids = set()
-        except Exception:
+        except (AttributeError, TypeError, ValueError):
             tokenizer.eos_token_ids = []
         try:
             tokenizer.eos_token_id = None
-        except Exception:
-            pass
+        except (AttributeError, TypeError, ValueError) as exc:
+            _warn_benchmark(
+                f"tokenizer eos_token_id could not be cleared for --no-eos: {exc}"
+            )
 
     generated_token_ids: list[int] = []
     final_response = None
@@ -457,7 +477,7 @@ def _generate_stock_baseline_once(
             "prompt_token_count": prompt_tokens,
             "generated_token_ids": [],
             "generation_tokens": 0,
-            "peak_memory_gb": float(mx.get_peak_memory()) / 1e9 if hasattr(mx, "get_peak_memory") else None,
+            "peak_memory_gb": _peak_memory_gb_if_reset(memory_reset_ok),
         }
 
     prompt_tokens = int(final_response.prompt_tokens)
@@ -473,7 +493,9 @@ def _generate_stock_baseline_once(
         "generated_token_ids": generated_token_ids,
         "generation_tokens": generation_tokens,
         "generation_tps": generation_tps,
-        "peak_memory_gb": float(final_response.peak_memory),
+        "peak_memory_gb": (
+            float(final_response.peak_memory) if memory_reset_ok else None
+        ),
     }
 
 def _generate_dflash_stream_once(
@@ -492,11 +514,7 @@ def _generate_dflash_stream_once(
     runtime_context: RuntimeContext,
     prompt_tokens_override: list[int] | None = None,
 ) -> dict[str, Any]:
-    if hasattr(mx, "reset_peak_memory"):
-        try:
-            mx.reset_peak_memory()
-        except Exception:
-            pass
+    memory_reset_ok = _reset_peak_memory_for_benchmark("dflash")
 
     start_ns = time.perf_counter_ns()
     first_token_us: float | None = None
@@ -528,6 +546,8 @@ def _generate_dflash_stream_once(
 
     if summary is None:
         raise RuntimeError("DFlash stream did not yield a summary event")
+    if not memory_reset_ok:
+        summary["peak_memory_gb"] = None
 
     summary["ttft_us"] = (
         first_token_us
@@ -538,17 +558,33 @@ def _generate_dflash_stream_once(
 
 def _release_loaded_models() -> None:
     gc.collect()
+    clear_error: Exception | None = None
     if hasattr(mx, "clear_cache"):
         try:
             mx.clear_cache()
             return
-        except Exception:
-            pass
+        except Exception as exc:
+            clear_error = exc
     if hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
         try:
             mx.metal.clear_cache()
-        except Exception:
-            pass
+            if clear_error is not None:
+                _warn_benchmark(
+                    f"MLX cache cleanup used metal.clear_cache after "
+                    f"clear_cache failed: {clear_error}"
+                )
+            return
+        except Exception as exc:
+            if clear_error is None:
+                clear_error = exc
+            else:
+                _warn_benchmark(
+                    f"MLX cache cleanup failed: clear_cache={clear_error}; "
+                    f"metal.clear_cache={exc}"
+                )
+                return
+    if clear_error is not None:
+        _warn_benchmark(f"MLX cache cleanup failed: {clear_error}")
 
 def _run_once_sequential(
     *,

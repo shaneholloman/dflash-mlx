@@ -37,6 +37,15 @@ L2_LAYOUT_ROOT = "v1"
 _VALID_KINDS = ("prefill", "generation")
 _HEX = set("0123456789abcdef")
 
+def _is_json_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+def _json_int_field(d: dict[str, Any], name: str) -> int:
+    value = d[name]
+    if not _is_json_int(value):
+        raise ValueError(f"expected integer key field {name!r}")
+    return value
+
 def _key_to_dict(key: DFlashPrefixKey) -> dict[str, Any]:
     return {
         "target_model_id": key.target_model_id,
@@ -49,14 +58,28 @@ def _key_to_dict(key: DFlashPrefixKey) -> dict[str, Any]:
     }
 
 def _key_from_dict(d: dict[str, Any]) -> DFlashPrefixKey:
+    if not isinstance(d, dict):
+        raise ValueError("expected key metadata object")
+    target_model_id = d["target_model_id"]
+    draft_model_id = d["draft_model_id"]
+    capture_layer_ids = d["capture_layer_ids"]
+    if not isinstance(target_model_id, str):
+        raise ValueError("expected string target_model_id")
+    if not isinstance(draft_model_id, str):
+        raise ValueError("expected string draft_model_id")
+    if (
+        not isinstance(capture_layer_ids, list)
+        or not all(_is_json_int(x) for x in capture_layer_ids)
+    ):
+        raise ValueError("expected integer capture_layer_ids")
     return DFlashPrefixKey(
-        target_model_id=str(d["target_model_id"]),
-        draft_model_id=str(d["draft_model_id"]),
-        capture_layer_ids=tuple(int(x) for x in d["capture_layer_ids"]),
-        draft_sink_size=int(d["draft_sink_size"]),
-        draft_window_size=int(d["draft_window_size"]),
-        target_fa_window=int(d.get("target_fa_window", 0)),
-        format_version=int(d.get("format_version", 1)),
+        target_model_id=target_model_id,
+        draft_model_id=draft_model_id,
+        capture_layer_ids=tuple(capture_layer_ids),
+        draft_sink_size=_json_int_field(d, "draft_sink_size"),
+        draft_window_size=_json_int_field(d, "draft_window_size"),
+        target_fa_window=_json_int_field(d, "target_fa_window"),
+        format_version=_json_int_field(d, "format_version"),
     )
 
 def _canon_key_blob(key: DFlashPrefixKey) -> bytes:
@@ -310,12 +333,7 @@ class DFlashPrefixL2Cache:
         self._stop = threading.Event()
         self._lock_fp = self._try_acquire_dir_lock()
 
-        try:
-            self._tracked_disk_bytes = sum(
-                p.stat().st_size for p in self._walk_snapshots()
-            )
-        except OSError:
-            self._tracked_disk_bytes = 0
+        self._tracked_disk_bytes = self._snapshot_disk_bytes()
 
         if self.writable:
             self._writer_thread: Optional[threading.Thread] = threading.Thread(
@@ -446,12 +464,9 @@ class DFlashPrefixL2Cache:
                     self._stats["materialize_errors"] += 1
             self._writer_slots.release()
             return
-        except Exception as e:
-            _LOG.warning("L2 materialize failed: %s", e)
-            with self._lock:
-                self._stats["materialize_errors"] += 1
+        except Exception:
             self._writer_slots.release()
-            return
+            raise
 
         self._write_queue.put(payload)
 
@@ -482,8 +497,8 @@ class DFlashPrefixL2Cache:
     def __del__(self):
         try:
             self.shutdown(wait=False)
-        except Exception:
-            pass
+        except Exception as exc:
+            _LOG.debug("L2 finalizer shutdown failed: %s", exc)
 
     def _writer_loop(self) -> None:
         while True:
@@ -520,11 +535,6 @@ class DFlashPrefixL2Cache:
                 _LOG.warning("L2 sync write materialize failed: %s", e)
                 with self._lock:
                     self._stats["materialize_errors"] += 1
-            return
-        except Exception as e:
-            _LOG.warning("L2 sync write materialize failed: %s", e)
-            with self._lock:
-                self._stats["materialize_errors"] += 1
             return
         self._write_payload(payload)
 
@@ -655,12 +665,23 @@ class DFlashPrefixL2Cache:
             return None
         try:
             meta = json.loads(meta_raw)
-        except Exception:
+        except (TypeError, json.JSONDecodeError):
             with self._lock:
                 self._stats["schema_rejects"] += 1
             self._unlink_if_writable(path)
             return None
-        if int(meta.get("schema_version", 0)) != L2_SCHEMA_VERSION:
+        if not isinstance(meta, dict):
+            with self._lock:
+                self._stats["schema_rejects"] += 1
+            self._unlink_if_writable(path)
+            return None
+        schema_version = meta.get("schema_version")
+        if not _is_json_int(schema_version):
+            with self._lock:
+                self._stats["schema_rejects"] += 1
+            self._unlink_if_writable(path)
+            return None
+        if schema_version != L2_SCHEMA_VERSION:
             with self._lock:
                 self._stats["schema_rejects"] += 1
             self._unlink_if_writable(path)
@@ -672,7 +693,7 @@ class DFlashPrefixL2Cache:
             return None
         try:
             file_key = _key_from_dict(meta["key"])
-        except Exception:
+        except (KeyError, TypeError, ValueError):
             with self._lock:
                 self._stats["schema_rejects"] += 1
             self._unlink_if_writable(path)
@@ -683,7 +704,18 @@ class DFlashPrefixL2Cache:
                 self._stats["schema_rejects"] += 1
             self._unlink_if_writable(path)
             return None
-        file_tokens = meta.get("token_ids", [])
+        file_tokens_raw = meta.get("token_ids")
+        if not isinstance(file_tokens_raw, list):
+            with self._lock:
+                self._stats["schema_rejects"] += 1
+            self._unlink_if_writable(path)
+            return None
+        if not all(_is_json_int(t) for t in file_tokens_raw):
+            with self._lock:
+                self._stats["schema_rejects"] += 1
+            self._unlink_if_writable(path)
+            return None
+        file_tokens = tuple(file_tokens_raw)
         n = len(file_tokens)
         if n != parts.token_len:
             with self._lock:
@@ -692,7 +724,7 @@ class DFlashPrefixL2Cache:
             return None
         if n == 0 or n > len(req_tokens):
             return None
-        if tuple(req_tokens[:n]) != tuple(int(t) for t in file_tokens):
+        if tuple(req_tokens[:n]) != file_tokens:
 
             return None
         if str(meta.get("kind", "")) != parts.kind:
@@ -713,16 +745,11 @@ class DFlashPrefixL2Cache:
         if not self.writable:
             return
         try:
-            sz = path.stat().st_size
-        except OSError:
-            sz = 0
-        try:
             path.unlink()
         except OSError:
             return
-        if sz > 0:
-            with self._lock:
-                self._tracked_disk_bytes = max(0, self._tracked_disk_bytes - sz)
+        with self._lock:
+            self._tracked_disk_bytes = self._snapshot_disk_bytes()
 
     def _walk_snapshots(self):
         root = self._layout_root()
@@ -758,6 +785,15 @@ class DFlashPrefixL2Cache:
                             continue
                         yield path
 
+    def _snapshot_disk_bytes(self) -> int:
+        total = 0
+        for path in self._walk_snapshots():
+            try:
+                total += path.stat().st_size
+            except OSError:
+                continue
+        return total
+
     def _evict_to_budget(self) -> None:
         if not self.writable or self._max_bytes <= 0:
             return
@@ -783,7 +819,7 @@ class DFlashPrefixL2Cache:
                 continue
             with self._lock:
                 self._stats["evictions"] += 1
-                self._tracked_disk_bytes = max(0, self._tracked_disk_bytes - sz)
+                self._tracked_disk_bytes = self._snapshot_disk_bytes()
 
     def clear(self) -> None:
         if not self.writable:
@@ -792,5 +828,9 @@ class DFlashPrefixL2Cache:
             self._epoch += 1
             root = self._layout_root()
             if root.is_dir():
-                shutil.rmtree(root, ignore_errors=True)
+                try:
+                    shutil.rmtree(root)
+                except OSError:
+                    self._tracked_disk_bytes = self._snapshot_disk_bytes()
+                    raise
             self._tracked_disk_bytes = 0

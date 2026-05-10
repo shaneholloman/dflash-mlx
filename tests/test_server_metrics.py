@@ -5,8 +5,11 @@
 from __future__ import annotations
 
 import json
+import builtins
 from io import BytesIO
 from types import SimpleNamespace
+
+import pytest
 
 from dflash_mlx.cache.manager import RuntimeCacheManager
 from dflash_mlx.cache.prefix_l1 import DFlashPrefixCache
@@ -58,7 +61,7 @@ def _configure_metrics(runtime_config=None):
         version="test-version",
         model_provider=SimpleNamespace(
             model_key=("target-model", None, "draft-model"),
-            draft_model=SimpleNamespace(target_layer_ids=()),
+            draft_model=SimpleNamespace(target_layer_ids=(3, 7)),
             cli_args=SimpleNamespace(
                 model="target-model",
                 draft_model=None,
@@ -266,6 +269,13 @@ def test_metrics_startup_clears_stale_cache_when_runtime_disables_prefix_cache(m
     )
     monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", ("old",))
     monkeypatch.setattr(DFlashPrefixCache, "shutdown", tracked_shutdown)
+    monkeypatch.setattr(
+        metrics_mod,
+        "build_prefix_key",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("disabled prefix cache should not build a cache key")
+        ),
+    )
     reset_live_metrics_for_tests()
 
     _configure_metrics(_runtime_config(prefix_cache=False, target_fa_window=2048))
@@ -311,6 +321,20 @@ def test_metrics_startup_preserves_request_cache_identity(monkeypatch):
     configure_live_metrics(version="test-version", model_provider=model_provider)
 
     assert cache_manager_mod.current_runtime_cache_manager() is existing
+
+
+def test_metrics_endpoint_treats_retired_prefix_cache_manager_as_absent(monkeypatch):
+    reset_live_metrics_for_tests()
+    _configure_metrics()
+    manager = RuntimeCacheManager(DFlashPrefixCache())
+    manager.shutdown()
+    monkeypatch.setattr(serve, "_current_runtime_cache_manager", lambda: manager)
+
+    payload = _call_metrics_endpoint()
+
+    assert payload["prefix_cache"]["entries"] == 0
+    assert payload["totals"]["cache_hits"] == 0
+    assert payload["totals"]["cache_misses"] == 0
 
 
 def test_post_request_memory_line_logs_snapshot(monkeypatch, capsys):
@@ -371,6 +395,53 @@ def test_post_request_memory_line_stderr_and_fallback_failure_does_not_raise(mon
     _patch_memory_snapshot(monkeypatch)
 
     write_post_request_memory_line(request_id=11)
+
+
+def test_current_rss_bytes_propagates_programmer_errors(monkeypatch):
+    monkeypatch.setattr(metrics_mod.sys, "platform", "linux")
+
+    def broken_open(*_args, **_kwargs):
+        raise TypeError("broken open contract")
+
+    monkeypatch.setattr(builtins, "open", broken_open)
+
+    with pytest.raises(TypeError, match="broken open contract"):
+        metrics_mod._current_rss_bytes()
+
+
+def test_darwin_rss_helpers_propagate_programmer_errors(monkeypatch):
+    def broken_cdll(*_args, **_kwargs):
+        raise TypeError("broken ctypes contract")
+
+    monkeypatch.setattr(metrics_mod.ctypes, "CDLL", broken_cdll)
+
+    with pytest.raises(TypeError, match="broken ctypes contract"):
+        metrics_mod._darwin_proc_resident_size_bytes()
+    with pytest.raises(TypeError, match="broken ctypes contract"):
+        metrics_mod._darwin_task_resident_size_bytes()
+
+
+def test_rss_peak_propagates_programmer_errors(monkeypatch):
+    monkeypatch.setattr(
+        metrics_mod.resource,
+        "getrusage",
+        lambda _kind: SimpleNamespace(ru_maxrss=object()),
+    )
+
+    with pytest.raises(TypeError):
+        metrics_mod._rss_peak_gb()
+
+
+def test_mlx_memory_probe_propagates_programmer_errors(monkeypatch):
+    import mlx.core as mx
+
+    def broken_getter():
+        raise TypeError("broken mlx memory contract")
+
+    monkeypatch.setattr(mx, "get_active_memory", broken_getter)
+
+    with pytest.raises(TypeError, match="broken mlx memory contract"):
+        metrics_mod._mlx_memory_gb("get_active_memory")
 
 
 def test_summary_line_stderr_failure_does_not_raise(monkeypatch):

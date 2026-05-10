@@ -126,7 +126,7 @@ def _git(args: list[str]) -> str:
             text=True,
             stderr=subprocess.DEVNULL,
         ).strip()
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         return "unknown"
 
 def _git_dirty() -> bool:
@@ -137,7 +137,7 @@ def _git_dirty() -> bool:
             stderr=subprocess.DEVNULL,
         )
         return bool(out.strip())
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         return True
 
 def _package_version(package: str) -> str:

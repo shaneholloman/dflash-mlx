@@ -27,21 +27,39 @@ class PrefixCacheLookupResult:
     elapsed_ms: float
 
 
+class RuntimeCacheManagerClosed(RuntimeError):
+    pass
+
+
 class RuntimeCacheManager:
     def __init__(self, cache: DFlashPrefixCache) -> None:
         self._cache = cache
+        self._state_lock = threading.RLock()
+        self._retired = False
+        self._shutdown_complete = False
 
     def set_trace_config(self, trace_config: Any) -> None:
-        self._cache.set_trace_config(trace_config)
+        with self._state_lock:
+            self._ensure_open_locked()
+            self._cache.set_trace_config(trace_config)
 
     def shutdown(self) -> None:
-        self._cache.shutdown()
+        with self._state_lock:
+            if self._shutdown_complete:
+                return
+            self._retired = True
+            self._cache.shutdown()
+            self._shutdown_complete = True
 
     def stats(self) -> dict[str, Any]:
-        return self._cache.stats()
+        with self._state_lock:
+            self._ensure_open_locked()
+            return self._cache.stats()
 
     def memory_waterfall_bytes(self) -> dict[str, int]:
-        return self._cache.memory_waterfall_bytes()
+        with self._state_lock:
+            self._ensure_open_locked()
+            return self._cache.memory_waterfall_bytes()
 
     def lookup(
         self,
@@ -49,7 +67,9 @@ class RuntimeCacheManager:
         key: DFlashPrefixKey,
     ) -> PrefixCacheLookupResult:
         lookup_t0 = time.perf_counter_ns()
-        matched_len, snapshot = self._cache.lookup(tokens, key)
+        with self._state_lock:
+            self._ensure_open_locked()
+            matched_len, snapshot = self._cache.lookup(tokens, key)
         return PrefixCacheLookupResult(
             matched_tokens=int(matched_len),
             snapshot=snapshot,
@@ -71,10 +91,14 @@ class RuntimeCacheManager:
         if snapshot.kind != kind:
             raise ValueError(f"expected {kind!r} prefix snapshot, got {snapshot.kind!r}")
         if require_logits and snapshot.last_logits is None:
-            return 0.0
+            raise ValueError("prefix snapshot requires last_logits")
         insert_t0 = time.perf_counter_ns()
         try:
-            self._cache.insert(snapshot)
+            with self._state_lock:
+                self._ensure_open_locked()
+                self._cache.insert(snapshot)
+        except RuntimeCacheManagerClosed:
+            raise
         except Exception as exc:
             _log_insert_failure(kind, exc)
             raise
@@ -89,7 +113,17 @@ class RuntimeCacheManager:
         return elapsed_ms
 
     def log_stats(self, label: str = "") -> None:
-        _format_stats_line(self._cache, label)
+        with self._state_lock:
+            self._ensure_open_locked()
+            _format_stats_line(self._cache, label)
+
+    def _ensure_open_locked(self) -> None:
+        if self._retired:
+            raise RuntimeCacheManagerClosed("runtime cache manager is shut down")
+
+    def _is_retired(self) -> bool:
+        with self._state_lock:
+            return self._retired
 
 
 def get_runtime_cache_manager(
@@ -105,21 +139,23 @@ def get_runtime_cache_manager(
         return None
     config_key = _prefix_cache_config_key(runtime_context, cache_identity=cache_identity)
     trace_config = runtime_context.diagnostics.trace
-    manager = _DFLASH_RUNTIME_CACHE_MANAGER
-    if manager is not None and _DFLASH_RUNTIME_CACHE_CONFIG_KEY == config_key:
-        manager.set_trace_config(trace_config)
-        return manager
     with _DFLASH_RUNTIME_CACHE_LOCK:
         manager = _DFLASH_RUNTIME_CACHE_MANAGER
-        if manager is not None and _DFLASH_RUNTIME_CACHE_CONFIG_KEY == config_key:
+        if (
+            manager is not None
+            and _DFLASH_RUNTIME_CACHE_CONFIG_KEY == config_key
+            and not manager._is_retired()
+        ):
             manager.set_trace_config(trace_config)
             return manager
-        _shutdown_manager(manager)
-        _DFLASH_RUNTIME_CACHE_MANAGER = RuntimeCacheManager(
-            _make_prefix_cache(runtime_context)
-        )
+        if manager is not None:
+            _shutdown_manager(manager)
+            _DFLASH_RUNTIME_CACHE_MANAGER = None
+            _DFLASH_RUNTIME_CACHE_CONFIG_KEY = None
+        manager = RuntimeCacheManager(_make_prefix_cache(runtime_context))
+        _DFLASH_RUNTIME_CACHE_MANAGER = manager
         _DFLASH_RUNTIME_CACHE_CONFIG_KEY = config_key
-    return _DFLASH_RUNTIME_CACHE_MANAGER
+        return manager
 
 
 def sync_runtime_cache_manager(
@@ -133,19 +169,26 @@ def sync_runtime_cache_manager(
     if _runtime_cache_disabled(runtime_context):
         _clear_runtime_cache_manager()
         return None
-    manager = _DFLASH_RUNTIME_CACHE_MANAGER
-    if manager is None:
-        return None
     config_key = _prefix_cache_config_key(runtime_context, cache_identity=cache_identity)
-    if _DFLASH_RUNTIME_CACHE_CONFIG_KEY != config_key:
-        _clear_runtime_cache_manager()
-        return None
-    manager.set_trace_config(runtime_context.diagnostics.trace)
-    return manager
+    with _DFLASH_RUNTIME_CACHE_LOCK:
+        manager = _DFLASH_RUNTIME_CACHE_MANAGER
+        if manager is None:
+            return None
+        if _DFLASH_RUNTIME_CACHE_CONFIG_KEY != config_key or manager._is_retired():
+            _shutdown_manager(manager)
+            _DFLASH_RUNTIME_CACHE_MANAGER = None
+            _DFLASH_RUNTIME_CACHE_CONFIG_KEY = None
+            return None
+        manager.set_trace_config(runtime_context.diagnostics.trace)
+        return manager
 
 
 def current_runtime_cache_manager() -> Optional[RuntimeCacheManager]:
-    return _DFLASH_RUNTIME_CACHE_MANAGER
+    with _DFLASH_RUNTIME_CACHE_LOCK:
+        manager = _DFLASH_RUNTIME_CACHE_MANAGER
+        if manager is None or manager._is_retired():
+            return None
+        return manager
 
 
 def shutdown_runtime_cache_manager() -> None:
@@ -156,16 +199,9 @@ def _clear_runtime_cache_manager(*, raise_on_error: bool = True) -> None:
     global _DFLASH_RUNTIME_CACHE_CONFIG_KEY, _DFLASH_RUNTIME_CACHE_MANAGER
     with _DFLASH_RUNTIME_CACHE_LOCK:
         manager = _DFLASH_RUNTIME_CACHE_MANAGER
-        config_key = _DFLASH_RUNTIME_CACHE_CONFIG_KEY
-        _DFLASH_RUNTIME_CACHE_MANAGER = None
-        _DFLASH_RUNTIME_CACHE_CONFIG_KEY = None
-    try:
-        _shutdown_manager(manager, raise_on_error=raise_on_error)
-    except Exception:
-        with _DFLASH_RUNTIME_CACHE_LOCK:
-            _DFLASH_RUNTIME_CACHE_MANAGER = manager
-            _DFLASH_RUNTIME_CACHE_CONFIG_KEY = config_key
-        raise
+        if _shutdown_manager(manager, raise_on_error=raise_on_error):
+            _DFLASH_RUNTIME_CACHE_MANAGER = None
+            _DFLASH_RUNTIME_CACHE_CONFIG_KEY = None
 
 
 def _prefix_cache_config_key(
@@ -194,11 +230,12 @@ def _shutdown_manager(
     manager: Optional[RuntimeCacheManager],
     *,
     raise_on_error: bool = True,
-) -> None:
+) -> bool:
     if manager is None:
-        return
+        return True
     try:
         manager.shutdown()
+        return True
     except Exception as exc:
         sys.stderr.write(
             f"{time.strftime('%Y-%m-%d %H:%M:%S')} "
@@ -207,6 +244,7 @@ def _shutdown_manager(
         sys.stderr.flush()
         if raise_on_error:
             raise
+        return False
 
 
 def _make_prefix_cache(runtime_context: Any) -> DFlashPrefixCache:
@@ -225,7 +263,7 @@ def _make_prefix_cache(runtime_context: Any) -> DFlashPrefixCache:
                 f"(dir={l2.cache_dir}, max_bytes={runtime_config.prefix_cache_l2_max_bytes}, "
                 f"writable={l2.writable})\n"
             )
-        except Exception as exc:
+        except OSError as exc:
             sys.stderr.write(
                 f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] prefix L2 cache disabled: {exc}\n"
             )

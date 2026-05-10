@@ -72,6 +72,13 @@ def test_doctor_load_model_uses_runtime_bundle(monkeypatch, capsys):
     def fake_load_runtime_bundle(**kwargs):
         calls.append(kwargs)
         return SimpleNamespace(
+            target_model=object(),
+            tokenizer=object(),
+            target_meta={},
+            draft_model=object(),
+            draft_meta={},
+            draft_backend=object(),
+            target_ops=object(),
             resolved_model_ref="Qwen/Qwen3.5-9B",
             resolved_draft_ref="manual/draft",
         )
@@ -95,6 +102,43 @@ def test_doctor_load_model_uses_runtime_bundle(monkeypatch, capsys):
         "model": "Qwen/Qwen3.5-9B",
         "draft": "manual/draft",
     }
+
+
+def test_doctor_scripts_reject_non_callable_entrypoint(monkeypatch):
+    import dflash_mlx.cli as cli
+
+    monkeypatch.setattr(cli, "main", object())
+
+    check = doctor._check_scripts_importable()
+
+    assert check.status == "fatal"
+    assert "not callable" in check.details["dflash"]["error"]
+
+
+def test_doctor_load_model_rejects_incomplete_runtime_bundle(monkeypatch, capsys):
+    _clear_doctor_env(monkeypatch)
+
+    import dflash_mlx.runtime_bundle as runtime_bundle
+
+    def fake_load_runtime_bundle(**_kwargs):
+        return SimpleNamespace(
+            resolved_model_ref="Qwen/Qwen3.5-9B",
+            resolved_draft_ref="manual/draft",
+        )
+
+    monkeypatch.setattr(runtime_bundle, "load_runtime_bundle", fake_load_runtime_bundle)
+
+    code, report = _json_run(
+        ["--model", "Qwen/Qwen3.5-9B", "--draft", "manual/draft", "--load-model"],
+        capsys,
+    )
+
+    assert code == 1
+    load_check = next(check for check in report["checks"] if check["name"] == "load_model")
+    assert load_check["status"] == "fatal"
+    assert "runtime bundle is incomplete" in load_check["details"]["error"]
+    assert "target_model" in load_check["details"]["error"]
+
 
 def test_doctor_warns_on_target_fa_window(monkeypatch, capsys):
     _clear_doctor_env(monkeypatch)

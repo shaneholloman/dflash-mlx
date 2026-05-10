@@ -58,7 +58,7 @@ def _resolve_local_model_path(model_ref: str | Path) -> Path:
         return candidate
     try:
         from huggingface_hub import snapshot_download
-    except Exception as exc:
+    except ImportError as exc:
         raise FileNotFoundError(
             f"Model path does not exist and huggingface_hub is unavailable: {model_ref}"
         ) from exc
@@ -117,12 +117,17 @@ def _draft_lm_head_weight_names(model_path: Path) -> list[str]:
             for name in weight_map
             if str(name).startswith("lm_head.")
         )
+    weight_files = sorted(model_path.glob("model*.safetensors"))
+    if not weight_files:
+        return []
     try:
         from safetensors import safe_open
-    except ImportError:
-        return []
+    except ImportError as exc:
+        raise ValueError(
+            f"Cannot inspect draft safetensors weights for unsupported lm_head: {model_path}"
+        ) from exc
     names: list[str] = []
-    for path in sorted(model_path.glob("model*.safetensors")):
+    for path in weight_files:
         with safe_open(str(path), framework="mlx") as handle:
             names.extend(
                 str(name)

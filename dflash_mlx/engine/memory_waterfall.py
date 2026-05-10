@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 import platform
 import resource
@@ -15,6 +16,7 @@ import mlx.core as mx
 from dflash_mlx.diagnostics import DiagnosticsConfig
 
 _GB = 1_000_000_000.0
+_MISSING = object()
 
 def memory_waterfall_enabled(diagnostics: Optional[DiagnosticsConfig] = None) -> bool:
     return bool(diagnostics is not None and diagnostics.memory_waterfall)
@@ -217,7 +219,7 @@ def _current_rss_bytes() -> int:
         ).decode().strip()
         if out:
             return int(float(out) * 1024.0)
-    except Exception:
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError, ValueError):
         pass
     ru = resource.getrusage(resource.RUSAGE_SELF)
     raw = int(ru.ru_maxrss)
@@ -235,7 +237,7 @@ def _system_wired_bytes() -> int:
             stderr=subprocess.DEVNULL,
             timeout=2,
         )
-    except Exception:
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
         return 0
     page_size = 4096
     wired_pages = 0
@@ -258,7 +260,7 @@ def _mlx_memory_bytes(name: str) -> int:
         return 0
     try:
         return int(fn())
-    except Exception:
+    except RuntimeError:
         return 0
 
 def _to_gb(value: Any) -> float:
@@ -288,10 +290,8 @@ def _kv_cache_nbytes(cache: Any) -> int:
     if hasattr(cache, "keys") or hasattr(cache, "values"):
         total += tree_nbytes([getattr(cache, "keys", None), getattr(cache, "values", None)])
     state = None
-    try:
+    if inspect.getattr_static(cache, "state", _MISSING) is not _MISSING:
         state = getattr(cache, "state")
-    except Exception:
-        state = None
     if state is not None:
         total += tree_nbytes(state)
     return int(total)

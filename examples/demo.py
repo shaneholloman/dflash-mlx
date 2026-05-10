@@ -19,6 +19,7 @@ from mlx_lm.generate import stream_generate as mlx_stream_generate
 from mlx_lm.utils import load as load_pristine_target
 
 from dflash_mlx.draft_backend import DraftBackend
+from dflash_mlx.generate import decode_token
 from dflash_mlx.runtime import (
     _prepare_prompt_tokens,
     stream_dflash_generate,
@@ -144,12 +145,6 @@ def _finalize_output(
         sys.stdout.write(footer)
         sys.stdout.write("\n")
     sys.stdout.flush()
-
-def _maybe_decode_token(tokenizer: Any, token_id: int) -> str:
-    try:
-        return str(tokenizer.decode([int(token_id)]))
-    except Exception:
-        return str(tokenizer.decode(int(token_id)))
 
 def _live_tps(first_token_at: Optional[float], token_count: int) -> float:
     if first_token_at is None or token_count <= 0:
@@ -410,7 +405,7 @@ def run_dflash(
         if event["event"] == "token":
             if first_token_at is None:
                 first_token_at = time.monotonic()
-            token_text = _maybe_decode_token(tokenizer, int(event["token_id"]))
+            token_text = decode_token(tokenizer, int(event["token_id"]))
             sys.stdout.write(token_text)
             sys.stdout.flush()
             token_count = int(event["generated_tokens"])

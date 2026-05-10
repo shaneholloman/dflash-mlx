@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from dflash_mlx.cache.manager import (
+    RuntimeCacheManagerClosed,
     RuntimeCacheManager,
     get_runtime_cache_manager,
 )
@@ -53,11 +54,12 @@ class PrefixCacheFlow:
         return self.cache_manager is not None
 
     def prefix_cache_memory_bytes(self) -> Optional[dict[str, int]]:
-        return (
-            None
-            if self.cache_manager is None
-            else self.cache_manager.memory_waterfall_bytes()
-        )
+        if self.cache_manager is None:
+            return None
+        try:
+            return self.cache_manager.memory_waterfall_bytes()
+        except RuntimeCacheManagerClosed:
+            return None
 
     @classmethod
     def for_request(
@@ -72,6 +74,11 @@ class PrefixCacheFlow:
         if runtime_context is None:
             return cls(cache_manager=None)
 
+        runtime_config = runtime_context.runtime
+        if runtime_config.target_fa_window > 0 or not runtime_config.prefix_cache:
+            get_runtime_cache_manager(runtime_context)
+            return cls(cache_manager=None)
+
         key = build_prefix_key(model_provider, draft_model, runtime_context)
         cache_manager = get_runtime_cache_manager(runtime_context, cache_identity=key)
         if cache_manager is None:
@@ -84,7 +91,10 @@ class PrefixCacheFlow:
             assistant_id=assistant_id,
         )
         lookup_tokens = prompt[:stable_prefix_len]
-        lookup = cache_manager.lookup(lookup_tokens, key)
+        try:
+            lookup = cache_manager.lookup(lookup_tokens, key)
+        except RuntimeCacheManagerClosed:
+            return cls(cache_manager=None)
         hit_tokens = int(lookup.matched_tokens)
         if lookup.matched_tokens > 0:
             sys.stderr.write(
@@ -92,7 +102,10 @@ class PrefixCacheFlow:
                 f"{hit_tokens}/{len(prompt)} tokens (stable prefix {stable_prefix_len})\n"
             )
             sys.stderr.flush()
-        cache_manager.log_stats(label="lookup")
+        try:
+            cache_manager.log_stats(label="lookup")
+        except RuntimeCacheManagerClosed:
+            cache_manager = None
         return cls(
             cache_manager=cache_manager,
             key=key,
@@ -100,11 +113,15 @@ class PrefixCacheFlow:
             snapshot=lookup.snapshot,
             lookup_ms=lookup.elapsed_ms,
             hit_tokens=hit_tokens,
-            snapshot_builder=PrefixSnapshotBuilder(
-                key=key,
-                draft_model=draft_model,
-                draft_sink_size=int(runtime_context.runtime.draft_sink_size),
-                draft_window_size=int(runtime_context.runtime.draft_window_size),
+            snapshot_builder=(
+                PrefixSnapshotBuilder(
+                    key=key,
+                    draft_model=draft_model,
+                    draft_sink_size=int(runtime_context.runtime.draft_sink_size),
+                    draft_window_size=int(runtime_context.runtime.draft_window_size),
+                )
+                if cache_manager is not None
+                else None
             ),
         )
 
@@ -123,10 +140,14 @@ class PrefixCacheFlow:
     ) -> None:
         if self.cache_manager is None or self.key is None:
             return
-        insert_ms = self.cache_manager.maybe_insert_snapshot(
-            snapshot,
-            key=self.key,
-            kind=kind,
-            require_logits=require_logits,
-        )
+        try:
+            insert_ms = self.cache_manager.maybe_insert_snapshot(
+                snapshot,
+                key=self.key,
+                kind=kind,
+                require_logits=require_logits,
+            )
+        except RuntimeCacheManagerClosed:
+            self.cache_manager = None
+            return
         self.insert_ms += insert_ms

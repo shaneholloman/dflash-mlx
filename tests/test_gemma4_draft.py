@@ -3,6 +3,7 @@
 # Based on DFlash (arXiv:2602.06036)
 
 import json
+import sys
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -349,6 +350,26 @@ def test_load_draft_bundle_rejects_future_draft_owned_lm_head(tmp_path):
         assert "TargetOps.logits_from_hidden" in message
     else:
         raise AssertionError("draft checkpoints with lm_head weights must fail fast")
+
+
+def test_load_draft_bundle_requires_safetensors_for_weight_inspection(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "model.safetensors").write_bytes(b"placeholder")
+    monkeypatch.setitem(sys.modules, "safetensors", None)
+    monkeypatch.setattr(
+        runtime_loading,
+        "load_model",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("load_model should not run before lm_head inspection")
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Cannot inspect draft safetensors weights for unsupported lm_head",
+    ):
+        runtime_loading.load_draft_bundle(tmp_path)
 
 
 def test_load_draft_bundle_rejects_malformed_safetensors_index(tmp_path):

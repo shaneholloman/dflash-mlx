@@ -7,6 +7,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import mlx.core as mx
+import pytest
 
 from dflash_mlx.cache.codecs import PrefixSnapshotBuilder
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
@@ -50,10 +51,86 @@ class _FakeTargetOps:
     def cleanup_generation_caches(self, *_args) -> None:
         return None
 
+    def arm_rollback(self, *_args, **_kwargs) -> None:
+        return None
+
+    def verify_block(
+        self,
+        *,
+        target_model,
+        verify_ids,
+        target_cache,
+        capture_layer_ids,
+    ):
+        del target_model, target_cache, capture_layer_ids
+        batch, seq_len = verify_ids.shape
+        logits = mx.zeros((batch, seq_len, 8), dtype=mx.float32)
+        hidden = {1: mx.zeros((batch, seq_len, 2), dtype=mx.float32)}
+        return logits, hidden
+
+    def restore_after_acceptance(self, *_args, **_kwargs) -> int:
+        return 0
+
 
 class _FakeDraftBackend:
     def make_cache(self, **_kwargs):
         return []
+
+    def draft_greedy(self, **_kwargs):
+        block_len = int(_kwargs["block_len"])
+        return mx.zeros((max(0, block_len - 1),), dtype=mx.uint32)
+
+
+def _runtime_context():
+    return build_runtime_context(
+        runtime_config_from_profile(
+            profile="balanced",
+            prefill_step_size=4,
+            prefix_cache=False,
+            prefix_cache_l2=False,
+        )
+    )
+
+
+def _draft_model():
+    return SimpleNamespace(
+        target_layer_ids=[0],
+        block_size=4,
+        mask_token_id=0,
+    )
+
+
+def _prefix_key() -> DFlashPrefixKey:
+    return DFlashPrefixKey(
+        target_model_id="target",
+        draft_model_id="draft",
+        capture_layer_ids=(0,),
+        draft_sink_size=64,
+        draft_window_size=1024,
+        target_fa_window=0,
+    )
+
+
+def _snapshot_builder(draft_model):
+    return PrefixSnapshotBuilder(
+        key=_prefix_key(),
+        draft_model=draft_model,
+        draft_sink_size=64,
+        draft_window_size=1024,
+    )
+
+
+def _prefix_snapshot(*, token_ids=(1, 2), fa_states=(), gdn_states=(), last_logits=None):
+    return DFlashPrefixSnapshot(
+        token_ids=tuple(token_ids),
+        fa_states=fa_states,
+        gdn_states=gdn_states,
+        target_hidden_chunks=(mx.zeros((1, len(token_ids), 2), dtype=mx.float32),),
+        target_hidden_chunk_spans=((0, len(token_ids)),),
+        target_hidden_total_len=len(token_ids),
+        last_logits=last_logits,
+        key=_prefix_key(),
+    )
 
 
 def test_yield_pause_tracker_records_enabled_pause(monkeypatch):
@@ -192,6 +269,40 @@ def test_runtime_prefill_accounting_reports_warm_restore():
     assert prefill_event["prefill_tokens_computed"] == 4
 
 
+def test_prefix_snapshot_hydration_failure_raises():
+    target_ops = _FakeTargetOps()
+    draft_backend = _FakeDraftBackend()
+    draft_model = _draft_model()
+    prefix_snapshot = _prefix_snapshot(
+        fa_states=(
+            (
+                mx.zeros((1, 1, 2, 2), dtype=mx.float32),
+                mx.zeros((1, 1, 2, 2), dtype=mx.float32),
+                2,
+            ),
+        ),
+        gdn_states=(None,),
+        last_logits=mx.zeros((1, 8), dtype=mx.float32),
+    )
+
+    with pytest.raises(RuntimeError, match="prefix snapshot hydrate failed for 2 tokens"):
+        list(
+            spec_epoch.stream_dflash_generate_impl(
+                target_model=object(),
+                target_ops=target_ops,
+                tokenizer=object(),
+                draft_model=draft_model,
+                draft_backend=draft_backend,
+                prompt="unused",
+                max_new_tokens=0,
+                prompt_tokens_override=[1, 2, 3],
+                prefix_snapshot=prefix_snapshot,
+                stable_prefix_len=2,
+                runtime_context=_runtime_context(),
+            )
+        )
+
+
 def test_prefill_snapshot_event_carries_snapshot_not_live_arrays():
     target_ops = _FakeTargetOps()
     draft_backend = _FakeDraftBackend()
@@ -246,6 +357,113 @@ def test_prefill_snapshot_event_carries_snapshot_not_live_arrays():
     assert "target_cache" not in snapshot_event
     assert "target_hidden" not in snapshot_event
     assert "last_logits" not in snapshot_event
+
+
+def test_prefill_snapshot_builder_failure_propagates():
+    target_ops = _FakeTargetOps()
+    draft_backend = _FakeDraftBackend()
+    draft_model = _draft_model()
+
+    class BrokenBuilder:
+        def build(self, **_kwargs):
+            raise RuntimeError("snapshot builder broken")
+
+    with pytest.raises(RuntimeError, match="snapshot builder broken"):
+        list(
+            spec_epoch.stream_dflash_generate_impl(
+                target_model=object(),
+                target_ops=target_ops,
+                tokenizer=object(),
+                draft_model=draft_model,
+                draft_backend=draft_backend,
+                prompt="unused",
+                max_new_tokens=0,
+                prompt_tokens_override=[1, 2],
+                prefix_snapshot_builder=BrokenBuilder(),
+                runtime_context=_runtime_context(),
+            )
+        )
+
+
+def test_prefill_snapshot_builder_requires_logits_for_warm_exact_hit():
+    target_ops = _FakeTargetOps()
+    draft_backend = _FakeDraftBackend()
+    draft_model = _draft_model()
+    prefix_snapshot = _prefix_snapshot()
+
+    with pytest.raises(ValueError, match="prefill_snapshot_ready requires last_logits"):
+        list(
+            spec_epoch.stream_dflash_generate_impl(
+                target_model=object(),
+                target_ops=target_ops,
+                tokenizer=object(),
+                draft_model=draft_model,
+                draft_backend=draft_backend,
+                prompt="unused",
+                max_new_tokens=0,
+                prompt_tokens_override=[1, 2],
+                prefix_snapshot=prefix_snapshot,
+                stable_prefix_len=2,
+                prefix_snapshot_builder=_snapshot_builder(draft_model),
+                runtime_context=_runtime_context(),
+            )
+        )
+
+
+def test_warm_exact_hit_without_builder_requires_logits_before_decode():
+    target_ops = _FakeTargetOps()
+    draft_backend = _FakeDraftBackend()
+    draft_model = _draft_model()
+    prefix_snapshot = _prefix_snapshot()
+
+    with pytest.raises(
+        RuntimeError,
+        match="prefill logits unavailable after prefix snapshot restore",
+    ):
+        list(
+            spec_epoch.stream_dflash_generate_impl(
+                target_model=object(),
+                target_ops=target_ops,
+                tokenizer=object(),
+                draft_model=draft_model,
+                draft_backend=draft_backend,
+                prompt="unused",
+                max_new_tokens=0,
+                prompt_tokens_override=[1, 2],
+                prefix_snapshot=prefix_snapshot,
+                stable_prefix_len=2,
+                runtime_context=_runtime_context(),
+            )
+        )
+
+
+def test_generation_snapshot_builder_failure_propagates():
+    target_ops = _FakeTargetOps()
+    draft_backend = _FakeDraftBackend()
+    draft_model = _draft_model()
+    delegate = _snapshot_builder(draft_model)
+
+    class GenerationFailingBuilder:
+        def build(self, **kwargs):
+            if kwargs["kind"] == "generation":
+                raise RuntimeError("generation snapshot broken")
+            return delegate.build(**kwargs)
+
+    with pytest.raises(RuntimeError, match="generation snapshot broken"):
+        list(
+            spec_epoch.stream_dflash_generate_impl(
+                target_model=object(),
+                target_ops=target_ops,
+                tokenizer=object(),
+                draft_model=draft_model,
+                draft_backend=draft_backend,
+                prompt="unused",
+                max_new_tokens=1,
+                prompt_tokens_override=[1, 2],
+                prefix_snapshot_builder=GenerationFailingBuilder(),
+                runtime_context=_runtime_context(),
+            )
+        )
 
 
 def test_prefill_snapshot_event_requires_builder():

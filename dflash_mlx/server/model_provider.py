@@ -29,9 +29,9 @@ class DFlashModelProvider(mlx_server.ModelProvider):
         for attr, default in _MLX_LM_SERVER_DEFAULTS.items():
             if not hasattr(cli_args, attr):
                 setattr(cli_args, attr, default)
-        super().__init__(cli_args)
         self.target_ops = None
         self.draft_backend = None
+        super().__init__(cli_args)
 
     def load(self, model_path, adapter_path=None, draft_model_path=None):
         default_map = getattr(self, "_model_map", None)
@@ -86,13 +86,6 @@ class DFlashModelProvider(mlx_server.ModelProvider):
         if self.cli_args.use_default_chat_template and tokenizer.chat_template is None:
             tokenizer.chat_template = tokenizer.default_chat_template
 
-        self.model = model
-        self.tokenizer = tokenizer
-        self.draft_model = draft_model
-        self.draft_backend = draft_backend
-        self.target_ops = target_ops
-        self.model_key = (model_ref, None, bundle.resolved_draft_ref)
-
         try:
             mx.eval(model.parameters())
             if draft_model is not None:
@@ -100,10 +93,18 @@ class DFlashModelProvider(mlx_server.ModelProvider):
         except Exception as _eval_err:
             sys.stderr.write(
                 f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] weight "
-                f"materialize failed (non-fatal): "
+                f"materialization failed: "
                 f"{type(_eval_err).__name__}: {_eval_err}\n"
             )
             sys.stderr.flush()
+            raise RuntimeError("DFlash weight materialization failed") from _eval_err
+
+        self.model = model
+        self.tokenizer = tokenizer
+        self.draft_model = draft_model
+        self.draft_backend = draft_backend
+        self.target_ops = target_ops
+        self.model_key = (model_ref, None, bundle.resolved_draft_ref)
 
         return self.model, self.tokenizer
 
@@ -115,7 +116,7 @@ def wait_for_initial_model_load(
 ) -> None:
     start = time.perf_counter()
     announced = False
-    while model_provider.model_key is None:
+    while not _runtime_components_ready(model_provider):
         if not announced:
             sys.stderr.write(
                 f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] loading model "
@@ -125,7 +126,15 @@ def wait_for_initial_model_load(
             announced = True
         if time.perf_counter() - start > timeout_s:
             raise RuntimeError(
-                f"DFlash generation worker failed to load model within "
+                f"DFlash generation worker failed to publish a complete runtime bundle within "
                 f"{timeout_s}s; check earlier log lines for the underlying error."
             )
         time.sleep(poll_interval_s)
+
+
+def _runtime_components_ready(model_provider: DFlashModelProvider) -> bool:
+    return (
+        model_provider.model_key is not None
+        and model_provider.target_ops is not None
+        and model_provider.draft_backend is not None
+    )

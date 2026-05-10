@@ -169,6 +169,103 @@ def test_model_provider_adds_mlx_lm_server_boundary_defaults(monkeypatch):
     assert provider.target_ops is target_ops
     assert provider.draft_backend is draft_backend
 
+def test_model_provider_preserves_dflash_fields_if_parent_preloads(monkeypatch):
+    _clear_profile_env(monkeypatch)
+    target_ops = object()
+    draft_backend = object()
+
+    def fake_parent_init(self, cli_args):
+        self.cli_args = cli_args
+        self.model_key = None
+        self.model = None
+        self.tokenizer = None
+        self.draft_model = None
+        self._model_map = {"default_model": cli_args.model}
+        self.load("default_model")
+
+    monkeypatch.setattr(model_provider.mlx_server.ModelProvider, "__init__", fake_parent_init)
+    monkeypatch.setattr(
+        model_provider,
+        "load_runtime_bundle",
+        lambda **_kwargs: SimpleNamespace(
+            target_model=SimpleNamespace(parameters=lambda: []),
+            tokenizer=SimpleNamespace(chat_template=None, default_chat_template=None),
+            draft_model=SimpleNamespace(parameters=lambda: []),
+            draft_backend=draft_backend,
+            target_ops=target_ops,
+            resolved_draft_ref="draft",
+        ),
+    )
+
+    args = build_parser().parse_args(["--model", "m"])
+    normalize_cli_args(args)
+    provider = model_provider.DFlashModelProvider(args)
+
+    assert provider.model_key == ("m", None, "draft")
+    assert provider.target_ops is target_ops
+    assert provider.draft_backend is draft_backend
+
+
+def test_model_provider_materialization_failure_does_not_publish_loaded_state(monkeypatch):
+    _clear_profile_env(monkeypatch)
+
+    class FakeGroup:
+        def size(self):
+            return 1
+
+    target_ops = object()
+    draft_backend = object()
+    target_model = SimpleNamespace(parameters=lambda: ["target-param"])
+    draft_model = SimpleNamespace(parameters=lambda: ["draft-param"])
+
+    monkeypatch.setattr(model_provider.mx.distributed, "init", lambda: FakeGroup())
+    monkeypatch.setattr(
+        model_provider,
+        "load_runtime_bundle",
+        lambda **_kwargs: SimpleNamespace(
+            target_model=target_model,
+            tokenizer=SimpleNamespace(chat_template=None, default_chat_template=None),
+            draft_model=draft_model,
+            draft_backend=draft_backend,
+            target_ops=target_ops,
+            resolved_draft_ref="draft",
+        ),
+    )
+    monkeypatch.setattr(
+        model_provider.mx,
+        "eval",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("bad weights")),
+    )
+
+    args = build_parser().parse_args(["--model", "m"])
+    normalize_cli_args(args)
+    provider = model_provider.DFlashModelProvider(args)
+
+    with pytest.raises(RuntimeError, match="DFlash weight materialization failed"):
+        provider.load("default_model")
+
+    assert provider.model is None
+    assert provider.tokenizer is None
+    assert provider.draft_model is None
+    assert provider.draft_backend is None
+    assert provider.target_ops is None
+    assert provider.model_key is None
+
+
+def test_wait_for_initial_model_load_requires_complete_runtime_bundle():
+    provider = SimpleNamespace(
+        model_key=("m", None, "draft"),
+        target_ops=None,
+        draft_backend=object(),
+    )
+
+    with pytest.raises(RuntimeError, match="complete runtime bundle"):
+        model_provider.wait_for_initial_model_load(
+            provider,
+            timeout_s=0.0,
+            poll_interval_s=0.0,
+        )
+
 def test_serve_cli_prefill_step_size_is_not_decorative(monkeypatch):
     _clear_profile_env(monkeypatch)
     monkeypatch.setenv("DFLASH_PREFILL_STEP_SIZE", "8192")

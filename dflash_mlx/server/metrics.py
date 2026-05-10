@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from dflash_mlx.bench_logger import log_post as _bench_log_post
-from dflash_mlx.cache.manager import sync_runtime_cache_manager
+from dflash_mlx.cache.manager import RuntimeCacheManagerClosed, sync_runtime_cache_manager
 from dflash_mlx.diagnostics import DiagnosticsConfig
 from dflash_mlx.server.prefix_cache_manager import build_prefix_key
 
@@ -79,7 +79,7 @@ def configure_live_metrics(
     runtime_context = getattr(cli_args, "runtime_context", None)
     cache_identity: Any = tuple(model_key)
     draft_model = getattr(model_provider, "draft_model", None)
-    if runtime_context is not None and draft_model is not None:
+    if prefix_cache_enabled and runtime_context is not None and draft_model is not None:
         cache_identity = build_prefix_key(model_provider, draft_model, runtime_context)
     sync_runtime_cache_manager(runtime_context, cache_identity=cache_identity)
     metal_limits = getattr(cli_args, "metal_limits", None)
@@ -127,7 +127,8 @@ def configure_live_metrics(
         )
 
 def get_live_metrics_payload(*, prefix_cache_manager: Optional[Any] = None) -> dict[str, Any]:
-    prefix_stats = _prefix_cache_payload(prefix_cache_manager)
+    raw_prefix_stats = _prefix_cache_stats(prefix_cache_manager)
+    prefix_stats = _prefix_cache_payload(prefix_cache_manager, stats=raw_prefix_stats)
     now = time.time()
     with _LIVE_LOCK:
         server = dict(_LIVE_SERVER)
@@ -158,8 +159,8 @@ def get_live_metrics_payload(*, prefix_cache_manager: Optional[Any] = None) -> d
         "prefix_cache": prefix_stats,
         "totals": totals,
     }
-    if prefix_cache_manager is not None:
-        stats = prefix_cache_manager.stats()
+    if raw_prefix_stats is not None:
+        stats = raw_prefix_stats
         payload["totals"]["cache_hits"] = int(
             stats.get("exact_hits", 0) + stats.get("prefix_hits", 0)
         )
@@ -780,7 +781,11 @@ def _last_request_payload(
         "finish_reason": finish_reason,
     }
 
-def _prefix_cache_payload(prefix_cache_manager: Optional[Any]) -> dict[str, Any]:
+def _prefix_cache_payload(
+    prefix_cache_manager: Optional[Any],
+    *,
+    stats: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     with _LIVE_LOCK:
         config = dict(_LIVE_PREFIX_CONFIG)
         last_request = None if _LIVE_LAST_REQUEST is None else dict(_LIVE_LAST_REQUEST)
@@ -813,7 +818,22 @@ def _prefix_cache_payload(prefix_cache_manager: Optional[Any]) -> dict[str, Any]
             "last_restored_tokens": None,
             "last_computed_tokens": None,
         }
-    stats = prefix_cache_manager.stats()
+    if stats is None:
+        stats = _prefix_cache_stats(prefix_cache_manager)
+    if stats is None:
+        return {
+            "entries": 0,
+            "max_entries": config.get("max_entries"),
+            "bytes": 0,
+            "max_bytes": config.get("max_bytes"),
+            "hits": 0,
+            "misses": 0,
+            "insertions": 0,
+            "evictions": 0,
+            "prefill_tokens_saved": 0,
+            "last_restored_tokens": None,
+            "last_computed_tokens": None,
+        }
     return {
         "entries": _int_or_none(stats.get("current_entries")),
         "max_entries": _int_or_none(stats.get("max_entries")),
@@ -831,6 +851,14 @@ def _prefix_cache_payload(prefix_cache_manager: Optional[Any]) -> dict[str, Any]
             None if last_request is None else _int_or_none(last_prefix.get("computed"))
         ),
     }
+
+def _prefix_cache_stats(prefix_cache_manager: Optional[Any]) -> Optional[dict[str, Any]]:
+    if prefix_cache_manager is None:
+        return None
+    try:
+        return prefix_cache_manager.stats()
+    except RuntimeCacheManagerClosed:
+        return None
 
 def _memory_payload(metal_limits: dict[str, Any]) -> dict[str, Any]:
     wired_limit_bytes = metal_limits.get("wired_limit_bytes")
@@ -860,7 +888,7 @@ def _current_rss_bytes() -> Optional[int]:
         if len(fields) < 2:
             return None
         return int(fields[1]) * int(resource.getpagesize())
-    except Exception:
+    except (OSError, UnicodeDecodeError, ValueError):
         return None
 
 def _darwin_proc_resident_size_bytes() -> Optional[int]:
@@ -908,7 +936,7 @@ def _darwin_proc_resident_size_bytes() -> Optional[int]:
         if result < ctypes.sizeof(info) or info.pti_resident_size <= 0:
             return None
         return int(info.pti_resident_size)
-    except Exception:
+    except (AttributeError, OSError, ValueError):
         return None
 
 def _darwin_task_resident_size_bytes() -> Optional[int]:
@@ -951,7 +979,7 @@ def _darwin_task_resident_size_bytes() -> Optional[int]:
         if result != 0 or info.resident_size <= 0 or info.resident_size == 0xFFFFFFFF:
             return None
         return int(info.resident_size)
-    except Exception:
+    except (AttributeError, OSError, ValueError):
         return None
 
 def _rss_peak_gb() -> Optional[float]:
@@ -960,7 +988,7 @@ def _rss_peak_gb() -> Optional[float]:
         if sys.platform != "darwin":
             value *= 1024.0
         return value / _GB
-    except Exception:
+    except (OSError, ValueError):
         return None
 
 def _mlx_memory_gb(name: str) -> Optional[float]:
@@ -971,7 +999,7 @@ def _mlx_memory_gb(name: str) -> Optional[float]:
         if getter is None:
             return None
         return float(getter()) / _GB
-    except Exception:
+    except (ImportError, RuntimeError):
         return None
 
 def _seconds_or_none(value_ms: Optional[float]) -> Optional[float]:

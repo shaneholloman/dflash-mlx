@@ -253,16 +253,20 @@ def _check_scripts_importable() -> DoctorCheck:
         module_name, func_name = target.split(":", 1)
         try:
             module = importlib.import_module(module_name)
-            callable(getattr(module, func_name))
+            entrypoint = getattr(module, func_name)
+            if not callable(entrypoint):
+                raise TypeError(f"{target} is not callable")
         except Exception as exc:
             failed.append(script)
             details[script] = {"target": target, "error": str(exc)}
         else:
-            details[script] = {"target": target, "importable": True}
+            details[script] = {"target": target, "callable": True}
     return DoctorCheck(
         "scripts",
         "fatal" if failed else "ok",
-        "console script modules import" if not failed else "some console scripts fail to import",
+        "console script entrypoints resolve"
+        if not failed
+        else "some console scripts fail to resolve",
         details,
     )
 
@@ -384,6 +388,24 @@ def _check_load_model(
             draft_ref=args.draft_model,
             verify_config=context.verify if context is not None else None,
         )
+        required_fields = (
+            "target_model",
+            "tokenizer",
+            "target_meta",
+            "draft_model",
+            "draft_meta",
+            "draft_backend",
+            "target_ops",
+            "resolved_model_ref",
+            "resolved_draft_ref",
+        )
+        missing_fields = [
+            field for field in required_fields if getattr(bundle, field, None) is None
+        ]
+        if missing_fields:
+            raise ValueError(
+                "runtime bundle is incomplete: " + ", ".join(missing_fields)
+            )
     except Exception as exc:
         return DoctorCheck(
             "load_model",
