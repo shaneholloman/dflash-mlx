@@ -17,11 +17,19 @@ from typing import Any, Optional
 
 import mlx.core as mx
 
-from dflash_mlx.cache.codecs import PrefixSnapshotBuilder
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
+from dflash_mlx.cache.manager import RuntimeCacheManager
 from dflash_mlx.cache.prefix_l1 import DFlashPrefixCache
 from dflash_mlx.cache.prefix_l2 import DFlashPrefixL2Cache
+from dflash_mlx.cache.snapshot_service import SnapshotService
+from dflash_mlx.cache.store import PrefixSnapshotStore
 from dflash_mlx.draft_backend import DraftBackend
+from dflash_mlx.engine.events import (
+    PrefillCompleteEvent,
+    SnapshotPublishedEvent,
+    TokenEvent,
+    is_engine_event,
+)
 from dflash_mlx.runtime import stream_dflash_generate
 from dflash_mlx.runtime_bundle import load_runtime_bundle
 from dflash_mlx.runtime_context import build_runtime_context, runtime_config_from_profile
@@ -31,10 +39,10 @@ def rss_mb() -> float:
     return ru.ru_maxrss / (1024 * 1024 if sys.platform == "darwin" else 1024)
 
 def mlx_active_mb() -> float:
-    try:
-        return mx.get_active_memory() / (1024 * 1024)
-    except Exception:
-        return 0.0
+    return mx.get_active_memory() / (1024 * 1024)
+
+def _clear_mlx_cache() -> None:
+    mx.clear_cache()
 
 def _tokenize(tok: Any, text: str) -> list[int]:
     if hasattr(tok, "encode"):
@@ -82,7 +90,7 @@ def _run_turn(
     draft_backend: DraftBackend,
     prompt_tokens: list[int],
     max_tokens: int,
-    cache: DFlashPrefixCache,
+    cache: PrefixSnapshotStore,
     key: DFlashPrefixKey,
     runtime_context: Any,
 ) -> dict[str, Any]:
@@ -92,6 +100,12 @@ def _run_turn(
     n_tokens = 0
     from_snap = False
     breakdown: dict[str, Any] = {}
+    snapshot_service = SnapshotService.from_request(
+        cache_manager=RuntimeCacheManager(cache),
+        key=key,
+        draft_model=draft_model,
+        runtime_context=runtime_context,
+    )
     stream = stream_dflash_generate(
         target_model=target_model,
         target_ops=target_ops,
@@ -103,36 +117,30 @@ def _run_turn(
         use_chat_template=False,
         prompt_tokens_override=prompt_tokens,
         prefix_snapshot=prefix_snap,
-        prefix_snapshot_builder=PrefixSnapshotBuilder(
-            key=key,
-            draft_model=draft_model,
-            draft_sink_size=int(runtime_context.runtime.draft_sink_size),
-            draft_window_size=int(runtime_context.runtime.draft_window_size),
-        ),
+        snapshot_service=snapshot_service,
         runtime_context=runtime_context,
     )
     try:
         for ev in stream:
-            kind = ev.get("event")
-            if kind == "prefill":
+            if isinstance(ev, PrefillCompleteEvent):
                 breakdown = {
-                    "prefill_us": float(ev.get("prefill_us") or 0.0),
-                    "rebuild_us": float(ev.get("phase_rebuild_us") or 0.0),
-                    "cold_us": float(ev.get("phase_cold_us") or 0.0),
+                    "prefill_us": float(ev.prefill_us),
+                    "rebuild_us": float(ev.phase_rebuild_us or 0.0),
+                    "cold_us": float(ev.phase_cold_us or 0.0),
                 }
                 continue
-            if kind == "prefill_snapshot_ready":
-                from_snap = bool(ev.get("from_snapshot", False))
-                snap = ev.get("snapshot")
-                if snap is not None and snap.key == key:
-                    cache.insert(snap)
+            if isinstance(ev, SnapshotPublishedEvent) and ev.kind == "prefill":
+                from_snap = bool(ev.from_snapshot)
                 continue
-            if kind == "token":
+            if isinstance(ev, TokenEvent):
                 if first_us is None:
                     first_us = (time.perf_counter_ns() - start) / 1_000.0
                 n_tokens += 1
                 if n_tokens >= max_tokens:
                     break
+                continue
+            if not is_engine_event(ev):
+                raise TypeError(f"Unsupported DFlash engine event: {type(ev).__name__}")
     finally:
         stream.close()
     total_us = (time.perf_counter_ns() - start) / 1_000.0
@@ -155,7 +163,7 @@ def _run_session(
     draft_backend: DraftBackend,
     prompts: list[list[int]],
     max_tokens: int,
-    cache: DFlashPrefixCache,
+    cache: PrefixSnapshotStore,
     key: DFlashPrefixKey,
     runtime_context: Any,
     label: str,
@@ -185,10 +193,7 @@ def _run_session(
         )
 
         gc.collect()
-        try:
-            mx.clear_cache()
-        except Exception:
-            pass
+        _clear_mlx_cache()
         mlx_now = mlx_active_mb()
         rss_now = rss_mb()
         l1_stats = cache.stats()
@@ -229,10 +234,7 @@ def _run_session(
             runtime_context=runtime_context,
         )
         gc.collect()
-        try:
-            mx.clear_cache()
-        except Exception:
-            pass
+        _clear_mlx_cache()
         revisits.append({"turn": idx, **r})
         l1_stats = cache.stats()
         l2_stats = l1_stats.get("l2") or {}
@@ -326,7 +328,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"Built {len(prompts)} distinct prompts, lens={[len(p) for p in prompts][:3]} ...")
 
     print("Warmup (8 tokens, no L2)...")
-    warm_cache = DFlashPrefixCache(max_entries=1, max_bytes=4 * 1024 * 1024 * 1024)
+    warm_cache = PrefixSnapshotStore(
+        l1=DFlashPrefixCache(max_entries=1, max_bytes=4 * 1024 * 1024 * 1024)
+    )
     warm_key = _build_key(target_ref, resolved_draft or draft_ref, draft_model, runtime_context)
     _run_turn(
         target_model=target_model,
@@ -342,16 +346,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     del warm_cache
     gc.collect()
-    try:
-        mx.clear_cache()
-    except Exception:
-        pass
+    _clear_mlx_cache()
 
     ctl: Optional[dict[str, Any]] = None
     if run_control:
 
         print("\n#### PASS 1: control (no L2) ####")
-        cache_ctl = DFlashPrefixCache(max_entries=l1_max_entries, max_bytes=l1_max_bytes)
+        cache_ctl = PrefixSnapshotStore(
+            l1=DFlashPrefixCache(max_entries=l1_max_entries, max_bytes=l1_max_bytes)
+        )
         key_ctl = _build_key(target_ref, resolved_draft or draft_ref, draft_model, runtime_context)
         ctl = _run_session(
             target_model=target_model,
@@ -368,17 +371,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         del cache_ctl
         gc.collect()
-        try:
-            mx.clear_cache()
-        except Exception:
-            pass
+        _clear_mlx_cache()
 
     label = "PASS 2" if run_control else "PASS"
     print(f"\n#### {label}: with L2 (L1 + SSD tier) ####")
     with tempfile.TemporaryDirectory(prefix="dflash_l2_long_") as l2_dir:
         l2 = DFlashPrefixL2Cache(cache_dir=l2_dir, max_bytes=l2_max_bytes)
-        cache_l2 = DFlashPrefixCache(
-            max_entries=l1_max_entries, max_bytes=l1_max_bytes, l2=l2,
+        cache_l2 = PrefixSnapshotStore(
+            l1=DFlashPrefixCache(
+                max_entries=l1_max_entries,
+                max_bytes=l1_max_bytes,
+            ),
+            l2=l2,
         )
         key_l2 = _build_key(target_ref, resolved_draft or draft_ref, draft_model, runtime_context)
         with_l2 = _run_session(

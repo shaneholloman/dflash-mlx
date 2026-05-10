@@ -14,9 +14,9 @@ from dflash_mlx.cache.manager import (
     RuntimeCacheManager,
     get_runtime_cache_manager,
 )
-from dflash_mlx.cache.codecs import PrefixSnapshotBuilder
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
 from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
+from dflash_mlx.cache.snapshot_service import SnapshotService
 from dflash_mlx.server.prefix_cache_manager import (
     build_prefix_key,
     chat_template_marker_ids,
@@ -46,12 +46,17 @@ class PrefixCacheFlow:
     snapshot: Optional[DFlashPrefixSnapshot] = None
     lookup_ms: float = 0.0
     hit_tokens: int = 0
-    insert_ms: float = 0.0
-    snapshot_builder: Optional[PrefixSnapshotBuilder] = None
+    snapshot_service: Optional[SnapshotService] = None
 
     @property
     def cache_active(self) -> bool:
         return self.cache_manager is not None
+
+    @property
+    def insert_ms(self) -> float:
+        if self.snapshot_service is None:
+            return 0.0
+        return self.snapshot_service.insert_ms
 
     def prefix_cache_memory_bytes(self) -> Optional[dict[str, int]]:
         if self.cache_manager is None:
@@ -113,41 +118,14 @@ class PrefixCacheFlow:
             snapshot=lookup.snapshot,
             lookup_ms=lookup.elapsed_ms,
             hit_tokens=hit_tokens,
-            snapshot_builder=(
-                PrefixSnapshotBuilder(
+            snapshot_service=(
+                SnapshotService.from_request(
+                    cache_manager=cache_manager,
                     key=key,
                     draft_model=draft_model,
-                    draft_sink_size=int(runtime_context.runtime.draft_sink_size),
-                    draft_window_size=int(runtime_context.runtime.draft_window_size),
+                    runtime_context=runtime_context,
                 )
                 if cache_manager is not None
                 else None
             ),
         )
-
-    def handle_prefill_snapshot(self, snapshot: DFlashPrefixSnapshot) -> None:
-        self._insert_snapshot(snapshot, kind="prefill", require_logits=True)
-
-    def handle_generation_snapshot(self, snapshot: DFlashPrefixSnapshot) -> None:
-        self._insert_snapshot(snapshot, kind="generation", require_logits=False)
-
-    def _insert_snapshot(
-        self,
-        snapshot: DFlashPrefixSnapshot,
-        *,
-        kind: str,
-        require_logits: bool,
-    ) -> None:
-        if self.cache_manager is None or self.key is None:
-            return
-        try:
-            insert_ms = self.cache_manager.maybe_insert_snapshot(
-                snapshot,
-                key=self.key,
-                kind=kind,
-                require_logits=require_logits,
-            )
-        except RuntimeCacheManagerClosed:
-            self.cache_manager = None
-            return
-        self.insert_ms += insert_ms

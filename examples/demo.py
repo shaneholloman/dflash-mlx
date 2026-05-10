@@ -19,11 +19,15 @@ from mlx_lm.generate import stream_generate as mlx_stream_generate
 from mlx_lm.utils import load as load_pristine_target
 
 from dflash_mlx.draft_backend import DraftBackend
-from dflash_mlx.generate import decode_token
-from dflash_mlx.runtime import (
-    _prepare_prompt_tokens,
-    stream_dflash_generate,
+from dflash_mlx.engine.events import (
+    PrefillCompleteEvent,
+    SummaryEvent,
+    TokenEvent,
+    is_engine_event,
 )
+from dflash_mlx.engine.sampling import prepare_prompt_tokens
+from dflash_mlx.generate import decode_token
+from dflash_mlx.runtime import stream_dflash_generate
 from dflash_mlx.runtime_bundle import load_runtime_bundle
 from dflash_mlx.runtime_context import (
     RuntimeContext,
@@ -280,7 +284,7 @@ def run_baseline(
 ) -> int:
     eos_ids = _get_stop_token_ids(tokenizer)
     started_at = time.monotonic()
-    prompt_tokens = _prepare_prompt_tokens(
+    prompt_tokens = prepare_prompt_tokens(
         tokenizer,
         prompt,
         use_chat_template=use_chat_template,
@@ -399,17 +403,17 @@ def run_dflash(
         quantize_kv_cache=quantize_kv_cache,
         runtime_context=runtime_context,
     ):
-        if event["event"] == "prefill":
-            prefill_us = float(event["prefill_us"])
+        if isinstance(event, PrefillCompleteEvent):
+            prefill_us = float(event.prefill_us)
             continue
-        if event["event"] == "token":
+        if isinstance(event, TokenEvent):
             if first_token_at is None:
                 first_token_at = time.monotonic()
-            token_text = decode_token(tokenizer, int(event["token_id"]))
+            token_text = decode_token(tokenizer, int(event.token_id))
             sys.stdout.write(token_text)
             sys.stdout.flush()
-            token_count = int(event["generated_tokens"])
-            acceptance_ratio = float(event["acceptance_ratio"])
+            token_count = int(event.generated_tokens)
+            acceptance_ratio = float(event.acceptance_ratio)
             if token_count % 8 == 0:
                 now = time.monotonic()
                 current_tps = _sample_tps(
@@ -430,11 +434,13 @@ def run_dflash(
                 )
                 last_status_at = now
                 last_status_tokens = token_count
-        elif event["event"] == "summary":
-            acceptance_ratio = float(event["acceptance_ratio"])
-            summary_prefill_us = float(event["phase_timings_us"]["prefill"])
-            generation_us = max(0.0, float(event["elapsed_us"]) - summary_prefill_us)
+        elif isinstance(event, SummaryEvent):
+            acceptance_ratio = float(event.acceptance_ratio)
+            summary_prefill_us = float(event.phase_timings_us["prefill"])
+            generation_us = max(0.0, float(event.elapsed_us) - summary_prefill_us)
             final_tps = token_count / (generation_us / 1e6) if generation_us > 0.0 else 0.0
+        elif not is_engine_event(event):
+            raise TypeError(f"Unsupported DFlash engine event: {type(event).__name__}")
     if token_count > 0:
         current_tps = _sample_tps(
             now=time.monotonic(),

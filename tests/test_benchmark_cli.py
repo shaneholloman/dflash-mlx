@@ -13,6 +13,12 @@ import pytest
 from dflash_mlx import benchmark
 from dflash_mlx import benchmark_report
 from dflash_mlx import benchmark_suites
+from dflash_mlx.engine.events import (
+    CycleCompleteEvent,
+    PrefillCompleteEvent,
+    SummaryEvent,
+    TokenEvent,
+)
 from dflash_mlx.runtime_context import build_offline_runtime_context
 
 def test_prompt_slug_distinguishes_long_prompts_with_same_prefix():
@@ -643,15 +649,31 @@ def test_benchmark_omits_dflash_peak_memory_when_reset_fails(monkeypatch, capsys
 
     stream = _ClosableBenchmarkStream(
         [
-            {"event": "token", "token_id": 7},
-            {
-                "event": "summary",
-                "elapsed_us": 1_000_000.0,
-                "phase_timings_us": {"prefill": 100_000.0},
-                "generated_token_ids": [7],
-                "generation_tokens": 1,
-                "peak_memory_gb": 42.0,
-            },
+            PrefillCompleteEvent(
+                prefill_us=100_000.0,
+                prompt_token_count=3,
+                logical_ctx_tokens=3,
+                physical_prefill_tokens=3,
+                prefill_tokens_restored=0,
+                prefill_tokens_computed=3,
+            ),
+            TokenEvent(
+                token_id=7,
+                generated_tokens=1,
+                acceptance_ratio=1.0,
+                cycles_completed=1,
+            ),
+            SummaryEvent(
+                elapsed_us=1_000_000.0,
+                prompt_token_count=3,
+                generated_token_ids=(7,),
+                generation_tokens=1,
+                accepted_from_draft=1,
+                acceptance_ratio=1.0,
+                cycles_completed=1,
+                phase_timings_us={"prefill": 100_000.0},
+                peak_memory_gb=42.0,
+            ),
         ]
     )
     monkeypatch.setattr(benchmark.mx, "reset_peak_memory", reset_fails, raising=False)
@@ -675,6 +697,72 @@ def test_benchmark_omits_dflash_peak_memory_when_reset_fails(monkeypatch, capsys
     assert stream.closed is True
     assert result["peak_memory_gb"] is None
     assert "dflash peak memory reset failed" in capsys.readouterr().err
+
+
+def test_benchmark_rejects_stale_dict_engine_event(monkeypatch):
+    stream = _ClosableBenchmarkStream(
+        [
+            PrefillCompleteEvent(
+                prefill_us=100_000.0,
+                prompt_token_count=3,
+                logical_ctx_tokens=3,
+                physical_prefill_tokens=3,
+                prefill_tokens_restored=0,
+                prefill_tokens_computed=3,
+            ),
+            {"event": "token", "token_id": 7},
+        ]
+    )
+    monkeypatch.setattr(benchmark, "_reset_peak_memory_for_benchmark", lambda _mode: True)
+    monkeypatch.setattr(benchmark, "stream_dflash_generate", lambda **_kwargs: stream)
+
+    with pytest.raises(TypeError, match="Unsupported DFlash engine event: dict"):
+        benchmark._generate_dflash_stream_once(
+            target_model=object(),
+            target_ops=object(),
+            tokenizer=_BenchmarkTokenizer(),
+            draft_model=object(),
+            draft_backend=object(),
+            prompt="prompt",
+            max_new_tokens=1,
+            use_chat_template=False,
+            block_tokens=16,
+            stop_token_ids=[],
+            suppress_token_ids=None,
+            runtime_context=object(),
+        )
+
+    assert stream.closed is True
+
+
+def test_summary_event_keeps_cycle_profile_typed_until_serialization():
+    cycle = CycleCompleteEvent(
+        cycle=1,
+        block_len=16,
+        commit_count=8,
+        acceptance_len=8,
+        draft_us=1.0,
+        verify_us=2.0,
+        acceptance_us=3.0,
+        hidden_extraction_us=4.0,
+        rollback_us=5.0,
+        other_us=6.0,
+        cycle_total_us=21.0,
+    )
+    summary = SummaryEvent(
+        elapsed_us=1_000_000.0,
+        prompt_token_count=3,
+        generated_token_ids=(7,),
+        generation_tokens=1,
+        accepted_from_draft=1,
+        acceptance_ratio=1.0,
+        cycles_completed=1,
+        phase_timings_us={"prefill": 100_000.0},
+        cycle_profile_us=(cycle,),
+    )
+
+    assert summary.cycle_profile_us == (cycle,)
+    assert summary.to_payload()["cycle_profile_us"] == [cycle.to_payload()]
 
 
 def test_benchmark_cleanup_failure_is_reported(monkeypatch, capsys):

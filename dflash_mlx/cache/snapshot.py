@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -56,7 +57,7 @@ class DFlashPrefixSnapshot:
 
 def validate_prefix_snapshot(
     snapshot: Optional[DFlashPrefixSnapshot],
-    prompt_tokens: list[int],
+    prompt_tokens: Sequence[int],
 ) -> int:
     if snapshot is None:
         return 0

@@ -8,12 +8,14 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
+from mlx.utils import tree_flatten
 
 from dflash_mlx import model as model_mod
 from dflash_mlx import runtime_loading
 from dflash_mlx.draft_backend import EagerDraftBackend
 from dflash_mlx.engine import spec_epoch
 from dflash_mlx.engine.config import resolve_draft_window
+from dflash_mlx.engine.events import SnapshotPublishedEvent, SummaryEvent, TokenEvent
 from dflash_mlx.engine.target_gemma4 import Gemma4TargetOps
 from dflash_mlx.engine.target_ops import bind_draft_to_target
 from dflash_mlx.model import (
@@ -352,6 +354,62 @@ def test_load_draft_bundle_rejects_future_draft_owned_lm_head(tmp_path):
         raise AssertionError("draft checkpoints with lm_head weights must fail fast")
 
 
+def test_load_draft_bundle_model_class_callback_accepts_mlx_lm_config_keyword(
+    tmp_path,
+    monkeypatch,
+):
+    calls = []
+
+    def fake_load_model(model_path, *, lazy, get_model_classes):
+        model_classes = get_model_classes(config={"model_type": "qwen3"})
+        calls.append((model_path, lazy, model_classes))
+        return object(), {"model_type": "qwen3"}
+
+    monkeypatch.setattr(runtime_loading, "load_model", fake_load_model)
+
+    model, meta = runtime_loading.load_draft_bundle(tmp_path, lazy=False)
+
+    assert model is not None
+    assert meta["config"] == {"model_type": "qwen3"}
+    assert calls == [
+        (
+            tmp_path,
+            False,
+            (DFlashDraftModel, DFlashDraftModelArgs),
+        )
+    ]
+
+
+def test_load_draft_bundle_uses_real_mlx_lm_model_class_callback(tmp_path):
+    config = {
+        "model_type": "qwen3",
+        "hidden_size": 16,
+        "num_hidden_layers": 1,
+        "intermediate_size": 32,
+        "num_attention_heads": 2,
+        "rms_norm_eps": 1e-6,
+        "vocab_size": 32,
+        "num_key_value_heads": 1,
+        "max_position_embeddings": 64,
+        "rope_theta": 1_000_000.0,
+        "head_dim": 8,
+        "tie_word_embeddings": False,
+        "num_target_layers": 2,
+        "block_size": 16,
+    }
+    draft_model = DFlashDraftModel(DFlashDraftModelArgs.from_dict(config))
+    weights = dict(tree_flatten(draft_model.parameters()))
+
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+
+    loaded_model, meta = runtime_loading.load_draft_bundle(tmp_path, lazy=False)
+
+    assert isinstance(loaded_model, DFlashDraftModel)
+    assert meta["config"]["model_type"] == "qwen3"
+    assert meta["config"]["hidden_size"] == 16
+
+
 def test_load_draft_bundle_requires_safetensors_for_weight_inspection(
     tmp_path, monkeypatch
 ):
@@ -494,10 +552,10 @@ def test_mask_token_id_can_be_generated():
         )
     )
 
-    token_events = [event for event in events if event.get("event") == "token"]
-    summary = next(event for event in events if event.get("event") == "summary")
-    assert [event["token_id"] for event in token_events] == [mask_token_id]
-    assert summary["generated_token_ids"] == [mask_token_id]
+    token_events = [event for event in events if isinstance(event, TokenEvent)]
+    summary = next(event for event in events if isinstance(event, SummaryEvent))
+    assert [event.token_id for event in token_events] == [mask_token_id]
+    assert summary.generated_token_ids == (mask_token_id,)
 
 
 def test_prefix_snapshot_capability_disables_snapshot_events(monkeypatch):
@@ -599,9 +657,7 @@ def test_prefix_snapshot_capability_disables_snapshot_events(monkeypatch):
         )
     )
 
-    event_names = {event.get("event") for event in events}
-    assert "prefill_snapshot_ready" not in event_names
-    assert "generation_snapshot_ready" not in event_names
+    assert not any(isinstance(event, SnapshotPublishedEvent) for event in events)
     assert generation_concat_calls == 0
 
 

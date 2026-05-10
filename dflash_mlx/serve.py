@@ -47,19 +47,16 @@ from dflash_mlx.server.protocol import (
     match_stream_token as _match_stream_token,
     thinking_enabled_for_request as _thinking_enabled_for_request,
 )
-from dflash_mlx.bench_logger import (
+from dflash_mlx.observability.writer import (
     enabled as _bench_enabled,
-    log_post as _bench_log_post,
 )
 from dflash_mlx.server.metrics import (
     clear_live_request as _clear_live_request,
     configure_live_metrics as _configure_live_metrics,
+    finalize_request_observability as _finalize_request_observability,
     get_live_metrics_payload as _get_live_metrics_payload,
-    record_request_metrics as _record_request_metrics,
     record_target_only_request as _record_target_only_request,
     start_live_request as _start_live_request,
-    write_post_request_memory_line as _write_post_request_memory_line,
-    write_summary_line as _write_summary_line,
 )
 from dflash_mlx.server.model_provider import (
     DFlashModelProvider,
@@ -68,7 +65,6 @@ from dflash_mlx.server.model_provider import (
 from dflash_mlx.runtime import get_stop_token_ids, stream_dflash_generate
 from dflash_mlx.runtime_context import with_metal_limits
 from dflash_mlx.cache.manager import (
-    current_runtime_cache_manager as _current_runtime_cache_manager,
     shutdown_runtime_cache_manager,
 )
 from dflash_mlx.server.prefix_cache_flow import PrefixCacheFlow
@@ -202,15 +198,8 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
                         mode_used="ar_fastpath",
                         wall_ms=wall_ms,
                         max_tokens=int(args.max_tokens),
+                        diagnostics=runtime_context.diagnostics,
                     )
-                    if bench_active:
-                        _bench_log_post(
-                            trace_config,
-                            request_id=request_id,
-                            mode_used="ar_fastpath",
-                            max_tokens=int(args.max_tokens),
-                            wall_ms=wall_ms,
-                        )
 
             model = self.model_provider.model
             tokenizer = self.model_provider.tokenizer
@@ -284,7 +273,7 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
                 stop_token_ids=stop_token_ids,
                 prompt_tokens_override=prompt,
                 prefix_snapshot=prefix_flow.snapshot,
-                prefix_snapshot_builder=prefix_flow.snapshot_builder,
+                snapshot_service=prefix_flow.snapshot_service,
                 stable_prefix_len=prefix_flow.stable_prefix_len,
                 prefix_cache_active=prefix_flow.cache_active,
                 runtime_context=runtime_context,
@@ -307,13 +296,7 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
             )
             summary_event = loop_result.summary_event
 
-            if summary_event is not None:
-                _write_summary_line(
-                    summary_event=summary_event,
-                    prompt_token_count=len(prompt),
-                )
-
-            _record_request_metrics(
+            _finalize_request_observability(
                 request_id=request_id,
                 summary_event=summary_event,
                 request_start_ns=loop_result.request_start_ns,
@@ -333,7 +316,6 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
                 prefill_event=loop_result.prefill_event,
                 runtime_config=runtime_context.runtime,
             )
-            _write_post_request_memory_line(request_id=request_id)
             rqueue.put(None)
         except Exception as e:
             _clear_live_request(request_id=request_id)
@@ -358,9 +340,7 @@ class DFlashAPIHandler(mlx_server.APIHandler):
         return super().do_POST()
 
     def handle_metrics_request(self):
-        payload = _get_live_metrics_payload(
-            prefix_cache_manager=_current_runtime_cache_manager(),
-        )
+        payload = _get_live_metrics_payload()
         body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
         self._set_completion_headers(200)
         self.send_header("Content-Length", str(len(body)))

@@ -9,6 +9,13 @@ from types import SimpleNamespace
 
 import pytest
 
+from dflash_mlx.engine.events import (
+    MemoryWaterfallEvent,
+    PrefillCompleteEvent,
+    SnapshotPublishedEvent,
+    SummaryEvent,
+    TokenEvent,
+)
 from dflash_mlx.server.request_loop import consume_dflash_events
 
 class FakeDetokenizer:
@@ -51,14 +58,26 @@ def test_consume_dflash_events_streams_pending_token_and_summary():
     rqueue = SimpleQueue()
     events = ClosableEvents(
         [
-            {"event": "prefill", "prompt_token_count": 3},
-            {"event": "token", "token_id": 10, "acceptance_ratio": 0.5},
-            {"event": "token", "token_id": 11, "acceptance_ratio": 0.5},
-            {
-                "event": "summary",
-                "generated_token_ids": [10, 11],
-                "generation_tokens": 2,
-            },
+            PrefillCompleteEvent(
+                prefill_us=1.0,
+                prompt_token_count=3,
+                logical_ctx_tokens=3,
+                physical_prefill_tokens=3,
+                prefill_tokens_restored=0,
+                prefill_tokens_computed=3,
+            ),
+            TokenEvent(token_id=10, generated_tokens=1, acceptance_ratio=0.5, cycles_completed=1),
+            TokenEvent(token_id=11, generated_tokens=2, acceptance_ratio=0.5, cycles_completed=1),
+            SummaryEvent(
+                elapsed_us=10.0,
+                prompt_token_count=3,
+                generated_token_ids=(10, 11),
+                generation_tokens=2,
+                accepted_from_draft=1,
+                acceptance_ratio=0.5,
+                cycles_completed=1,
+                phase_timings_us={},
+            ),
         ]
     )
 
@@ -88,32 +107,35 @@ def test_consume_dflash_events_streams_pending_token_and_summary():
     assert responses[1].text == "T11"
 
 
-def test_consume_dflash_events_routes_snapshot_events_without_streaming():
-    class FakePrefixFlow:
-        lookup_ms = 0.0
-        hit_tokens = 0
-        insert_ms = 0.0
-        cache = None
-
-        def __init__(self):
-            self.prefill_snapshots = []
-            self.generation_snapshots = []
-
-        def handle_prefill_snapshot(self, snapshot):
-            self.prefill_snapshots.append(snapshot)
-
-        def handle_generation_snapshot(self, snapshot):
-            self.generation_snapshots.append(snapshot)
-
-    prefix_flow = FakePrefixFlow()
+def test_consume_dflash_events_ignores_snapshot_publication_metadata():
+    prefix_flow = SimpleNamespace(lookup_ms=0.1, hit_tokens=2, insert_ms=0.5)
     rqueue = SimpleQueue()
-    prefill_snapshot = object()
-    generation_snapshot = object()
     events = ClosableEvents(
         [
-            {"event": "prefill_snapshot_ready", "snapshot": prefill_snapshot},
-            {"event": "generation_snapshot_ready", "snapshot": generation_snapshot},
-            {"event": "summary", "generated_token_ids": [], "generation_tokens": 0},
+            SnapshotPublishedEvent(
+                kind="prefill",
+                snapshot_boundary=3,
+                prefix_len=3,
+                insert_ms=0.2,
+                admitted=True,
+            ),
+            SnapshotPublishedEvent(
+                kind="generation",
+                snapshot_boundary=5,
+                prefix_len=5,
+                insert_ms=0.3,
+                admitted=True,
+            ),
+            SummaryEvent(
+                elapsed_us=10.0,
+                prompt_token_count=3,
+                generated_token_ids=(),
+                generation_tokens=0,
+                accepted_from_draft=0,
+                acceptance_ratio=0.0,
+                cycles_completed=0,
+                phase_timings_us={},
+            ),
         ]
     )
 
@@ -131,41 +153,30 @@ def test_consume_dflash_events_routes_snapshot_events_without_streaming():
 
     assert events.closed is True
     assert rqueue.empty()
-    assert prefix_flow.prefill_snapshots == [prefill_snapshot]
-    assert prefix_flow.generation_snapshots == [generation_snapshot]
     assert result.summary_event is not None
+    assert result.cache_lookup_ms == 0.1
+    assert result.cache_hit_tokens == 2
+    assert result.cache_insert_ms == 0.5
 
 
-def test_consume_dflash_events_requires_snapshot_payload_for_snapshot_events():
-    class FakePrefixFlow:
-        lookup_ms = 0.0
-        hit_tokens = 0
-        insert_ms = 0.0
-        cache = None
+def test_consume_dflash_events_rejects_stale_dict_events():
+    rqueue = SimpleQueue()
+    events = ClosableEvents([{"event": "token", "token_id": 10}])
 
-        def handle_prefill_snapshot(self, snapshot):
-            raise AssertionError("missing snapshot should fail before flow call")
-
-        def handle_generation_snapshot(self, snapshot):
-            raise AssertionError("missing snapshot should fail before flow call")
-
-    events = ClosableEvents([{"event": "prefill_snapshot_ready"}])
-
-    with pytest.raises(KeyError, match="snapshot") as exc_info:
+    with pytest.raises(TypeError, match="Unsupported DFlash engine event: dict"):
         consume_dflash_events(
             event_iter=events,
-            rqueue=SimpleQueue(),
+            rqueue=rqueue,
             ctx=FakeContext(),
             tokenizer=FakeTokenizer(),
             prompt=[1, 2, 3],
             max_tokens=16,
             eos_token_ids=set(),
             request_start_ns=0,
-            prefix_flow=FakePrefixFlow(),
         )
 
-    assert exc_info.value.args == ("snapshot",)
     assert events.closed is True
+    assert rqueue.empty()
 
 
 def test_memory_waterfall_events_are_enriched_with_prefix_cache_memory():
@@ -186,8 +197,17 @@ def test_memory_waterfall_events_are_enriched_with_prefix_cache_memory():
     rqueue = SimpleQueue()
     events = ClosableEvents(
         [
-            {"event": "memory_waterfall", "memory_phase": "during_decode"},
-            {"event": "summary", "generated_token_ids": [], "generation_tokens": 0},
+            MemoryWaterfallEvent(fields={"memory_phase": "during_decode"}),
+            SummaryEvent(
+                elapsed_us=10.0,
+                prompt_token_count=3,
+                generated_token_ids=(),
+                generation_tokens=0,
+                accepted_from_draft=0,
+                acceptance_ratio=0.0,
+                cycles_completed=0,
+                phase_timings_us={},
+            ),
         ]
     )
 

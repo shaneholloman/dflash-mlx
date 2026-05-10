@@ -14,6 +14,7 @@ from dflash_mlx.cache.fingerprints import DFlashPrefixKey
 from dflash_mlx.cache.prefix_l1 import DFlashPrefixCache
 from dflash_mlx.cache.prefix_l2 import DFlashPrefixL2Cache
 from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
+from dflash_mlx.cache.store import PrefixSnapshotStore
 
 _DFLASH_RUNTIME_CACHE_MANAGER: Optional["RuntimeCacheManager"] = None
 _DFLASH_RUNTIME_CACHE_CONFIG_KEY: Optional[tuple[Any, ...]] = None
@@ -27,13 +28,19 @@ class PrefixCacheLookupResult:
     elapsed_ms: float
 
 
+@dataclass(frozen=True)
+class PrefixCacheInsertResult:
+    admitted: bool
+    elapsed_ms: float
+
+
 class RuntimeCacheManagerClosed(RuntimeError):
     pass
 
 
 class RuntimeCacheManager:
-    def __init__(self, cache: DFlashPrefixCache) -> None:
-        self._cache = cache
+    def __init__(self, store: PrefixSnapshotStore) -> None:
+        self._store = store
         self._state_lock = threading.RLock()
         self._retired = False
         self._shutdown_complete = False
@@ -41,25 +48,25 @@ class RuntimeCacheManager:
     def set_trace_config(self, trace_config: Any) -> None:
         with self._state_lock:
             self._ensure_open_locked()
-            self._cache.set_trace_config(trace_config)
+            self._store.set_trace_config(trace_config)
 
     def shutdown(self) -> None:
         with self._state_lock:
             if self._shutdown_complete:
                 return
             self._retired = True
-            self._cache.shutdown()
+            self._store.shutdown()
             self._shutdown_complete = True
 
     def stats(self) -> dict[str, Any]:
         with self._state_lock:
             self._ensure_open_locked()
-            return self._cache.stats()
+            return self._store.stats()
 
     def memory_waterfall_bytes(self) -> dict[str, int]:
         with self._state_lock:
             self._ensure_open_locked()
-            return self._cache.memory_waterfall_bytes()
+            return self._store.memory_waterfall_bytes()
 
     def lookup(
         self,
@@ -69,7 +76,7 @@ class RuntimeCacheManager:
         lookup_t0 = time.perf_counter_ns()
         with self._state_lock:
             self._ensure_open_locked()
-            matched_len, snapshot = self._cache.lookup(tokens, key)
+            matched_len, snapshot = self._store.lookup(tokens, key)
         return PrefixCacheLookupResult(
             matched_tokens=int(matched_len),
             snapshot=snapshot,
@@ -83,7 +90,7 @@ class RuntimeCacheManager:
         key: DFlashPrefixKey,
         kind: str,
         require_logits: bool,
-    ) -> float:
+    ) -> PrefixCacheInsertResult:
         if not isinstance(snapshot, DFlashPrefixSnapshot):
             raise TypeError(f"expected DFlashPrefixSnapshot, got {type(snapshot).__name__}")
         if snapshot.key != key:
@@ -96,26 +103,29 @@ class RuntimeCacheManager:
         try:
             with self._state_lock:
                 self._ensure_open_locked()
-                self._cache.insert(snapshot)
+                admitted = self._store.insert(snapshot)
         except RuntimeCacheManagerClosed:
             raise
         except Exception as exc:
             _log_insert_failure(kind, exc)
             raise
         elapsed_ms = (time.perf_counter_ns() - insert_t0) / 1e6
-        if kind == "generation":
+        if admitted and kind == "generation":
             sys.stderr.write(
                 f"{time.strftime('%Y-%m-%d %H:%M:%S')} "
                 f"[dflash] end-of-request snapshot saved "
                 f"({snapshot.prefix_len} tokens)\n"
             )
             sys.stderr.flush()
-        return elapsed_ms
+        return PrefixCacheInsertResult(
+            admitted=bool(admitted),
+            elapsed_ms=float(elapsed_ms),
+        )
 
     def log_stats(self, label: str = "") -> None:
         with self._state_lock:
             self._ensure_open_locked()
-            _format_stats_line(self._cache, label)
+            _format_stats_line(self._store, label)
 
     def _ensure_open_locked(self) -> None:
         if self._retired:
@@ -152,7 +162,7 @@ def get_runtime_cache_manager(
             _shutdown_manager(manager)
             _DFLASH_RUNTIME_CACHE_MANAGER = None
             _DFLASH_RUNTIME_CACHE_CONFIG_KEY = None
-        manager = RuntimeCacheManager(_make_prefix_cache(runtime_context))
+        manager = RuntimeCacheManager(_make_prefix_store(runtime_context))
         _DFLASH_RUNTIME_CACHE_MANAGER = manager
         _DFLASH_RUNTIME_CACHE_CONFIG_KEY = config_key
         return manager
@@ -247,7 +257,7 @@ def _shutdown_manager(
         return False
 
 
-def _make_prefix_cache(runtime_context: Any) -> DFlashPrefixCache:
+def _make_prefix_store(runtime_context: Any) -> PrefixSnapshotStore:
     runtime_config = runtime_context.runtime
     max_entries = int(runtime_config.prefix_cache_max_entries)
     max_bytes = int(runtime_config.prefix_cache_max_bytes)
@@ -269,10 +279,9 @@ def _make_prefix_cache(runtime_context: Any) -> DFlashPrefixCache:
             )
             l2 = None
     trace_config = runtime_context.diagnostics.trace if runtime_context is not None else None
-    cache = DFlashPrefixCache(
+    l1 = DFlashPrefixCache(
         max_entries=max_entries,
         max_bytes=max_bytes,
-        l2=l2,
         trace_config=trace_config,
         max_snapshot_tokens=runtime_config.max_snapshot_tokens,
     )
@@ -281,11 +290,13 @@ def _make_prefix_cache(runtime_context: Any) -> DFlashPrefixCache:
         f"(max_entries={max_entries}, max_bytes={max_bytes})\n"
     )
     sys.stderr.flush()
-    return cache
+    store = PrefixSnapshotStore(l1=l1, l2=l2)
+    store.set_trace_config(trace_config)
+    return store
 
 
-def _format_stats_line(cache: DFlashPrefixCache, label: str = "") -> None:
-    stats = cache.stats()
+def _format_stats_line(store: PrefixSnapshotStore, label: str = "") -> None:
+    stats = store.stats()
     prefix = f" [{label}]" if label else ""
     line = (
         f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] prefix-cache-stats{prefix} "

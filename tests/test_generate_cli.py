@@ -4,9 +4,12 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from dflash_mlx import generate
+from dflash_mlx.engine.events import PrefillCompleteEvent
 from dflash_mlx.runtime_loading import parse_draft_quant_spec
 
 
@@ -114,6 +117,70 @@ def test_generate_cli_rejects_invalid_prefill_step_size(monkeypatch):
         )
 
     assert exc.value.code == "--prefill-step-size must be > 0"
+
+
+class _ClosableGenerateStream:
+    def __init__(self, events):
+        self.events = list(events)
+        self.closed = False
+
+    def __iter__(self):
+        return iter(self.events)
+
+    def close(self):
+        self.closed = True
+
+
+def test_run_generate_rejects_stale_dict_engine_event(monkeypatch):
+    class _Tokenizer:
+        def decode(self, token):
+            return str(token)
+
+    monkeypatch.setattr(
+        generate,
+        "load_runtime_bundle",
+        lambda **_kwargs: SimpleNamespace(
+            target_model=object(),
+            tokenizer=_Tokenizer(),
+            draft_model=object(),
+            draft_backend=object(),
+            target_ops=object(),
+        ),
+    )
+    stream = _ClosableGenerateStream(
+        [
+            PrefillCompleteEvent(
+                prefill_us=1.0,
+                prompt_token_count=1,
+                logical_ctx_tokens=1,
+                physical_prefill_tokens=1,
+                prefill_tokens_restored=0,
+                prefill_tokens_computed=1,
+            ),
+            {"event": "token", "token_id": 7},
+        ]
+    )
+    monkeypatch.setattr(generate, "get_stop_token_ids", lambda _tokenizer: [])
+    monkeypatch.setattr(generate, "stream_dflash_generate", lambda **_kwargs: stream)
+
+    with pytest.raises(TypeError, match="Unsupported DFlash engine event: dict"):
+        generate.run_generate(
+            model_ref="m",
+            prompt="p",
+            max_tokens=1,
+            use_chat_template=False,
+            draft_ref=None,
+            target_fa_window=0,
+            prefill_step_size=1,
+            draft_sink_size=1,
+            draft_window_size=1,
+            verify_len_cap=0,
+            verify_mode="off",
+            draft_quant=None,
+        )
+
+    assert stream.closed is True
+
 
 def test_draft_quant_parser_no_env_fallback(monkeypatch):
     monkeypatch.setenv("DFLASH_DRAFT_QUANT", "w4")

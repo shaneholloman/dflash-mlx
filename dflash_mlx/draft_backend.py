@@ -8,6 +8,7 @@ from typing import Any, Optional, Protocol
 
 import mlx.core as mx
 
+from dflash_mlx.engine.sampling import greedy_tokens_with_mask
 from dflash_mlx.model import (
     ContextOnlyDraftKVCache,
     DFlashDraftModel,
@@ -100,9 +101,7 @@ class EagerDraftBackend:
             target_model,
             draft_hidden[:, 1:, :],
         )
-        from dflash_mlx import runtime as runtime_mod
-
-        drafted = runtime_mod.greedy_tokens_with_mask(
+        drafted = greedy_tokens_with_mask(
             draft_logits,
             suppress_token_mask,
         ).squeeze(0)

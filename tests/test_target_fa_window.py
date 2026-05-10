@@ -15,6 +15,8 @@ from dflash_mlx.cache.codecs import target_cache_is_serializable
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
 from dflash_mlx.cache.prefix_l1 import DFlashPrefixCache
 from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
+from dflash_mlx.cache.store import PrefixSnapshotStore
+from dflash_mlx.engine.events import PrefillCompleteEvent
 from dflash_mlx.engine.target_qwen_gdn import QwenGdnTargetOps
 from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
 
@@ -204,7 +206,7 @@ def test_prefix_cache_flow_disabled_for_windowed_target(monkeypatch):
     monkeypatch.setattr(
         cache_manager_mod,
         "_DFLASH_RUNTIME_CACHE_MANAGER",
-        RuntimeCacheManager(preexisting_cache),
+        RuntimeCacheManager(PrefixSnapshotStore(l1=preexisting_cache)),
     )
     monkeypatch.setattr(
         cache_manager_mod,
@@ -226,7 +228,7 @@ def test_prefix_cache_flow_disabled_for_windowed_target(monkeypatch):
     assert flow.key is None
     assert flow.hit_tokens == 0
     assert flow.snapshot is None
-    assert flow.snapshot_builder is None
+    assert flow.snapshot_service is None
     assert cache_manager_mod.current_runtime_cache_manager() is None
     assert shutdown_calls == [preexisting_cache]
 
@@ -316,11 +318,97 @@ def test_fallback_prefill_event_reports_full_physical_prefill(monkeypatch):
         )
     )
 
-    prefill_event = next(event for event in events if event.get("event") == "prefill")
-    assert prefill_event["logical_ctx_tokens"] == 4
-    assert prefill_event["physical_prefill_tokens"] == 4
-    assert prefill_event["prefill_tokens_restored"] == 0
-    assert prefill_event["prefill_tokens_computed"] == 4
+    prefill_event = next(event for event in events if isinstance(event, PrefillCompleteEvent))
+    assert prefill_event.logical_ctx_tokens == 4
+    assert prefill_event.physical_prefill_tokens == 4
+    assert prefill_event.prefill_tokens_restored == 0
+    assert prefill_event.prefill_tokens_computed == 4
+
+
+def test_fallback_stream_uses_plain_tokenizer_without_override():
+    import dflash_mlx.engine.fallback as fallback
+
+    class FakeOps:
+        def make_cache(self, target_model, **kwargs):
+            return []
+
+    class FakeTarget:
+        def __call__(self, input_ids, cache):
+            del cache
+            batch, seq_len = input_ids.shape
+            return mx.zeros((batch, seq_len, 8), dtype=mx.float32)
+
+    class FakeTokenizer:
+        def __init__(self):
+            self.encode_calls = []
+
+        def encode(self, prompt):
+            self.encode_calls.append(prompt)
+            return [3, 4, 5]
+
+    tokenizer = FakeTokenizer()
+
+    events = list(
+        fallback.stream_baseline_generate(
+            target_model=FakeTarget(),
+            target_ops=FakeOps(),
+            tokenizer=tokenizer,
+            prompt="fallback",
+            max_new_tokens=1,
+            use_chat_template=False,
+        )
+    )
+
+    prefill_event = next(event for event in events if isinstance(event, PrefillCompleteEvent))
+    assert tokenizer.encode_calls == ["fallback"]
+    assert prefill_event.prompt_token_count == 3
+
+
+def test_fallback_stream_uses_chat_template_without_override():
+    import dflash_mlx.engine.fallback as fallback
+
+    class FakeOps:
+        def make_cache(self, target_model, **kwargs):
+            return []
+
+    class FakeTarget:
+        def __call__(self, input_ids, cache):
+            del cache
+            batch, seq_len = input_ids.shape
+            return mx.zeros((batch, seq_len, 8), dtype=mx.float32)
+
+    class FakeTokenizer:
+        def __init__(self):
+            self.encode_calls = []
+            self.template_calls = []
+
+        def encode(self, prompt):
+            self.encode_calls.append(prompt)
+            return [3, 4, 5]
+
+        def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
+            self.template_calls.append((messages, tokenize, add_generation_prompt))
+            return [6, 7]
+
+    tokenizer = FakeTokenizer()
+
+    events = list(
+        fallback.stream_baseline_generate(
+            target_model=FakeTarget(),
+            target_ops=FakeOps(),
+            tokenizer=tokenizer,
+            prompt="fallback chat",
+            max_new_tokens=1,
+            use_chat_template=True,
+        )
+    )
+
+    prefill_event = next(event for event in events if isinstance(event, PrefillCompleteEvent))
+    assert tokenizer.encode_calls == []
+    assert tokenizer.template_calls == [
+        ([{"role": "user", "content": "fallback chat"}], True, True)
+    ]
+    assert prefill_event.prompt_token_count == 2
 
 
 def test_rotating_kv_trim_survives_logical_positions_past_cache_length():

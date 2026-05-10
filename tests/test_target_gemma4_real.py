@@ -11,6 +11,7 @@ import mlx.core as mx
 import pytest
 from mlx_lm.generate import generate_step
 
+from dflash_mlx.engine.events import SummaryEvent, TokenEvent
 from dflash_mlx.engine.target_gemma4 import Gemma4TargetOps
 from dflash_mlx.runtime import VerifyConfig, stream_dflash_generate
 from dflash_mlx.runtime_bundle import load_runtime_bundle
@@ -192,14 +193,14 @@ def test_real_gemma4_dflash_matches_mlx_lm_greedy_tokens():
         prompt_tokens_override=prompt_ids,
         runtime_context=runtime_context,
     ):
-        if event.get("event") == "token":
-            generated_tokens.append(int(event["token_id"]))
-        elif event.get("event") == "summary":
+        if isinstance(event, TokenEvent):
+            generated_tokens.append(int(event.token_id))
+        elif isinstance(event, SummaryEvent):
             summary = event
             break
 
     assert summary is not None
     assert generated_tokens == expected_tokens
-    assert list(summary.get("generated_token_ids") or []) == expected_tokens
-    assert int(summary.get("generation_tokens") or 0) == max_tokens
-    assert int(summary.get("accepted_from_draft") or 0) > 0
+    assert list(summary.generated_token_ids) == expected_tokens
+    assert int(summary.generation_tokens) == max_tokens
+    assert int(summary.accepted_from_draft) > 0

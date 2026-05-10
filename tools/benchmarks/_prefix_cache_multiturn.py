@@ -14,10 +14,18 @@ from typing import Any, Optional
 
 from mlx_lm import stream_generate as mlxlm_stream_generate
 
-from dflash_mlx.cache.codecs import PrefixSnapshotBuilder
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
+from dflash_mlx.cache.manager import RuntimeCacheManager
 from dflash_mlx.cache.prefix_l1 import DFlashPrefixCache
+from dflash_mlx.cache.snapshot_service import SnapshotService
+from dflash_mlx.cache.store import PrefixSnapshotStore
 from dflash_mlx.draft_backend import DraftBackend
+from dflash_mlx.engine.events import (
+    PrefillCompleteEvent,
+    SnapshotPublishedEvent,
+    TokenEvent,
+    is_engine_event,
+)
 from dflash_mlx.runtime import stream_dflash_generate
 from dflash_mlx.runtime_bundle import load_runtime_bundle
 from dflash_mlx.runtime_context import build_runtime_context, runtime_config_from_profile
@@ -53,7 +61,7 @@ def _run_one_turn(
     prompt_tokens: list[int],
     max_tokens: int,
     prefix_snapshot=None,
-    cache_to_populate: Optional[DFlashPrefixCache] = None,
+    cache_to_populate: Optional[PrefixSnapshotStore] = None,
     cache_key: Optional[DFlashPrefixKey] = None,
     runtime_context: Any,
 ) -> dict[str, Any]:
@@ -64,6 +72,16 @@ def _run_one_turn(
     snap_len_used = 0
     inserted = False
     breakdown: dict[str, Any] = {}
+    snapshot_service = (
+        SnapshotService.from_request(
+            cache_manager=RuntimeCacheManager(cache_to_populate),
+            key=cache_key,
+            draft_model=draft_model,
+            runtime_context=runtime_context,
+        )
+        if cache_to_populate is not None and cache_key is not None
+        else None
+    )
     stream = stream_dflash_generate(
         target_model=target_model,
         target_ops=target_ops,
@@ -75,47 +93,36 @@ def _run_one_turn(
         use_chat_template=False,
         prompt_tokens_override=prompt_tokens,
         prefix_snapshot=prefix_snapshot,
-        prefix_snapshot_builder=(
-            PrefixSnapshotBuilder(
-                key=cache_key,
-                draft_model=draft_model,
-                draft_sink_size=int(runtime_context.runtime.draft_sink_size),
-                draft_window_size=int(runtime_context.runtime.draft_window_size),
-            )
-            if cache_to_populate is not None and cache_key is not None
-            else None
-        ),
+        snapshot_service=snapshot_service,
         runtime_context=runtime_context,
     )
     try:
         for event in stream:
-            ev = event.get("event")
-            if ev == "prefill":
+            if isinstance(event, PrefillCompleteEvent):
                 breakdown = {
-                    "prefill_us": float(event.get("prefill_us") or 0.0),
-                    "rebuild_us": float(event.get("phase_rebuild_us") or 0.0),
-                    "cold_us": float(event.get("phase_cold_us") or 0.0),
-                    "seam_us": float(event.get("phase_seam_us") or 0.0),
-                    "tail_us": float(event.get("phase_tail_us") or 0.0),
-                    "snap_prefix_len": int(event.get("snap_prefix_len") or 0),
-                    "snapshot_boundary": int(event.get("snapshot_boundary") or 0),
+                    "prefill_us": float(event.prefill_us),
+                    "rebuild_us": float(event.phase_rebuild_us or 0.0),
+                    "cold_us": float(event.phase_cold_us or 0.0),
+                    "seam_us": float(event.phase_seam_us or 0.0),
+                    "tail_us": float(event.phase_tail_us or 0.0),
+                    "snap_prefix_len": int(event.snap_prefix_len),
+                    "snapshot_boundary": int(event.snapshot_boundary),
                 }
                 continue
-            if ev == "prefill_snapshot_ready":
-                from_snapshot = bool(event.get("from_snapshot", False))
-                snap_len_used = int(event.get("snap_prefix_len", 0))
-                if cache_to_populate is not None and cache_key is not None:
-                    snap = event.get("snapshot")
-                    if snap is not None and snap.key == cache_key:
-                        cache_to_populate.insert(snap)
-                        inserted = True
+            if isinstance(event, SnapshotPublishedEvent) and event.kind == "prefill":
+                from_snapshot = bool(event.from_snapshot)
+                snap_len_used = int(event.snap_prefix_len)
+                inserted = bool(event.admitted)
                 continue
-            if ev == "token":
+            if isinstance(event, TokenEvent):
                 if first_token_us is None:
                     first_token_us = (time.perf_counter_ns() - start) / 1_000.0
                 n_tokens += 1
                 if n_tokens >= max_tokens:
                     break
+                continue
+            if not is_engine_event(event):
+                raise TypeError(f"Unsupported DFlash engine event: {type(event).__name__}")
     finally:
         stream.close()
 
@@ -125,11 +132,11 @@ def _run_one_turn(
         "total_us": total_us,
         "n_tokens": n_tokens,
         "prompt_len": len(prompt_tokens),
-        "from_snapshot": from_snapshot,
-        "snap_prefix_len": snap_len_used,
-        "inserted": inserted,
     }
     out.update(breakdown)
+    out["from_snapshot"] = from_snapshot
+    out["snap_prefix_len"] = snap_len_used
+    out["inserted"] = inserted
     return out
 
 def _build_turn_prompts(tokenizer: Any, n_turns: int, system_target_tokens: int) -> list[list[int]]:
@@ -255,7 +262,7 @@ def _session(
     prompts: list[list[int]],
     max_tokens: int,
     use_cache: bool,
-    cache: Optional[DFlashPrefixCache],
+    cache: Optional[PrefixSnapshotStore],
     key: Optional[DFlashPrefixKey],
     runtime_context: Any,
 ) -> list[dict[str, Any]]:
@@ -377,7 +384,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     print("\n=== DFlash + PREFIX CACHE (new feature) ===")
-    cache = DFlashPrefixCache(max_entries=16)
+    cache = PrefixSnapshotStore(l1=DFlashPrefixCache(max_entries=16))
     key = _build_key(target_ref, resolved_draft or draft_ref, draft_model, runtime_context)
     cached = _session(
         target_model=target_model,

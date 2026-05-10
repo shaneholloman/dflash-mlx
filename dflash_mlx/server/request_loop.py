@@ -9,21 +9,29 @@ import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from dflash_mlx.bench_logger import log_cycle as _bench_log_cycle
 from dflash_mlx.engine.memory_waterfall import (
     collect_memory_waterfall,
     format_memory_waterfall_summary,
     merge_memory_waterfall_peak,
     prefix_cache_memory_fields,
 )
+from dflash_mlx.engine.events import (
+    CycleCompleteEvent,
+    MemoryWaterfallEvent,
+    PrefillCompleteEvent,
+    PrefillProgressEvent,
+    SnapshotPublishedEvent,
+    SummaryEvent,
+    TokenEvent,
+)
 from dflash_mlx.server.prefix_cache_flow import PrefixCacheFlow
-from dflash_mlx.server.metrics import update_live_request
+from dflash_mlx.server.metrics import record_cycle_diagnostic, update_live_request
 from dflash_mlx.server.protocol import make_response, match_stream_token
 
 @dataclass
 class RequestLoopResult:
-    summary_event: Optional[dict[str, Any]]
-    prefill_event: Optional[dict[str, Any]]
+    summary_event: Optional[SummaryEvent]
+    prefill_event: Optional[PrefillCompleteEvent]
     request_start_ns: int
     first_token_ns: Optional[int]
     prefill_done_ns: Optional[int]
@@ -62,8 +70,8 @@ def consume_dflash_events(
     pending_finish_reason: Optional[str] = None
     first_token_flushed = False
     finish_reason: Optional[str] = None
-    summary_event: Optional[dict[str, Any]] = None
-    prefill_event: Optional[dict[str, Any]] = None
+    summary_event: Optional[SummaryEvent] = None
+    prefill_event: Optional[PrefillCompleteEvent] = None
     prefill_done_ns: Optional[int] = None
     first_token_ns: Optional[int] = None
     prefill_elapsed_s = 0.0
@@ -77,48 +85,53 @@ def consume_dflash_events(
         if runtime_context is not None
         else None
     )
-    trace = diagnostics.trace if diagnostics is not None else None
     memory_enabled = bool(diagnostics is not None and diagnostics.memory_waterfall)
 
     try:
         for event in event_iter:
-            event_name = event.get("event")
-            if bench_active and event_name == "cycle_complete":
-                cycle_event = {k: v for k, v in event.items() if k != "event"}
-                _bench_log_cycle(trace, request_id=request_id, **cycle_event)
+            if isinstance(event, CycleCompleteEvent):
+                if bench_active:
+                    record_cycle_diagnostic(
+                        diagnostics=diagnostics,
+                        request_id=request_id,
+                        fields=event.to_payload(),
+                    )
                 continue
-            if event_name == "memory_waterfall":
-                memory_event = {k: v for k, v in event.items() if k != "event"}
+            if isinstance(event, MemoryWaterfallEvent):
+                memory_event = dict(event.fields)
                 memory_event = _with_prefix_cache_memory(memory_event, prefix_flow)
                 memory_peak = merge_memory_waterfall_peak(memory_peak, memory_event)
                 if bench_active:
-                    _bench_log_cycle(trace, request_id=request_id, **memory_event)
+                    record_cycle_diagnostic(
+                        diagnostics=diagnostics,
+                        request_id=request_id,
+                        fields=memory_event,
+                    )
                 continue
-            if event_name in ("prefill", "prefill_progress"):
-                if event_name == "prefill":
-                    prefill_event = dict(event)
-                processed = int(
-                    event.get(
-                        "tokens_processed",
-                        event.get("prompt_token_count", len(prompt)),
-                    )
-                )
-                total = int(
-                    event.get(
-                        "tokens_total",
-                        event.get("prompt_token_count", len(prompt)),
-                    )
-                )
+            if isinstance(event, PrefillProgressEvent | PrefillCompleteEvent):
+                if isinstance(event, PrefillCompleteEvent):
+                    prefill_event = event
+                    processed = int(event.prompt_token_count)
+                    total = int(event.prompt_token_count)
+                else:
+                    processed = int(event.tokens_processed)
+                    total = int(event.tokens_total)
                 elapsed_s = (time.perf_counter_ns() - request_start_ns) / 1e9
                 update_live_request(
                     request_id=request_id,
-                    state="prefill" if event_name == "prefill_progress" else "decode",
+                    state=(
+                        "prefill"
+                        if isinstance(event, PrefillProgressEvent)
+                        else "decode"
+                    ),
                     prefill_tokens_processed=processed,
                     prefill_tokens_total=total,
-                    prefill_s=elapsed_s if event_name == "prefill" else None,
-                    prefill_done=event_name == "prefill",
+                    prefill_s=(
+                        elapsed_s if isinstance(event, PrefillCompleteEvent) else None
+                    ),
+                    prefill_done=isinstance(event, PrefillCompleteEvent),
                 )
-                if event_name == "prefill_progress":
+                if isinstance(event, PrefillProgressEvent):
                     sys.stderr.write(
                         f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] "
                         f"prefill: {processed}/{total} tokens | {elapsed_s:.1f}s\n"
@@ -136,44 +149,39 @@ def consume_dflash_events(
                         )
                         sys.stderr.flush()
                 continue
-            if event_name == "prefill_snapshot_ready":
-                if prefix_flow is not None:
-                    prefix_flow.handle_prefill_snapshot(event["snapshot"])
+            if isinstance(event, SnapshotPublishedEvent):
                 continue
-            if event_name == "generation_snapshot_ready":
-                if prefix_flow is not None:
-                    prefix_flow.handle_generation_snapshot(event["snapshot"])
-                continue
-            if event_name != "token":
-                if event_name == "summary":
-                    summary_event = event
-                    update_live_request(
-                        request_id=request_id,
-                        state="finishing",
-                        generated_tokens=_int_or_zero(event.get("generation_tokens")),
-                        acceptance_rate=_float_or_none(event.get("acceptance_ratio")),
-                        cycles=_int_or_none(event.get("cycles_completed")),
-                    )
-                    generated_token_ids = list(event.get("generated_token_ids", []) or [])
-                    if generated_token_ids:
-                        last_token = int(generated_token_ids[-1])
-                        if last_token in eos_token_ids:
-                            finish_reason = "stop"
-                        elif int(event.get("generation_tokens", 0)) >= int(max_tokens):
-                            finish_reason = "length"
-                        else:
-                            finish_reason = "stop"
+            if isinstance(event, SummaryEvent):
+                summary_event = event
+                update_live_request(
+                    request_id=request_id,
+                    state="finishing",
+                    generated_tokens=int(event.generation_tokens),
+                    acceptance_rate=float(event.acceptance_ratio),
+                    cycles=int(event.cycles_completed),
+                )
+                generated_token_ids = list(event.generated_token_ids)
+                if generated_token_ids:
+                    last_token = int(generated_token_ids[-1])
+                    if last_token in eos_token_ids:
+                        finish_reason = "stop"
+                    elif int(event.generation_tokens) >= int(max_tokens):
+                        finish_reason = "length"
                     else:
                         finish_reason = "stop"
+                else:
+                    finish_reason = "stop"
                 continue
+            if not isinstance(event, TokenEvent):
+                raise TypeError(f"Unsupported DFlash engine event: {type(event).__name__}")
 
             if client_done:
                 continue
-            token = int(event["token_id"])
+            token = int(event.token_id)
             if first_token_ns is None:
                 first_token_ns = time.perf_counter_ns()
             live_token_count += 1
-            live_acceptance_pct = float(event.get("acceptance_ratio", 0.0) or 0.0) * 100.0
+            live_acceptance_pct = float(event.acceptance_ratio) * 100.0
             elapsed_s = (time.perf_counter_ns() - request_start_ns) / 1e9
             live_tok_s = live_token_count / max(0.001, elapsed_s - prefill_elapsed_s)
             update_live_request(
@@ -261,7 +269,11 @@ def consume_dflash_events(
             )
             memory_peak = merge_memory_waterfall_peak(memory_peak, memory_event)
             if bench_active:
-                _bench_log_cycle(trace, request_id=request_id, **memory_event)
+                record_cycle_diagnostic(
+                    diagnostics=diagnostics,
+                    request_id=request_id,
+                    fields=memory_event,
+                )
 
     detokenizer.finalize()
     tail = detokenizer.last_segment
@@ -310,23 +322,3 @@ def _with_prefix_cache_memory(
 
 def _context_should_stop(ctx: Any) -> bool:
     return bool(getattr(ctx, "_should_stop", False))
-
-def _int_or_none(value: Any) -> Optional[int]:
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-def _int_or_zero(value: Any) -> int:
-    parsed = _int_or_none(value)
-    return 0 if parsed is None else parsed
-
-def _float_or_none(value: Any) -> Optional[float]:
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None

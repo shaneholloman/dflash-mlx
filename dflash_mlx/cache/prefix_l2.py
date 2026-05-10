@@ -444,13 +444,13 @@ class DFlashPrefixL2Cache:
             self._stats["misses"] += 1
         return None
 
-    def insert_async(self, snapshot: DFlashPrefixSnapshot) -> None:
+    def insert_async(self, snapshot: DFlashPrefixSnapshot) -> bool:
         if not self.writable:
-            return
+            return False
         if not self._writer_slots.acquire(blocking=False):
             with self._lock:
                 self._stats["write_drops_queue_full"] += 1
-            return
+            return False
         try:
             payload = self._prepare_payload(snapshot)
         except OSError as e:
@@ -463,12 +463,13 @@ class DFlashPrefixL2Cache:
                 with self._lock:
                     self._stats["materialize_errors"] += 1
             self._writer_slots.release()
-            return
+            return False
         except Exception:
             self._writer_slots.release()
             raise
 
         self._write_queue.put(payload)
+        return True
 
     def stats(self) -> dict[str, Any]:
         with self._lock:

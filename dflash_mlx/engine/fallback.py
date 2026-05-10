@@ -10,6 +10,18 @@ from typing import Any, Optional
 
 import mlx.core as mx
 
+from dflash_mlx.engine.events import (
+    EngineEvent,
+    PrefillCompleteEvent,
+    SummaryEvent,
+    TokenEvent,
+)
+from dflash_mlx.engine.sampling import (
+    build_suppress_token_mask,
+    greedy_tokens_with_mask,
+    prepare_prompt_tokens,
+)
+
 def _make_fallback_target_cache(
     target_model: Any,
     target_ops: Any,
@@ -36,16 +48,11 @@ def stream_baseline_generate(
     prompt_tokens_override: Optional[list[int]] = None,
     quantize_kv_cache: bool = False,
     fallback_reason: Optional[str] = None,
-) -> Iterator[dict[str, Any]]:
-    from dflash_mlx.runtime import (
-        _prepare_prompt_tokens,
-        build_suppress_token_mask,
-        greedy_tokens_with_mask,
-    )
+) -> Iterator[EngineEvent]:
     prompt_tokens = (
         list(prompt_tokens_override)
         if prompt_tokens_override is not None
-        else _prepare_prompt_tokens(tokenizer, prompt, use_chat_template=use_chat_template)
+        else prepare_prompt_tokens(tokenizer, prompt, use_chat_template=use_chat_template)
     )
     prompt_len = len(prompt_tokens)
     stop_token_ids = list(stop_token_ids or [])
@@ -67,29 +74,27 @@ def stream_baseline_generate(
     generated_tokens = [next_token]
 
     _pre_yield = time.perf_counter_ns()
-    yield {
-        "event": "prefill",
-        "prefill_us": prefill_ns / 1_000.0,
-        "prompt_token_count": prompt_len,
-        "logical_ctx_tokens": int(prompt_len),
-        "physical_prefill_tokens": int(prompt_len),
-        "prefill_tokens_restored": 0,
-        "prefill_tokens_computed": int(prompt_len),
-        "fallback_ar": True,
-        "fallback_reason": fallback_reason,
-    }
+    yield PrefillCompleteEvent(
+        prefill_us=prefill_ns / 1_000.0,
+        prompt_token_count=int(prompt_len),
+        logical_ctx_tokens=int(prompt_len),
+        physical_prefill_tokens=int(prompt_len),
+        prefill_tokens_restored=0,
+        prefill_tokens_computed=int(prompt_len),
+        fallback_ar=True,
+        fallback_reason=fallback_reason,
+    )
     _yield_pause_ns += time.perf_counter_ns() - _pre_yield
 
     _pre_yield = time.perf_counter_ns()
-    yield {
-        "event": "token",
-        "token_id": next_token,
-        "generated_tokens": 1,
-        "acceptance_ratio": 0.0,
-        "cycles_completed": 0,
-        "fallback_ar": True,
-        "fallback_reason": fallback_reason,
-    }
+    yield TokenEvent(
+        token_id=int(next_token),
+        generated_tokens=1,
+        acceptance_ratio=0.0,
+        cycles_completed=0,
+        fallback_ar=True,
+        fallback_reason=fallback_reason,
+    )
     _yield_pause_ns += time.perf_counter_ns() - _pre_yield
 
     while len(generated_tokens) < max_new_tokens:
@@ -100,31 +105,29 @@ def stream_baseline_generate(
         next_token = int(greedy_tokens_with_mask(logits[:, -1, :], suppress_token_mask).item())
         generated_tokens.append(next_token)
         _pre_yield = time.perf_counter_ns()
-        yield {
-            "event": "token",
-            "token_id": next_token,
-            "generated_tokens": len(generated_tokens),
-            "acceptance_ratio": 0.0,
-            "cycles_completed": 0,
-            "fallback_ar": True,
-            "fallback_reason": fallback_reason,
-        }
+        yield TokenEvent(
+            token_id=int(next_token),
+            generated_tokens=len(generated_tokens),
+            acceptance_ratio=0.0,
+            cycles_completed=0,
+            fallback_ar=True,
+            fallback_reason=fallback_reason,
+        )
         _yield_pause_ns += time.perf_counter_ns() - _pre_yield
 
     elapsed_us = (time.perf_counter_ns() - start_ns - _yield_pause_ns) / 1_000.0
     del cache
     if hasattr(mx, "clear_cache"):
         mx.clear_cache()
-    yield {
-        "event": "summary",
-        "elapsed_us": elapsed_us,
-        "prompt_token_count": prompt_len,
-        "generated_token_ids": generated_tokens,
-        "generation_tokens": len(generated_tokens),
-        "accepted_from_draft": 0,
-        "acceptance_ratio": 0.0,
-        "cycles_completed": 0,
-        "phase_timings_us": {
+    yield SummaryEvent(
+        elapsed_us=elapsed_us,
+        prompt_token_count=int(prompt_len),
+        generated_token_ids=tuple(int(token) for token in generated_tokens),
+        generation_tokens=len(generated_tokens),
+        accepted_from_draft=0,
+        acceptance_ratio=0.0,
+        cycles_completed=0,
+        phase_timings_us={
             "prefill": prefill_ns / 1_000.0,
             "draft": 0.0,
             "draft_prefill": 0.0,
@@ -133,7 +136,7 @@ def stream_baseline_generate(
             "replay": 0.0,
             "commit": 0.0,
         },
-        "verify_len_cap": None,
-        "fallback_ar": True,
-        "fallback_reason": fallback_reason,
-    }
+        verify_len_cap=None,
+        fallback_ar=True,
+        fallback_reason=fallback_reason,
+    )

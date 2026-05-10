@@ -21,6 +21,7 @@ from dflash_mlx.cache.codecs import (
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
 from dflash_mlx.cache.prefix_l1 import DFlashPrefixCache
 from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
+from dflash_mlx.cache.store import PrefixSnapshotStore
 from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
 from dflash_mlx.server.prefix_cache_flow import compute_stable_prefix_len
 
@@ -751,6 +752,7 @@ class TestSkipLongSnapshot:
 
             def insert_async(self, snap):
                 self.inserts.append(snap)
+                return True
 
             def lookup(self, tokens, key):
                 return None
@@ -762,11 +764,13 @@ class TestSkipLongSnapshot:
                 pass
 
         l2 = _StubL2()
-        cache = DFlashPrefixCache(
-            max_entries=8,
-            max_bytes=8 * 1024 * 1024 * 1024,
+        cache = PrefixSnapshotStore(
+            l1=DFlashPrefixCache(
+                max_entries=8,
+                max_bytes=8 * 1024 * 1024 * 1024,
+                max_snapshot_tokens=5,
+            ),
             l2=l2,
-            max_snapshot_tokens=5,
         )
         key = _make_key()
         too_long = _make_synthetic_snapshot([1, 2, 3, 4, 5, 6], key)

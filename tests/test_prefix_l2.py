@@ -26,6 +26,8 @@ from dflash_mlx.cache.prefix_l2 import (
     _serialize,
     _token_hash,
 )
+from dflash_mlx.cache.store import PrefixSnapshotStore
+from dflash_mlx.diagnostics import TraceConfig
 from tests.test_prefix_cache import (
     _make_key,
     _make_synthetic_snapshot,
@@ -44,6 +46,19 @@ def _all_snapshot_files(cache_dir: Path) -> list[Path]:
 def _bucket_dir(cache_dir: Path, key) -> Path:
     kh = _key_hash(key)
     return cache_dir / L2_LAYOUT_ROOT / _runtime_layout_hash() / kh[:2] / kh
+
+
+def _store(
+    *,
+    l2: DFlashPrefixL2Cache,
+    max_entries: int = 4,
+    max_bytes: int = 10**9,
+) -> PrefixSnapshotStore:
+    return PrefixSnapshotStore(
+        l1=DFlashPrefixCache(max_entries=max_entries, max_bytes=max_bytes),
+        l2=l2,
+    )
+
 
 def _write_tampered_snapshot_file(
     cache_dir: Path,
@@ -179,7 +194,7 @@ class TestL2Lifecycle:
     def test_evict_promotes_to_l2_disk(self, tmp_path):
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
-            cache = DFlashPrefixCache(max_entries=1, max_bytes=10**9, l2=l2)
+            cache = _store(max_entries=1, max_bytes=10**9, l2=l2)
             key = _make_key()
             cache.insert(_make_synthetic_snapshot([1, 2, 3], key))
             cache.insert(_make_synthetic_snapshot([4, 5, 6], key))
@@ -188,12 +203,29 @@ class TestL2Lifecycle:
         finally:
             l2.shutdown()
 
+    def test_pruned_prefix_promotes_to_l2_disk(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
+            key = _make_key()
+            cache.insert(_make_synthetic_snapshot([1, 2, 3], key))
+            cache.insert(_make_synthetic_snapshot([1, 2, 3, 4], key))
+            _wait_writes(l2, expected=1)
+
+            matched, hydrated = cache.lookup([1, 2, 3], key)
+
+            assert matched == 3
+            assert hydrated is not None
+            assert hydrated.token_ids == (1, 2, 3)
+        finally:
+            l2.shutdown()
+
     def test_l2_lookup_promotes_to_l1(self, tmp_path):
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
             key = _make_key()
             l2._write_one(_make_synthetic_snapshot([7, 8, 9, 10], key))
-            cache = DFlashPrefixCache(max_entries=4, max_bytes=10**9, l2=l2)
+            cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
             matched, hydrated = cache.lookup([7, 8, 9, 10], key)
             assert matched == 4
             assert hydrated is not None
@@ -204,13 +236,35 @@ class TestL2Lifecycle:
         finally:
             l2.shutdown()
 
+    def test_l2_lookup_hit_logs_cache_event_from_store_trace(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path / "l2", max_bytes=10**9)
+        try:
+            trace_dir = tmp_path / "trace"
+            key = _make_key()
+            l2._write_one(_make_synthetic_snapshot([7, 8, 9, 10], key))
+            cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
+            cache.set_trace_config(TraceConfig(log_dir=trace_dir))
+
+            matched, hydrated = cache.lookup([7, 8, 9, 10], key)
+
+            assert matched == 4
+            assert hydrated is not None
+            rows = (trace_dir / "cache_events.jsonl").read_text().splitlines()
+            assert rows
+            event = json.loads(rows[-1])
+            assert event["op"] == "lookup"
+            assert event["result"] == "l2_hit"
+            assert event["matched_len"] == 4
+        finally:
+            l2.shutdown()
+
     def test_l2_lookup_miss_when_key_mismatch(self, tmp_path):
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
             key_a = _make_key(target_model_id="model-a")
             key_b = _make_key(target_model_id="model-b")
             l2._write_one(_make_synthetic_snapshot([1, 2, 3], key_a))
-            cache = DFlashPrefixCache(max_entries=4, max_bytes=10**9, l2=l2)
+            cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
             matched, hydrated = cache.lookup([1, 2, 3], key_b)
             assert matched == 0
             assert hydrated is None
@@ -225,7 +279,7 @@ class TestL2Lifecycle:
         try:
             key = _make_key()
             l2._write_one(_make_synthetic_snapshot([1, 2, 3, 4, 5], key))
-            cache = DFlashPrefixCache(max_entries=4, max_bytes=10**9, l2=l2)
+            cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
             matched, hydrated = cache.lookup([1, 2, 99, 4, 5], key)
             assert matched == 0
             assert hydrated is None
@@ -276,7 +330,7 @@ class TestFailureModes:
             )
             bad = bucket / name
             bad.write_bytes(b"not a safetensors file")
-            cache = DFlashPrefixCache(max_entries=4, max_bytes=10**9, l2=l2)
+            cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
             matched, hydrated = cache.lookup([1, 2, 3], key)
             assert matched == 0
             assert hydrated is None
@@ -304,7 +358,7 @@ class TestFailureModes:
                 fp_short="0" * 16,
             )
             mx.save_safetensors(str(stale), arrays, metadata=meta_dict)
-            cache = DFlashPrefixCache(max_entries=4, max_bytes=10**9, l2=l2)
+            cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
             matched, _ = cache.lookup([1, 2], key)
             assert matched == 0
             assert not stale.exists()
@@ -331,7 +385,7 @@ class TestFailureModes:
                 fp_short="0" * 16,
             )
             mx.save_safetensors(str(stale), arrays, metadata=meta_dict)
-            cache = DFlashPrefixCache(max_entries=4, max_bytes=10**9, l2=l2)
+            cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
             matched, _ = cache.lookup([1, 2], key)
             assert matched == 0
             assert not stale.exists()
@@ -437,7 +491,7 @@ class TestFailureModes:
                 raise OSError(errno.ENOSPC, "disk full (test)")
 
             monkeypatch.setattr("mlx.core.save_safetensors", _enospc)
-            cache = DFlashPrefixCache(max_entries=1, max_bytes=10**9, l2=l2)
+            cache = _store(max_entries=1, max_bytes=10**9, l2=l2)
             key = _make_key()
             cache.insert(_make_synthetic_snapshot([1, 2, 3], key))
             cache.insert(_make_synthetic_snapshot([4, 5, 6], key))
@@ -495,10 +549,10 @@ class TestEvictionAndStats:
         finally:
             l2.shutdown()
 
-    def test_stats_surfaced_through_l1(self, tmp_path):
+    def test_stats_surfaced_through_store(self, tmp_path):
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
-            cache = DFlashPrefixCache(max_entries=1, max_bytes=10**9, l2=l2)
+            cache = _store(max_entries=1, max_bytes=10**9, l2=l2)
             key = _make_key()
             cache.insert(_make_synthetic_snapshot([1, 2, 3], key))
             cache.insert(_make_synthetic_snapshot([4, 5, 6], key))
@@ -513,7 +567,7 @@ class TestEvictionAndStats:
     def test_clear_removes_l2_files(self, tmp_path):
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
-            cache = DFlashPrefixCache(max_entries=1, max_bytes=10**9, l2=l2)
+            cache = _store(max_entries=1, max_bytes=10**9, l2=l2)
             key = _make_key()
             cache.insert(_make_synthetic_snapshot([1, 2, 3], key))
             cache.insert(_make_synthetic_snapshot([4, 5, 6], key))

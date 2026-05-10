@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import json
-import builtins
 from io import BytesIO
 from types import SimpleNamespace
 
@@ -13,11 +12,18 @@ import pytest
 
 from dflash_mlx.cache.manager import RuntimeCacheManager
 from dflash_mlx.cache.prefix_l1 import DFlashPrefixCache
+from dflash_mlx.cache.store import PrefixSnapshotStore
 from dflash_mlx.diagnostics import DiagnosticsConfig, TraceConfig
+from dflash_mlx.engine.events import PrefillCompleteEvent, SummaryEvent
+from dflash_mlx.observability import memory as memory_obs
 from dflash_mlx.server import metrics as metrics_mod
 from dflash_mlx.server.metrics import (
     configure_live_metrics,
+    finalize_request_observability,
+    get_live_metrics_payload,
+    record_cycle_diagnostic,
     record_request_metrics,
+    record_target_only_request,
     reset_live_metrics_for_tests,
     start_live_request,
     update_live_request,
@@ -144,6 +150,50 @@ def _patch_memory_snapshot(monkeypatch, **overrides):
     )
 
 
+def _summary_event(
+    *,
+    generation_tokens: int,
+    acceptance_ratio: float = 0.0,
+    cycles_completed: int = 0,
+    tokens_per_cycle: float = 0.0,
+    phase_timings_us: dict[str, float] | None = None,
+    elapsed_us: float = 0.0,
+) -> SummaryEvent:
+    return SummaryEvent(
+        elapsed_us=elapsed_us,
+        prompt_token_count=0,
+        generated_token_ids=tuple(0 for _ in range(generation_tokens)),
+        generation_tokens=generation_tokens,
+        accepted_from_draft=0,
+        acceptance_ratio=acceptance_ratio,
+        cycles_completed=cycles_completed,
+        phase_timings_us=phase_timings_us or {},
+        tokens_per_cycle=tokens_per_cycle,
+    )
+
+
+def _prefill_event(
+    *,
+    prompt_token_count: int,
+    logical_ctx_tokens: int,
+    physical_prefill_tokens: int,
+    prefill_tokens_restored: int,
+    prefill_tokens_computed: int,
+    phase_cold_us: float | None = None,
+    phase_seam_us: float | None = None,
+) -> PrefillCompleteEvent:
+    return PrefillCompleteEvent(
+        prefill_us=0.0,
+        prompt_token_count=prompt_token_count,
+        logical_ctx_tokens=logical_ctx_tokens,
+        physical_prefill_tokens=physical_prefill_tokens,
+        prefill_tokens_restored=prefill_tokens_restored,
+        prefill_tokens_computed=prefill_tokens_computed,
+        phase_cold_us=phase_cold_us,
+        phase_seam_us=phase_seam_us,
+    )
+
+
 def test_diagnostics_post_event_records_prefill_details(tmp_path):
     diagnostics = DiagnosticsConfig(
         mode="full",
@@ -153,13 +203,13 @@ def test_diagnostics_post_event_records_prefill_details(tmp_path):
 
     record_request_metrics(
         request_id=7,
-        summary_event={
-            "generation_tokens": 1,
-            "acceptance_ratio": 0.0,
-            "cycles_completed": 0,
-            "tokens_per_cycle": 0.0,
-            "phase_timings_us": {"prefill": 2_000_000.0},
-        },
+        summary_event=_summary_event(
+            generation_tokens=1,
+            acceptance_ratio=0.0,
+            cycles_completed=0,
+            tokens_per_cycle=0.0,
+            phase_timings_us={"prefill": 2_000_000.0},
+        ),
         request_start_ns=1_000_000_000,
         request_done_ns=3_500_000_000,
         first_token_ns=3_000_000_000,
@@ -171,16 +221,15 @@ def test_diagnostics_post_event_records_prefill_details(tmp_path):
         cache_insert_ms=0.0,
         finish_reason="length",
         max_tokens=1,
-        prefill_event={
-            "event": "prefill",
-            "prompt_token_count": 4096,
-            "logical_ctx_tokens": 4096,
-            "physical_prefill_tokens": 1024,
-            "prefill_tokens_restored": 3072,
-            "prefill_tokens_computed": 1024,
-            "phase_cold_us": 1_900_000.0,
-            "phase_seam_us": 100_000.0,
-        },
+        prefill_event=_prefill_event(
+            prompt_token_count=4096,
+            logical_ctx_tokens=4096,
+            physical_prefill_tokens=1024,
+            prefill_tokens_restored=3072,
+            prefill_tokens_computed=1024,
+            phase_cold_us=1_900_000.0,
+            phase_seam_us=100_000.0,
+        ),
         runtime_config=SimpleNamespace(
             profile="balanced",
             prefill_step_size=8192,
@@ -214,10 +263,184 @@ def test_diagnostics_post_event_records_prefill_details(tmp_path):
     assert "prefill_tok_s" in (tmp_path / "summary.md").read_text()
 
 
+def test_target_only_request_records_live_metrics_and_post_event(tmp_path, monkeypatch):
+    reset_live_metrics_for_tests()
+    monkeypatch.setattr(metrics_mod, "current_runtime_cache_manager", lambda: None)
+    diagnostics = DiagnosticsConfig(
+        mode="basic",
+        run_dir=tmp_path,
+        trace=TraceConfig(log_dir=tmp_path),
+    )
+
+    record_target_only_request(
+        request_id=8,
+        mode_used="ar_fastpath",
+        wall_ms=125.0,
+        max_tokens=32,
+        diagnostics=diagnostics,
+    )
+
+    row = json.loads((tmp_path / "post_events.jsonl").read_text().splitlines()[-1])
+    assert row["request_id"] == 8
+    assert row["mode_used"] == "ar_fastpath"
+    assert row["wall_ms"] == 125.0
+    assert row["max_tokens"] == 32
+    payload = get_live_metrics_payload()
+    assert payload["last_request"]["request_id"] == 8
+    assert payload["last_request"]["mode_used"] == "ar_fastpath"
+    assert payload["last_request"]["max_tokens"] == 32
+    assert payload["totals"]["requests"] == 1
+
+
+def test_cycle_diagnostic_records_cycle_event(tmp_path):
+    diagnostics = DiagnosticsConfig(
+        mode="full",
+        run_dir=tmp_path,
+        trace=TraceConfig(log_dir=tmp_path, cycle_events=True),
+    )
+
+    record_cycle_diagnostic(
+        diagnostics=diagnostics,
+        request_id=9,
+        fields={"cycle": 1, "commit_count": 4},
+    )
+
+    row = json.loads((tmp_path / "cycle_events.jsonl").read_text().splitlines()[-1])
+    assert row["request_id"] == 9
+    assert row["cycle"] == 1
+    assert row["commit_count"] == 4
+
+
+def test_finalize_request_observability_records_all_outputs(tmp_path, monkeypatch, capsys):
+    reset_live_metrics_for_tests()
+    monkeypatch.setattr(metrics_mod, "current_runtime_cache_manager", lambda: None)
+    monkeypatch.setattr(
+        metrics_mod,
+        "get_memory_snapshot",
+        lambda: _memory_snapshot(),
+    )
+    diagnostics = DiagnosticsConfig(
+        mode="full",
+        run_dir=tmp_path,
+        trace=TraceConfig(log_dir=tmp_path, cycle_events=True),
+    )
+
+    finalize_request_observability(
+        request_id=10,
+        summary_event=_summary_event(
+            generation_tokens=4,
+            acceptance_ratio=0.5,
+            cycles_completed=2,
+            tokens_per_cycle=2.0,
+            phase_timings_us={"prefill": 1_000_000.0},
+            elapsed_us=3_000_000.0,
+        ),
+        request_start_ns=0,
+        request_done_ns=3_000_000_000,
+        first_token_ns=1_500_000_000,
+        prefill_done_ns=1_000_000_000,
+        prompt_token_count=8,
+        live_token_count=4,
+        cache_lookup_ms=0.25,
+        cache_hit_tokens=0,
+        cache_insert_ms=0.5,
+        finish_reason="stop",
+        max_tokens=16,
+        prompt_regime={"request_type": "chat"},
+        memory_waterfall_peak={"mlx_active_gb": 6.0, "mlx_cache_gb": 1.0},
+        diagnostics=diagnostics,
+        prefill_event=_prefill_event(
+            prompt_token_count=8,
+            logical_ctx_tokens=8,
+            physical_prefill_tokens=8,
+            prefill_tokens_restored=0,
+            prefill_tokens_computed=8,
+        ),
+        runtime_config=_runtime_config(prefix_cache=False),
+    )
+
+    post = json.loads((tmp_path / "post_events.jsonl").read_text().splitlines()[-1])
+    assert post["request_id"] == 10
+    assert post["mode_used"] == "dflash"
+    assert post["prompt_tokens"] == 8
+    assert post["generated_tokens"] == 4
+    assert post["prefill_tok_s"] == 8.0
+    assert post["decode_tok_s"] == 2.0
+    assert post["prefill_event"]["physical_prefill_tokens"] == 8
+    assert post["memory_waterfall_peak"]["mlx_active_gb"] == 6.0
+    summary = (tmp_path / "summary.md").read_text()
+    assert "| 10 | 8 | 4 | 3000.0 | 1500.0 | 1000.0 | 8.00 |" in summary
+    payload = get_live_metrics_payload()
+    assert payload["last_request"]["request_id"] == 10
+    assert payload["last_request"]["generated_tokens"] == 4
+    err = capsys.readouterr().err
+    assert "2.0 tok/s | prefill 8.0 tok/s" in err
+    assert "req#10 mlx_active=2.00" in err
+    assert "req#10 mlx_active=6.00" not in err
+    assert "memory snapshot partial" not in err
+
+
+def test_diagnostics_summary_append_failure_is_signaled(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    reset_live_metrics_for_tests()
+    monkeypatch.setattr(metrics_mod, "current_runtime_cache_manager", lambda: None)
+
+    def fail_open(self, *_args, **_kwargs):
+        if self.name == "summary.md":
+            raise OSError("summary full")
+        raise AssertionError(f"unexpected Path.open call for {self}")
+
+    monkeypatch.setattr(metrics_mod.Path, "open", fail_open)
+    diagnostics = DiagnosticsConfig(
+        mode="full",
+        run_dir=tmp_path,
+        trace=TraceConfig(log_dir=tmp_path, cycle_events=True),
+    )
+
+    record_request_metrics(
+        request_id=11,
+        summary_event=_summary_event(
+            generation_tokens=2,
+            acceptance_ratio=0.5,
+            cycles_completed=1,
+            tokens_per_cycle=2.0,
+            phase_timings_us={},
+        ),
+        request_start_ns=0,
+        request_done_ns=2_000_000_000,
+        first_token_ns=1_000_000_000,
+        prefill_done_ns=1_000_000_000,
+        prompt_token_count=8,
+        live_token_count=2,
+        cache_lookup_ms=0.0,
+        cache_hit_tokens=0,
+        cache_insert_ms=0.0,
+        finish_reason="stop",
+        max_tokens=4,
+        prefill_event=_prefill_event(
+            prompt_token_count=8,
+            logical_ctx_tokens=8,
+            physical_prefill_tokens=8,
+            prefill_tokens_restored=0,
+            prefill_tokens_computed=8,
+        ),
+        runtime_config=_runtime_config(prefix_cache=False),
+        diagnostics=diagnostics,
+    )
+
+    err = capsys.readouterr().err
+    assert "diagnostics summary append failed: summary full" in err
+    assert get_live_metrics_payload()["last_request"]["request_id"] == 11
+    assert (tmp_path / "post_events.jsonl").exists()
+
+
 def test_metrics_endpoint_returns_json_before_request(monkeypatch):
     reset_live_metrics_for_tests()
     _configure_metrics()
-    monkeypatch.setattr(serve, "_current_runtime_cache_manager", lambda: None)
+    monkeypatch.setattr(metrics_mod, "current_runtime_cache_manager", lambda: None)
 
     payload = _call_metrics_endpoint()
 
@@ -251,6 +474,29 @@ def test_metrics_endpoint_returns_json_before_request(monkeypatch):
     assert payload["totals"]["requests"] == 0
 
 
+def test_live_memory_payload_does_not_spawn_system_wired_probe(monkeypatch):
+    monkeypatch.setattr(
+        memory_obs,
+        "system_wired_bytes",
+        lambda: (_ for _ in ()).throw(AssertionError("vm_stat should not run")),
+    )
+
+    payload = memory_obs.live_memory_payload(wired_limit_bytes=64 * 1024**3)
+
+    assert payload["wired_gb"] is None
+    assert payload["wired_limit_gb"] is not None
+
+
+def test_live_memory_payload_keeps_current_and_peak_rss_separate(monkeypatch):
+    monkeypatch.setattr(memory_obs, "current_rss_bytes", lambda: None)
+    monkeypatch.setattr(memory_obs, "rss_peak_bytes", lambda: 5_000_000_000)
+
+    payload = memory_obs.live_memory_payload()
+
+    assert payload["rss_gb"] is None
+    assert payload["rss_peak_gb"] == 5.0
+
+
 def test_metrics_startup_clears_stale_cache_when_runtime_disables_prefix_cache(monkeypatch):
     import dflash_mlx.cache.manager as cache_manager_mod
 
@@ -265,7 +511,7 @@ def test_metrics_startup_clears_stale_cache_when_runtime_disables_prefix_cache(m
     monkeypatch.setattr(
         cache_manager_mod,
         "_DFLASH_RUNTIME_CACHE_MANAGER",
-        RuntimeCacheManager(stale_cache),
+        RuntimeCacheManager(PrefixSnapshotStore(l1=stale_cache)),
     )
     monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", ("old",))
     monkeypatch.setattr(DFlashPrefixCache, "shutdown", tracked_shutdown)
@@ -326,9 +572,9 @@ def test_metrics_startup_preserves_request_cache_identity(monkeypatch):
 def test_metrics_endpoint_treats_retired_prefix_cache_manager_as_absent(monkeypatch):
     reset_live_metrics_for_tests()
     _configure_metrics()
-    manager = RuntimeCacheManager(DFlashPrefixCache())
+    manager = RuntimeCacheManager(PrefixSnapshotStore(l1=DFlashPrefixCache()))
     manager.shutdown()
-    monkeypatch.setattr(serve, "_current_runtime_cache_manager", lambda: manager)
+    monkeypatch.setattr(metrics_mod, "current_runtime_cache_manager", lambda: manager)
 
     payload = _call_metrics_endpoint()
 
@@ -366,7 +612,9 @@ def test_post_request_memory_line_logs_partial_snapshot(monkeypatch, capsys):
 
     err = capsys.readouterr().err
     assert "[dflash] req#9 memory snapshot partial unavailable=mlx_active_gb,rss_gb" in err
-    assert "[dflash] req#9 mlx_active=0.00" in err
+    assert "[dflash] req#9 mlx_active=n/a" in err
+    assert "rss_now=n/a" in err
+    assert "untracked=n/a GB" in err
 
 
 def test_post_request_memory_line_stderr_failure_does_not_raise(monkeypatch):
@@ -398,79 +646,54 @@ def test_post_request_memory_line_stderr_and_fallback_failure_does_not_raise(mon
 
 
 def test_current_rss_bytes_propagates_programmer_errors(monkeypatch):
-    monkeypatch.setattr(metrics_mod.sys, "platform", "linux")
+    monkeypatch.setattr(memory_obs.sys, "platform", "linux")
 
     def broken_open(*_args, **_kwargs):
         raise TypeError("broken open contract")
 
-    monkeypatch.setattr(builtins, "open", broken_open)
+    monkeypatch.setattr(memory_obs.builtins, "open", broken_open)
 
     with pytest.raises(TypeError, match="broken open contract"):
-        metrics_mod._current_rss_bytes()
+        memory_obs.current_rss_bytes()
 
 
 def test_darwin_rss_helpers_propagate_programmer_errors(monkeypatch):
     def broken_cdll(*_args, **_kwargs):
         raise TypeError("broken ctypes contract")
 
-    monkeypatch.setattr(metrics_mod.ctypes, "CDLL", broken_cdll)
+    monkeypatch.setattr(memory_obs.ctypes, "CDLL", broken_cdll)
 
     with pytest.raises(TypeError, match="broken ctypes contract"):
-        metrics_mod._darwin_proc_resident_size_bytes()
+        memory_obs.darwin_proc_resident_size_bytes()
     with pytest.raises(TypeError, match="broken ctypes contract"):
-        metrics_mod._darwin_task_resident_size_bytes()
+        memory_obs.darwin_task_resident_size_bytes()
 
 
 def test_rss_peak_propagates_programmer_errors(monkeypatch):
     monkeypatch.setattr(
-        metrics_mod.resource,
+        memory_obs.resource,
         "getrusage",
         lambda _kind: SimpleNamespace(ru_maxrss=object()),
     )
 
     with pytest.raises(TypeError):
-        metrics_mod._rss_peak_gb()
+        memory_obs.rss_peak_bytes()
 
 
 def test_mlx_memory_probe_propagates_programmer_errors(monkeypatch):
-    import mlx.core as mx
-
     def broken_getter():
         raise TypeError("broken mlx memory contract")
 
-    monkeypatch.setattr(mx, "get_active_memory", broken_getter)
+    monkeypatch.setattr(memory_obs.mx, "get_active_memory", broken_getter)
 
     with pytest.raises(TypeError, match="broken mlx memory contract"):
-        metrics_mod._mlx_memory_gb("get_active_memory")
-
-
-def test_summary_line_stderr_failure_does_not_raise(monkeypatch):
-    writes: list[tuple[int, bytes]] = []
-    monkeypatch.setattr(metrics_mod.sys, "stderr", BrokenStderr())
-    monkeypatch.setattr(
-        metrics_mod.os,
-        "write",
-        lambda fd, data: writes.append((fd, data)) or len(data),
-    )
-
-    metrics_mod.write_summary_line(
-        summary_event={
-            "generation_tokens": 2,
-            "elapsed_us": 2_000_000.0,
-            "phase_timings_us": {"prefill": 1_000_000.0},
-            "acceptance_ratio": 0.5,
-        },
-        prompt_token_count=4,
-    )
-
-    assert writes
-    assert b"observability stderr write failed: stderr closed" in writes[0][1]
+        memory_obs.mlx_memory_bytes("get_active_memory")
 
 
 def test_metrics_endpoint_reports_current_request(monkeypatch):
     reset_live_metrics_for_tests()
     _configure_metrics()
-    monkeypatch.setattr(serve, "_current_runtime_cache_manager", lambda: None)
+    monkeypatch.setattr(metrics_mod, "current_runtime_cache_manager", lambda: None)
 
     start_live_request(
         request_id=9,
@@ -522,20 +745,20 @@ def test_metrics_endpoint_reports_last_request_and_prefix_cache(monkeypatch):
     reset_live_metrics_for_tests()
     runtime_config = _configure_metrics()
     monkeypatch.setattr(
-        serve,
-        "_current_runtime_cache_manager",
+        metrics_mod,
+        "current_runtime_cache_manager",
         lambda: FakePrefixCacheManager(),
     )
 
     record_request_metrics(
         request_id=12,
-        summary_event={
-            "generation_tokens": 100,
-            "acceptance_ratio": 0.81,
-            "cycles_completed": 44,
-            "tokens_per_cycle": 2.27,
-            "phase_timings_us": {"prefill": 1_000_000.0},
-        },
+        summary_event=_summary_event(
+            generation_tokens=100,
+            acceptance_ratio=0.81,
+            cycles_completed=44,
+            tokens_per_cycle=2.27,
+            phase_timings_us={"prefill": 1_000_000.0},
+        ),
         request_start_ns=0,
         request_done_ns=4_000_000_000,
         first_token_ns=1_000_000_000,
@@ -547,14 +770,13 @@ def test_metrics_endpoint_reports_last_request_and_prefix_cache(monkeypatch):
         cache_insert_ms=0.0,
         finish_reason="stop",
         max_tokens=100,
-        prefill_event={
-            "event": "prefill",
-            "prompt_token_count": 1000,
-            "logical_ctx_tokens": 1000,
-            "physical_prefill_tokens": 250,
-            "prefill_tokens_restored": 750,
-            "prefill_tokens_computed": 250,
-        },
+        prefill_event=_prefill_event(
+            prompt_token_count=1000,
+            logical_ctx_tokens=1000,
+            physical_prefill_tokens=250,
+            prefill_tokens_restored=750,
+            prefill_tokens_computed=250,
+        ),
         runtime_config=runtime_config,
         diagnostics=None,
     )

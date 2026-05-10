@@ -4,22 +4,34 @@
 
 from __future__ import annotations
 
-import ctypes
 import os
-import resource
 import sys
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from dflash_mlx.bench_logger import log_post as _bench_log_post
-from dflash_mlx.cache.manager import RuntimeCacheManagerClosed, sync_runtime_cache_manager
+from dflash_mlx.observability.writer import (
+    log_cycle as _bench_log_cycle,
+    log_post as _bench_log_post,
+    report_observability_failure,
+)
+from dflash_mlx.observability.cache import (
+    live_prefix_cache_payload,
+    live_prefix_cache_totals,
+)
+from dflash_mlx.cache.manager import (
+    RuntimeCacheManagerClosed,
+    current_runtime_cache_manager,
+    sync_runtime_cache_manager,
+)
 from dflash_mlx.diagnostics import DiagnosticsConfig
+from dflash_mlx.engine.events import PrefillCompleteEvent, SummaryEvent
+from dflash_mlx.observability.memory import live_memory_payload
 from dflash_mlx.server.prefix_cache_manager import build_prefix_key
 
-_GB = 1_000_000_000.0
 _LIVE_LOCK = threading.Lock()
 _LIVE_STARTED_AT = time.time()
 _LIVE_SERVER: dict[str, Any] = {
@@ -59,6 +71,237 @@ _LIVE_TOTALS: dict[str, int] = {
     "cache_hits": 0,
     "cache_misses": 0,
 }
+
+@dataclass(frozen=True)
+class _RequestAccounting:
+    request_id: int
+    mode_used: str
+    wall_ms: float
+    max_tokens: int
+    prompt_tokens: Optional[int] = None
+    generated_tokens: Optional[int] = None
+    ttft_ms: Optional[float] = None
+    prefill_ms: Optional[float] = None
+    prefill_tok_s: Optional[float] = None
+    prefill_tok_s_physical: Optional[float] = None
+    prefill_tok_s_apparent: Optional[float] = None
+    decode_ms: Optional[float] = None
+    decode_tok_s: Optional[float] = None
+    acceptance_ratio: Optional[float] = None
+    tokens_per_cycle: Optional[float] = None
+    cycles_completed: Optional[int] = None
+    finish_reason: Optional[str] = None
+    cache_lookup_ms: Optional[float] = None
+    cache_hit_tokens: int = 0
+    cache_insert_ms: Optional[float] = None
+    prompt_regime: Optional[dict[str, Any]] = None
+    prefill_event_payload: Optional[dict[str, Any]] = None
+    prefill_accounting: Optional[dict[str, int]] = None
+    prefill_phase_timings_us: Optional[dict[str, float]] = None
+    phase_timings_us: Optional[dict[str, float]] = None
+    runtime_config: Optional[dict[str, Any]] = None
+    memory_waterfall_peak: Optional[dict[str, Any]] = None
+
+    @classmethod
+    def target_only(
+        cls,
+        *,
+        request_id: int,
+        mode_used: str,
+        wall_ms: float,
+        max_tokens: int,
+    ) -> "_RequestAccounting":
+        return cls(
+            request_id=int(request_id),
+            mode_used=mode_used,
+            wall_ms=float(wall_ms),
+            max_tokens=int(max_tokens),
+        )
+
+    @classmethod
+    def dflash(
+        cls,
+        *,
+        request_id: int,
+        summary_event: Optional[SummaryEvent],
+        request_start_ns: int,
+        request_done_ns: int,
+        first_token_ns: Optional[int],
+        prefill_done_ns: Optional[int],
+        prompt_token_count: int,
+        live_token_count: int,
+        cache_lookup_ms: float,
+        cache_hit_tokens: int,
+        cache_insert_ms: float,
+        finish_reason: Optional[str],
+        max_tokens: int,
+        prompt_regime: Optional[dict[str, Any]],
+        memory_waterfall_peak: Optional[dict[str, Any]],
+        prefill_event: Optional[PrefillCompleteEvent],
+        runtime_config: Optional[Any],
+    ) -> "_RequestAccounting":
+        wall_ms = (request_done_ns - request_start_ns) / 1e6
+        ttft_ms = (
+            (first_token_ns - request_start_ns) / 1e6
+            if first_token_ns is not None
+            else None
+        )
+        prefill_ms = (
+            (prefill_done_ns - request_start_ns) / 1e6
+            if prefill_done_ns is not None
+            else None
+        )
+        prefill_tok_s = (
+            prompt_token_count / (float(prefill_ms) / 1_000.0)
+            if prefill_ms is not None and float(prefill_ms) > 0.0
+            else None
+        )
+        decode_ms = (
+            (request_done_ns - prefill_done_ns) / 1e6
+            if prefill_done_ns is not None
+            else None
+        )
+        generation_tokens = int(
+            summary_event.generation_tokens
+            if summary_event is not None
+            else live_token_count
+        )
+        acceptance_ratio = float(summary_event.acceptance_ratio if summary_event else 0.0)
+        cycles_completed = int(summary_event.cycles_completed if summary_event else 0)
+        tokens_per_cycle = float(summary_event.tokens_per_cycle if summary_event else 0.0)
+        prefill_phase_timings_us = _prefill_phase_timings(prefill_event)
+        prefill_accounting = _prefill_accounting(prefill_event)
+        runtime_config_payload = _runtime_config_payload(runtime_config)
+        logical_prefill_tokens = int(
+            prefill_accounting.get("logical_ctx_tokens", prompt_token_count)
+        )
+        physical_prefill_tokens = prefill_accounting.get("physical_prefill_tokens")
+        prefill_tok_s_apparent = (
+            logical_prefill_tokens / (float(prefill_ms) / 1_000.0)
+            if prefill_ms is not None and float(prefill_ms) > 0.0
+            else None
+        )
+        prefill_tok_s_physical = (
+            int(physical_prefill_tokens) / (float(prefill_ms) / 1_000.0)
+            if physical_prefill_tokens is not None
+            and prefill_ms is not None
+            and float(prefill_ms) > 0.0
+            else None
+        )
+        decode_tok_s = (
+            generation_tokens / (float(decode_ms) / 1_000.0)
+            if decode_ms is not None and float(decode_ms) > 0.0
+            else None
+        )
+        fallback_used = bool(summary_event.fallback_ar if summary_event else False)
+        return cls(
+            request_id=int(request_id),
+            mode_used="dflash_fallback" if fallback_used else "dflash",
+            prompt_tokens=int(prompt_token_count),
+            generated_tokens=generation_tokens,
+            wall_ms=wall_ms,
+            ttft_ms=ttft_ms,
+            prefill_ms=prefill_ms,
+            prefill_tok_s=prefill_tok_s,
+            prefill_tok_s_physical=prefill_tok_s_physical,
+            prefill_tok_s_apparent=prefill_tok_s_apparent,
+            decode_ms=decode_ms,
+            decode_tok_s=decode_tok_s,
+            acceptance_ratio=acceptance_ratio,
+            tokens_per_cycle=tokens_per_cycle,
+            cycles_completed=cycles_completed,
+            finish_reason=finish_reason,
+            max_tokens=int(max_tokens),
+            cache_lookup_ms=float(cache_lookup_ms),
+            cache_hit_tokens=int(cache_hit_tokens),
+            cache_insert_ms=float(cache_insert_ms),
+            prompt_regime=dict(prompt_regime or {}),
+            prefill_event_payload=(
+                prefill_event.to_payload() if prefill_event is not None else {}
+            ),
+            prefill_accounting=dict(prefill_accounting),
+            prefill_phase_timings_us=dict(prefill_phase_timings_us),
+            phase_timings_us=dict(summary_event.phase_timings_us if summary_event else {}),
+            runtime_config=runtime_config_payload,
+            memory_waterfall_peak=dict(memory_waterfall_peak or {}),
+        )
+
+    @property
+    def physical_prefill_tokens(self) -> Optional[int]:
+        return _int_or_none((self.prefill_accounting or {}).get("physical_prefill_tokens"))
+
+    @property
+    def restored_prefill_tokens(self) -> Optional[int]:
+        return _int_or_none((self.prefill_accounting or {}).get("prefill_tokens_restored"))
+
+    @property
+    def computed_prefill_tokens(self) -> Optional[int]:
+        return _int_or_none((self.prefill_accounting or {}).get("prefill_tokens_computed"))
+
+    @property
+    def prefix_cache_enabled(self) -> bool:
+        runtime_config = self.runtime_config or {}
+        return bool(
+            runtime_config.get("prefix_cache", False)
+            and int(runtime_config.get("target_fa_window", 0) or 0) <= 0
+        )
+
+    def last_request_payload(self) -> dict[str, Any]:
+        payload = _last_request_payload(
+            request_id=self.request_id,
+            prompt_tokens=self.prompt_tokens,
+            generated_tokens=self.generated_tokens,
+            wall_ms=self.wall_ms,
+            prefill_ms=self.prefill_ms,
+            decode_ms=self.decode_ms,
+            prefill_tok_s_physical=self.prefill_tok_s_physical,
+            prefill_tok_s_apparent=self.prefill_tok_s_apparent,
+            decode_tok_s=self.decode_tok_s,
+            acceptance_rate=self.acceptance_ratio,
+            cycles=self.cycles_completed,
+            finish_reason=self.finish_reason,
+        )
+        payload["mode_used"] = self.mode_used
+        payload["max_tokens"] = int(self.max_tokens)
+        return payload
+
+    def post_event_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "request_id": int(self.request_id),
+            "mode_used": self.mode_used,
+            "max_tokens": int(self.max_tokens),
+            "wall_ms": float(self.wall_ms),
+        }
+        if self.prompt_tokens is None:
+            return payload
+        payload.update(
+            {
+                "prompt_tokens": int(self.prompt_tokens),
+                "generated_tokens": int(self.generated_tokens or 0),
+                "ttft_ms": self.ttft_ms,
+                "prefill_ms": self.prefill_ms,
+                "prefill_tok_s": self.prefill_tok_s,
+                "prefill_tok_s_physical": self.prefill_tok_s_physical,
+                "prefill_tok_s_apparent": self.prefill_tok_s_apparent,
+                "decode_tok_s": self.decode_tok_s,
+                "decode_ms": self.decode_ms,
+                "cache_lookup_ms": self.cache_lookup_ms,
+                "cache_hit_tokens": int(self.cache_hit_tokens),
+                "cache_insert_ms": self.cache_insert_ms,
+                "acceptance_ratio": self.acceptance_ratio,
+                "tokens_per_cycle": self.tokens_per_cycle,
+                "cycles_completed": self.cycles_completed,
+                "finish_reason": self.finish_reason,
+                "prompt_regime": dict(self.prompt_regime or {}),
+                "prefill_event": dict(self.prefill_event_payload or {}),
+                **dict(self.prefill_accounting or {}),
+                "prefill_phase_timings_us": dict(self.prefill_phase_timings_us or {}),
+                "phase_timings_us": dict(self.phase_timings_us or {}),
+                "runtime_config": dict(self.runtime_config or {}),
+                "memory_waterfall_peak": dict(self.memory_waterfall_peak or {}),
+            }
+        )
+        return payload
 
 def configure_live_metrics(
     *,
@@ -126,9 +369,9 @@ def configure_live_metrics(
             }
         )
 
-def get_live_metrics_payload(*, prefix_cache_manager: Optional[Any] = None) -> dict[str, Any]:
+def get_live_metrics_payload() -> dict[str, Any]:
+    prefix_cache_manager = current_runtime_cache_manager()
     raw_prefix_stats = _prefix_cache_stats(prefix_cache_manager)
-    prefix_stats = _prefix_cache_payload(prefix_cache_manager, stats=raw_prefix_stats)
     now = time.time()
     with _LIVE_LOCK:
         server = dict(_LIVE_SERVER)
@@ -141,6 +384,14 @@ def get_live_metrics_payload(*, prefix_cache_manager: Optional[Any] = None) -> d
         totals = dict(_LIVE_TOTALS)
         metal_limits = dict(_LIVE_METAL_LIMITS)
         finish_times = list(_LIVE_REQUEST_FINISH_TIMES)
+        prefix_config = dict(_LIVE_PREFIX_CONFIG)
+        last_prefix = dict(_LIVE_LAST_PREFIX)
+    prefix_stats = live_prefix_cache_payload(
+        stats=raw_prefix_stats,
+        config=prefix_config,
+        last_request=last_request,
+        last_prefix=last_prefix,
+    )
     payload = {
         "server": server,
         "runtime": runtime,
@@ -159,12 +410,7 @@ def get_live_metrics_payload(*, prefix_cache_manager: Optional[Any] = None) -> d
         "prefix_cache": prefix_stats,
         "totals": totals,
     }
-    if raw_prefix_stats is not None:
-        stats = raw_prefix_stats
-        payload["totals"]["cache_hits"] = int(
-            stats.get("exact_hits", 0) + stats.get("prefix_hits", 0)
-        )
-        payload["totals"]["cache_misses"] = int(stats.get("misses", 0))
+    payload["totals"].update(live_prefix_cache_totals(raw_prefix_stats))
     return payload
 
 def start_live_request(
@@ -254,26 +500,76 @@ def record_target_only_request(
     mode_used: str,
     wall_ms: float,
     max_tokens: int,
+    diagnostics: Optional[DiagnosticsConfig] = None,
 ) -> None:
-    last_request = _last_request_payload(
+    accounting = _RequestAccounting.target_only(
         request_id=request_id,
-        prompt_tokens=None,
-        generated_tokens=None,
+        mode_used=mode_used,
         wall_ms=wall_ms,
-        prefill_ms=None,
-        decode_ms=None,
-        prefill_tok_s_physical=None,
-        prefill_tok_s_apparent=None,
-        decode_tok_s=None,
-        acceptance_rate=None,
-        cycles=None,
-        finish_reason=None,
+        max_tokens=max_tokens,
     )
-    last_request["mode_used"] = mode_used
-    last_request["max_tokens"] = int(max_tokens)
-    with _LIVE_LOCK:
-        _LIVE_TOTALS["requests"] += 1
-        _finish_live_request_unlocked(last_request)
+    _record_live_accounting(accounting)
+    _bench_log_post(
+        diagnostics.trace if diagnostics is not None else None,
+        **accounting.post_event_payload(),
+    )
+
+def record_cycle_diagnostic(
+    *,
+    diagnostics: Optional[DiagnosticsConfig],
+    request_id: int,
+    fields: dict[str, Any],
+) -> None:
+    _bench_log_cycle(
+        diagnostics.trace if diagnostics is not None else None,
+        request_id=request_id,
+        **fields,
+    )
+
+def finalize_request_observability(
+    *,
+    request_id: int,
+    summary_event: Optional[SummaryEvent],
+    request_start_ns: int,
+    request_done_ns: int,
+    first_token_ns: Optional[int],
+    prefill_done_ns: Optional[int],
+    prompt_token_count: int,
+    live_token_count: int,
+    cache_lookup_ms: float,
+    cache_hit_tokens: int,
+    cache_insert_ms: float,
+    finish_reason: Optional[str],
+    max_tokens: int,
+    prompt_regime: Optional[dict[str, Any]] = None,
+    memory_waterfall_peak: Optional[dict[str, Any]] = None,
+    diagnostics: Optional[DiagnosticsConfig] = None,
+    prefill_event: Optional[PrefillCompleteEvent] = None,
+    runtime_config: Optional[Any] = None,
+) -> None:
+    accounting = _RequestAccounting.dflash(
+        request_id=request_id,
+        summary_event=summary_event,
+        request_start_ns=request_start_ns,
+        request_done_ns=request_done_ns,
+        first_token_ns=first_token_ns,
+        prefill_done_ns=prefill_done_ns,
+        prompt_token_count=prompt_token_count,
+        live_token_count=live_token_count,
+        cache_lookup_ms=cache_lookup_ms,
+        cache_hit_tokens=cache_hit_tokens,
+        cache_insert_ms=cache_insert_ms,
+        finish_reason=finish_reason,
+        max_tokens=max_tokens,
+        prompt_regime=prompt_regime,
+        memory_waterfall_peak=memory_waterfall_peak,
+        prefill_event=prefill_event,
+        runtime_config=runtime_config,
+    )
+    if summary_event is not None:
+        _write_summary_line_from_accounting(accounting)
+    _record_request_accounting(accounting, diagnostics=diagnostics)
+    write_post_request_memory_line(request_id=request_id)
 
 def reset_live_metrics_for_tests() -> None:
     with _LIVE_LOCK:
@@ -308,29 +604,18 @@ def reset_live_metrics_for_tests() -> None:
         for key in _LIVE_TOTALS:
             _LIVE_TOTALS[key] = 0
 
-def write_summary_line(
-    *,
-    summary_event: dict[str, Any],
-    prompt_token_count: int,
-) -> None:
-    generation_tokens = int(summary_event.get("generation_tokens", 0) or 0)
-    elapsed_us = float(summary_event.get("elapsed_us", 0.0) or 0.0)
-    phase_timings_us = dict(summary_event.get("phase_timings_us") or {})
-    prefill_us = float(phase_timings_us.get("prefill", 0.0) or 0.0)
-    prefill_tok_s = (
-        prompt_token_count / (prefill_us / 1_000_000.0)
-        if prefill_us > 0.0
-        else 0.0
-    )
-    decode_s = max(0.0, (elapsed_us - prefill_us) / 1_000_000.0)
-    tok_s = (generation_tokens / decode_s) if decode_s > 0.0 else 0.0
-    acceptance_pct = float(summary_event.get("acceptance_ratio", 0.0) or 0.0) * 100.0
-    total_s = elapsed_us / 1_000_000.0
+def _write_summary_line_from_accounting(accounting: _RequestAccounting) -> None:
+    generation_tokens = int(accounting.generated_tokens or 0)
+    prompt_tokens = int(accounting.prompt_tokens or 0)
+    prefill_tok_s = _float_or_none(accounting.prefill_tok_s) or 0.0
+    tok_s = _float_or_none(accounting.decode_tok_s) or 0.0
+    acceptance_pct = (_float_or_none(accounting.acceptance_ratio) or 0.0) * 100.0
+    total_s = float(accounting.wall_ms) / 1_000.0
     _write_observability_line(
         f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] {tok_s:.1f} tok/s | "
         f"prefill {prefill_tok_s:.1f} tok/s | "
         f"{acceptance_pct:.1f}% accepted | {generation_tokens} tokens | "
-        f"{total_s:.1f}s | prompt: {prompt_token_count} tokens\n"
+        f"{total_s:.1f}s | prompt: {prompt_tokens} tokens\n"
     )
 
 
@@ -360,17 +645,28 @@ def write_post_request_memory_line(*, request_id: int) -> None:
             f"[dflash] req#{request_id} memory snapshot partial "
             f"unavailable={','.join(unavailable)}\n"
         )
-    mlx_active_gb = _float_or_none(memory.get("mlx_active_gb")) or 0.0
-    mlx_cache_gb = _float_or_none(memory.get("mlx_cache_gb")) or 0.0
-    mlx_peak_gb = _float_or_none(memory.get("mlx_peak_gb")) or 0.0
-    rss_now_gb = _float_or_none(memory.get("rss_gb")) or 0.0
-    rss_peak_gb = _float_or_none(memory.get("rss_peak_gb")) or 0.0
-    untracked_gb = max(0.0, rss_now_gb - mlx_active_gb - mlx_cache_gb)
+    mlx_active_gb = _float_or_none(memory.get("mlx_active_gb"))
+    mlx_cache_gb = _float_or_none(memory.get("mlx_cache_gb"))
+    mlx_peak_gb = _float_or_none(memory.get("mlx_peak_gb"))
+    rss_now_gb = _float_or_none(memory.get("rss_gb"))
+    rss_peak_gb = _float_or_none(memory.get("rss_peak_gb"))
+    untracked_gb = (
+        max(0.0, rss_now_gb - mlx_active_gb - mlx_cache_gb)
+        if (
+            rss_now_gb is not None
+            and mlx_active_gb is not None
+            and mlx_cache_gb is not None
+        )
+        else None
+    )
     _write_observability_line(
         f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] req#{request_id} "
-        f"mlx_active={mlx_active_gb:.2f} mlx_cache={mlx_cache_gb:.2f} "
-        f"mlx_peak={mlx_peak_gb:.2f} rss_now={rss_now_gb:.2f} "
-        f"rss_peak={rss_peak_gb:.2f} untracked={untracked_gb:.2f} GB\n"
+        f"mlx_active={_fmt_gb_value(mlx_active_gb)} "
+        f"mlx_cache={_fmt_gb_value(mlx_cache_gb)} "
+        f"mlx_peak={_fmt_gb_value(mlx_peak_gb)} "
+        f"rss_now={_fmt_gb_value(rss_now_gb)} "
+        f"rss_peak={_fmt_gb_value(rss_peak_gb)} "
+        f"untracked={_fmt_gb_value(untracked_gb)} GB\n"
     )
 
 def _write_observability_line(line: str) -> None:
@@ -391,7 +687,7 @@ def _write_observability_line(line: str) -> None:
 def record_request_metrics(
     *,
     request_id: int,
-    summary_event: Optional[dict[str, Any]],
+    summary_event: Optional[SummaryEvent],
     request_start_ns: int,
     request_done_ns: int,
     first_token_ns: Optional[int],
@@ -406,156 +702,61 @@ def record_request_metrics(
     prompt_regime: Optional[dict[str, Any]] = None,
     memory_waterfall_peak: Optional[dict[str, Any]] = None,
     diagnostics: Optional[DiagnosticsConfig] = None,
-    prefill_event: Optional[dict[str, Any]] = None,
+    prefill_event: Optional[PrefillCompleteEvent] = None,
     runtime_config: Optional[Any] = None,
 ) -> None:
-    wall_ms = (request_done_ns - request_start_ns) / 1e6
-    ttft_ms = (
-        (first_token_ns - request_start_ns) / 1e6
-        if first_token_ns is not None
-        else None
-    )
-    prefill_ms = (
-        (prefill_done_ns - request_start_ns) / 1e6
-        if prefill_done_ns is not None
-        else None
-    )
-    prefill_tok_s = (
-        prompt_token_count / (float(prefill_ms) / 1_000.0)
-        if prefill_ms is not None and float(prefill_ms) > 0.0
-        else None
-    )
-    decode_ms = (
-        (request_done_ns - prefill_done_ns) / 1e6
-        if prefill_done_ns is not None
-        else None
-    )
-    fallback_used = bool(summary_event.get("fallback_ar") if summary_event else False)
-    generation_tokens = int(
-        (summary_event or {}).get("generation_tokens", live_token_count) or 0
-    )
-    acceptance_ratio = float((summary_event or {}).get("acceptance_ratio", 0.0) or 0.0)
-    cycles_completed = int((summary_event or {}).get("cycles_completed", 0) or 0)
-    tokens_per_cycle = float((summary_event or {}).get("tokens_per_cycle", 0.0) or 0.0)
-    prefill_phase_timings_us = _prefill_phase_timings(prefill_event)
-    prefill_accounting = _prefill_accounting(prefill_event)
-    runtime_config_payload = _runtime_config_payload(runtime_config)
-    logical_prefill_tokens = int(
-        prefill_accounting.get("logical_ctx_tokens", prompt_token_count)
-    )
-    physical_prefill_tokens = prefill_accounting.get("physical_prefill_tokens")
-    restored_prefill_tokens = prefill_accounting.get("prefill_tokens_restored")
-    computed_prefill_tokens = prefill_accounting.get("prefill_tokens_computed")
-    prefill_tok_s_apparent = (
-        logical_prefill_tokens / (float(prefill_ms) / 1_000.0)
-        if prefill_ms is not None and float(prefill_ms) > 0.0
-        else None
-    )
-    prefill_tok_s_physical = (
-        int(physical_prefill_tokens) / (float(prefill_ms) / 1_000.0)
-        if physical_prefill_tokens is not None
-        and prefill_ms is not None
-        and float(prefill_ms) > 0.0
-        else None
-    )
-    decode_tok_s = (
-        generation_tokens / (float(decode_ms) / 1_000.0)
-        if decode_ms is not None and float(decode_ms) > 0.0
-        else None
-    )
-    _record_live_request(
+    accounting = _RequestAccounting.dflash(
         request_id=request_id,
+        summary_event=summary_event,
+        request_start_ns=request_start_ns,
+        request_done_ns=request_done_ns,
+        first_token_ns=first_token_ns,
+        prefill_done_ns=prefill_done_ns,
         prompt_token_count=prompt_token_count,
-        generation_tokens=generation_tokens,
-        wall_ms=wall_ms,
-        prefill_ms=prefill_ms,
-        decode_ms=decode_ms,
-        prefill_tok_s_physical=prefill_tok_s_physical,
-        prefill_tok_s_apparent=prefill_tok_s_apparent,
-        decode_tok_s=decode_tok_s,
-        acceptance_ratio=acceptance_ratio,
-        cycles_completed=cycles_completed,
-        finish_reason=finish_reason,
-        cache_hit_tokens=cache_hit_tokens,
-        runtime_config=runtime_config,
-        physical_prefill_tokens=physical_prefill_tokens,
-        restored_prefill_tokens=restored_prefill_tokens,
-        computed_prefill_tokens=computed_prefill_tokens,
-    )
-    _bench_log_post(
-        diagnostics.trace if diagnostics is not None else None,
-        request_id=request_id,
-        mode_used="dflash_fallback" if fallback_used else "dflash",
-        prompt_tokens=int(prompt_token_count),
-        generated_tokens=generation_tokens,
-        wall_ms=wall_ms,
-        ttft_ms=ttft_ms,
-        prefill_ms=prefill_ms,
-        prefill_tok_s=prefill_tok_s,
-        prefill_tok_s_physical=prefill_tok_s_physical,
-        prefill_tok_s_apparent=prefill_tok_s_apparent,
-        decode_tok_s=decode_tok_s,
-        decode_ms=decode_ms,
+        live_token_count=live_token_count,
         cache_lookup_ms=cache_lookup_ms,
         cache_hit_tokens=cache_hit_tokens,
         cache_insert_ms=cache_insert_ms,
-        acceptance_ratio=acceptance_ratio,
-        tokens_per_cycle=tokens_per_cycle,
-        cycles_completed=cycles_completed,
         finish_reason=finish_reason,
         max_tokens=int(max_tokens),
-        prompt_regime=prompt_regime or {},
-        prefill_event=prefill_event or {},
-        **prefill_accounting,
-        prefill_phase_timings_us=prefill_phase_timings_us,
-        phase_timings_us=dict((summary_event or {}).get("phase_timings_us") or {}),
-        runtime_config=runtime_config_payload,
-        memory_waterfall_peak=memory_waterfall_peak or {},
+        prompt_regime=prompt_regime,
+        memory_waterfall_peak=memory_waterfall_peak,
+        prefill_event=prefill_event,
+        runtime_config=runtime_config,
     )
-    _append_diagnostics_summary(
-        request_id=request_id,
-        wall_ms=wall_ms,
-        ttft_ms=ttft_ms,
-        prefill_ms=prefill_ms,
-        prefill_tok_s=prefill_tok_s,
-        decode_ms=decode_ms,
-        prompt_token_count=prompt_token_count,
-        generation_tokens=generation_tokens,
-        acceptance_ratio=acceptance_ratio,
-        tokens_per_cycle=tokens_per_cycle,
-        cycles_completed=cycles_completed,
-        cache_hit_tokens=cache_hit_tokens,
-        runtime_config=runtime_config_payload,
-        diagnostics=diagnostics,
+    _record_request_accounting(accounting, diagnostics=diagnostics)
+
+def _record_request_accounting(
+    accounting: _RequestAccounting,
+    *,
+    diagnostics: Optional[DiagnosticsConfig],
+) -> None:
+    _record_live_accounting(accounting)
+    _bench_log_post(
+        diagnostics.trace if diagnostics is not None else None,
+        **accounting.post_event_payload(),
     )
+    _append_diagnostics_summary(accounting=accounting, diagnostics=diagnostics)
 
 def _append_diagnostics_summary(
     *,
-    request_id: int,
-    wall_ms: float,
-    ttft_ms: Optional[float],
-    prefill_ms: Optional[float],
-    prefill_tok_s: Optional[float],
-    decode_ms: Optional[float],
-    prompt_token_count: int,
-    generation_tokens: int,
-    acceptance_ratio: float,
-    tokens_per_cycle: float,
-    cycles_completed: int,
-    cache_hit_tokens: int,
-    runtime_config: dict[str, Any],
+    accounting: _RequestAccounting,
     diagnostics: Optional[DiagnosticsConfig],
 ) -> None:
     if diagnostics is None or diagnostics.run_dir is None:
         return
     path = Path(diagnostics.run_dir) / "summary.md"
+    runtime_config = accounting.runtime_config or {}
     prefill_step_size = runtime_config.get("prefill_step_size", "")
     line = (
-        f"| {request_id} | {prompt_token_count} | {generation_tokens} | "
-        f"{_fmt_ms(wall_ms)} | {_fmt_ms(ttft_ms)} | {_fmt_ms(prefill_ms)} | "
-        f"{_fmt_float(prefill_tok_s)} | {prefill_step_size} | "
-        f"{_fmt_ms(decode_ms)} | {acceptance_ratio:.3f} | "
-        f"{tokens_per_cycle:.2f} | {cycles_completed} | {cache_hit_tokens} |\n"
+        f"| {accounting.request_id} | {_fmt_int(accounting.prompt_tokens)} | "
+        f"{_fmt_int(accounting.generated_tokens)} | {_fmt_ms(accounting.wall_ms)} | "
+        f"{_fmt_ms(accounting.ttft_ms)} | {_fmt_ms(accounting.prefill_ms)} | "
+        f"{_fmt_float(accounting.prefill_tok_s)} | {prefill_step_size} | "
+        f"{_fmt_ms(accounting.decode_ms)} | "
+        f"{_fmt_float3(accounting.acceptance_ratio)} | "
+        f"{_fmt_float(accounting.tokens_per_cycle)} | "
+        f"{_fmt_int(accounting.cycles_completed)} | {accounting.cache_hit_tokens} |\n"
     )
     try:
         current = path.read_text(errors="ignore") if path.exists() else ""
@@ -569,40 +770,18 @@ def _append_diagnostics_summary(
                     "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
                 )
             fp.write(line)
-    except OSError:
-        pass
+    except OSError as exc:
+        report_observability_failure("diagnostics summary append failed", exc)
 
-def _prefill_phase_timings(prefill_event: Optional[dict[str, Any]]) -> dict[str, float]:
+def _prefill_phase_timings(prefill_event: Optional[PrefillCompleteEvent]) -> dict[str, float]:
     if not prefill_event:
         return {}
-    out: dict[str, float] = {}
-    for key, value in prefill_event.items():
-        if key.startswith("phase_") and key.endswith("_us"):
-            try:
-                out[key] = float(value)
-            except (TypeError, ValueError):
-                pass
-    return out
+    return prefill_event.phase_timings()
 
-def _prefill_accounting(prefill_event: Optional[dict[str, Any]]) -> dict[str, int]:
+def _prefill_accounting(prefill_event: Optional[PrefillCompleteEvent]) -> dict[str, int]:
     if not prefill_event:
         return {}
-    keys = (
-        "logical_ctx_tokens",
-        "physical_prefill_tokens",
-        "prefill_tokens_restored",
-        "prefill_tokens_computed",
-    )
-    out: dict[str, int] = {}
-    for key in keys:
-        value = prefill_event.get(key)
-        if value is None:
-            continue
-        try:
-            out[key] = int(value)
-        except (TypeError, ValueError):
-            pass
-    return out
+    return prefill_event.accounting()
 
 def _runtime_config_payload(runtime_config: Optional[Any]) -> dict[str, Any]:
     if runtime_config is None:
@@ -628,60 +807,28 @@ def _runtime_config_payload(runtime_config: Optional[Any]) -> dict[str, Any]:
             payload[key] = getattr(runtime_config, key)
     return payload
 
-def _record_live_request(
-    *,
-    request_id: int,
-    prompt_token_count: int,
-    generation_tokens: int,
-    wall_ms: float,
-    prefill_ms: Optional[float],
-    decode_ms: Optional[float],
-    prefill_tok_s_physical: Optional[float],
-    prefill_tok_s_apparent: Optional[float],
-    decode_tok_s: Optional[float],
-    acceptance_ratio: float,
-    cycles_completed: int,
-    finish_reason: Optional[str],
-    cache_hit_tokens: int,
-    runtime_config: Optional[Any],
-    physical_prefill_tokens: Optional[int],
-    restored_prefill_tokens: Optional[int],
-    computed_prefill_tokens: Optional[int],
-) -> None:
-    last_request = _last_request_payload(
-        request_id=request_id,
-        prompt_tokens=int(prompt_token_count),
-        generated_tokens=int(generation_tokens),
-        wall_ms=wall_ms,
-        prefill_ms=prefill_ms,
-        decode_ms=decode_ms,
-        prefill_tok_s_physical=prefill_tok_s_physical,
-        prefill_tok_s_apparent=prefill_tok_s_apparent,
-        decode_tok_s=decode_tok_s,
-        acceptance_rate=float(acceptance_ratio),
-        cycles=int(cycles_completed),
-        finish_reason=finish_reason,
-    )
-    cache_enabled = bool(
-        runtime_config is not None
-        and getattr(runtime_config, "prefix_cache", False)
-        and int(getattr(runtime_config, "target_fa_window", 0) or 0) <= 0
-    )
+def _record_live_accounting(accounting: _RequestAccounting) -> None:
+    last_request = accounting.last_request_payload()
     with _LIVE_LOCK:
         _LIVE_TOTALS["requests"] += 1
-        _LIVE_TOTALS["generated_tokens"] += int(generation_tokens)
-        if physical_prefill_tokens is not None:
-            _LIVE_TOTALS["prefill_tokens_physical"] += int(physical_prefill_tokens)
-        if restored_prefill_tokens is not None:
-            _LIVE_TOTALS["prefill_tokens_restored"] += int(restored_prefill_tokens)
+        if accounting.generated_tokens is not None:
+            _LIVE_TOTALS["generated_tokens"] += int(accounting.generated_tokens)
+        if accounting.physical_prefill_tokens is not None:
+            _LIVE_TOTALS["prefill_tokens_physical"] += int(
+                accounting.physical_prefill_tokens
+            )
+        if accounting.restored_prefill_tokens is not None:
+            _LIVE_TOTALS["prefill_tokens_restored"] += int(
+                accounting.restored_prefill_tokens
+            )
         _LIVE_LAST_PREFIX.update(
             {
-                "restored": _int_or_none(restored_prefill_tokens),
-                "computed": _int_or_none(computed_prefill_tokens),
+                "restored": _int_or_none(accounting.restored_prefill_tokens),
+                "computed": _int_or_none(accounting.computed_prefill_tokens),
             }
         )
-        if cache_enabled:
-            if int(cache_hit_tokens) > 0:
+        if accounting.prefix_cache_enabled:
+            if int(accounting.cache_hit_tokens) > 0:
                 _LIVE_TOTALS["cache_hits"] += 1
             else:
                 _LIVE_TOTALS["cache_misses"] += 1
@@ -781,77 +928,6 @@ def _last_request_payload(
         "finish_reason": finish_reason,
     }
 
-def _prefix_cache_payload(
-    prefix_cache_manager: Optional[Any],
-    *,
-    stats: Optional[dict[str, Any]] = None,
-) -> dict[str, Any]:
-    with _LIVE_LOCK:
-        config = dict(_LIVE_PREFIX_CONFIG)
-        last_request = None if _LIVE_LAST_REQUEST is None else dict(_LIVE_LAST_REQUEST)
-        last_prefix = dict(_LIVE_LAST_PREFIX)
-    if prefix_cache_manager is None:
-        if not config.get("enabled"):
-            return {
-                "entries": None,
-                "max_entries": config.get("max_entries"),
-                "bytes": None,
-                "max_bytes": config.get("max_bytes"),
-                "hits": None,
-                "misses": None,
-                "insertions": None,
-                "evictions": None,
-                "prefill_tokens_saved": None,
-                "last_restored_tokens": None,
-                "last_computed_tokens": None,
-            }
-        return {
-            "entries": 0,
-            "max_entries": config.get("max_entries"),
-            "bytes": 0,
-            "max_bytes": config.get("max_bytes"),
-            "hits": 0,
-            "misses": 0,
-            "insertions": 0,
-            "evictions": 0,
-            "prefill_tokens_saved": 0,
-            "last_restored_tokens": None,
-            "last_computed_tokens": None,
-        }
-    if stats is None:
-        stats = _prefix_cache_stats(prefix_cache_manager)
-    if stats is None:
-        return {
-            "entries": 0,
-            "max_entries": config.get("max_entries"),
-            "bytes": 0,
-            "max_bytes": config.get("max_bytes"),
-            "hits": 0,
-            "misses": 0,
-            "insertions": 0,
-            "evictions": 0,
-            "prefill_tokens_saved": 0,
-            "last_restored_tokens": None,
-            "last_computed_tokens": None,
-        }
-    return {
-        "entries": _int_or_none(stats.get("current_entries")),
-        "max_entries": _int_or_none(stats.get("max_entries")),
-        "bytes": _int_or_none(stats.get("current_bytes")),
-        "max_bytes": _int_or_none(stats.get("max_bytes")),
-        "hits": int(stats.get("exact_hits", 0) + stats.get("prefix_hits", 0)),
-        "misses": _int_or_none(stats.get("misses")),
-        "insertions": _int_or_none(stats.get("insertions")),
-        "evictions": _int_or_none(stats.get("evictions")),
-        "prefill_tokens_saved": _int_or_none(stats.get("prefill_tokens_saved")),
-        "last_restored_tokens": (
-            None if last_request is None else _int_or_none(last_prefix.get("restored"))
-        ),
-        "last_computed_tokens": (
-            None if last_request is None else _int_or_none(last_prefix.get("computed"))
-        ),
-    }
-
 def _prefix_cache_stats(prefix_cache_manager: Optional[Any]) -> Optional[dict[str, Any]]:
     if prefix_cache_manager is None:
         return None
@@ -861,146 +937,10 @@ def _prefix_cache_stats(prefix_cache_manager: Optional[Any]) -> Optional[dict[st
         return None
 
 def _memory_payload(metal_limits: dict[str, Any]) -> dict[str, Any]:
-    wired_limit_bytes = metal_limits.get("wired_limit_bytes")
-    rss_bytes = _current_rss_bytes()
-    rss_gb = None if rss_bytes is None else float(rss_bytes) / _GB
-    return {
-        "rss_gb": rss_gb,
-        "rss_peak_gb": _rss_peak_gb(),
-        "mlx_active_gb": _mlx_memory_gb("get_active_memory"),
-        "mlx_cache_gb": _mlx_memory_gb("get_cache_memory"),
-        "mlx_peak_gb": _mlx_memory_gb("get_peak_memory"),
-        "wired_gb": None,
-        "wired_limit_gb": (
-            None if wired_limit_bytes is None else float(wired_limit_bytes) / _GB
-        ),
-    }
+    return live_memory_payload(wired_limit_bytes=metal_limits.get("wired_limit_bytes"))
 
 def get_memory_snapshot() -> dict[str, Any]:
     return _memory_payload({"wired_limit_bytes": None})
-
-def _current_rss_bytes() -> Optional[int]:
-    if sys.platform == "darwin":
-        return _darwin_proc_resident_size_bytes() or _darwin_task_resident_size_bytes()
-    try:
-        with open("/proc/self/statm") as fp:
-            fields = fp.read().split()
-        if len(fields) < 2:
-            return None
-        return int(fields[1]) * int(resource.getpagesize())
-    except (OSError, UnicodeDecodeError, ValueError):
-        return None
-
-def _darwin_proc_resident_size_bytes() -> Optional[int]:
-    class ProcTaskInfo(ctypes.Structure):
-        _fields_ = [
-            ("pti_virtual_size", ctypes.c_uint64),
-            ("pti_resident_size", ctypes.c_uint64),
-            ("pti_total_user", ctypes.c_uint64),
-            ("pti_total_system", ctypes.c_uint64),
-            ("pti_threads_user", ctypes.c_uint64),
-            ("pti_threads_system", ctypes.c_uint64),
-            ("pti_policy", ctypes.c_int32),
-            ("pti_faults", ctypes.c_int32),
-            ("pti_pageins", ctypes.c_int32),
-            ("pti_cow_faults", ctypes.c_int32),
-            ("pti_messages_sent", ctypes.c_int32),
-            ("pti_messages_received", ctypes.c_int32),
-            ("pti_syscalls_mach", ctypes.c_int32),
-            ("pti_syscalls_unix", ctypes.c_int32),
-            ("pti_csw", ctypes.c_int32),
-            ("pti_threadnum", ctypes.c_int32),
-            ("pti_numrunning", ctypes.c_int32),
-            ("pti_priority", ctypes.c_int32),
-        ]
-
-    try:
-        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-        proc_pidinfo = libproc.proc_pidinfo
-        proc_pidinfo.argtypes = [
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_uint64,
-            ctypes.c_void_p,
-            ctypes.c_int,
-        ]
-        proc_pidinfo.restype = ctypes.c_int
-        info = ProcTaskInfo()
-        result = proc_pidinfo(
-            os.getpid(),
-            4,  # PROC_PIDTASKINFO
-            0,
-            ctypes.byref(info),
-            ctypes.sizeof(info),
-        )
-        if result < ctypes.sizeof(info) or info.pti_resident_size <= 0:
-            return None
-        return int(info.pti_resident_size)
-    except (AttributeError, OSError, ValueError):
-        return None
-
-def _darwin_task_resident_size_bytes() -> Optional[int]:
-    class TimeValue(ctypes.Structure):
-        _fields_ = [
-            ("seconds", ctypes.c_int32),
-            ("microseconds", ctypes.c_int32),
-        ]
-
-    class TaskBasicInfo64(ctypes.Structure):
-        _fields_ = [
-            ("virtual_size", ctypes.c_uint64),
-            ("resident_size", ctypes.c_uint64),
-            ("resident_size_max", ctypes.c_uint64),
-            ("user_time", TimeValue),
-            ("system_time", TimeValue),
-            ("policy", ctypes.c_int32),
-            ("suspend_count", ctypes.c_int32),
-        ]
-
-    try:
-        libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
-        task_info = libc.task_info
-        task_info.argtypes = [
-            ctypes.c_uint32,
-            ctypes.c_int32,
-            ctypes.c_void_p,
-            ctypes.POINTER(ctypes.c_uint32),
-        ]
-        task_info.restype = ctypes.c_int32
-        libc.mach_task_self.restype = ctypes.c_uint32
-        info = TaskBasicInfo64()
-        count = ctypes.c_uint32(ctypes.sizeof(info) // ctypes.sizeof(ctypes.c_int32))
-        result = task_info(
-            libc.mach_task_self(),
-            5,  # TASK_BASIC_INFO_64
-            ctypes.byref(info),
-            ctypes.byref(count),
-        )
-        if result != 0 or info.resident_size <= 0 or info.resident_size == 0xFFFFFFFF:
-            return None
-        return int(info.resident_size)
-    except (AttributeError, OSError, ValueError):
-        return None
-
-def _rss_peak_gb() -> Optional[float]:
-    try:
-        value = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-        if sys.platform != "darwin":
-            value *= 1024.0
-        return value / _GB
-    except (OSError, ValueError):
-        return None
-
-def _mlx_memory_gb(name: str) -> Optional[float]:
-    try:
-        import mlx.core as mx
-
-        getter = getattr(mx, name, None)
-        if getter is None:
-            return None
-        return float(getter()) / _GB
-    except (ImportError, RuntimeError):
-        return None
 
 def _seconds_or_none(value_ms: Optional[float]) -> Optional[float]:
     if value_ms is None:
@@ -1033,7 +973,22 @@ def _fmt_ms(value: Optional[float]) -> str:
         return ""
     return f"{float(value):.1f}"
 
+def _fmt_int(value: Optional[int]) -> str:
+    if value is None:
+        return ""
+    return str(int(value))
+
 def _fmt_float(value: Optional[float]) -> str:
     if value is None:
         return ""
     return f"{float(value):.2f}"
+
+def _fmt_gb_value(value: Optional[float]) -> str:
+    if value is None:
+        return "n/a"
+    return f"{float(value):.2f}"
+
+def _fmt_float3(value: Optional[float]) -> str:
+    if value is None:
+        return ""
+    return f"{float(value):.3f}"

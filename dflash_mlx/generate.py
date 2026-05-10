@@ -9,6 +9,7 @@ import sys
 from collections.abc import Sequence
 from typing import Any, Optional
 
+from dflash_mlx.engine.events import SummaryEvent, TokenEvent, is_engine_event
 from dflash_mlx.metal_limits import apply_metal_limits
 from dflash_mlx.runtime import (
     get_stop_token_ids,
@@ -26,11 +27,11 @@ def decode_token(tokenizer: Any, token_id: int) -> str:
     except TypeError:
         return str(tokenizer.decode(token))
 
-def generation_tps_from_summary(summary: dict[str, Any]) -> float:
-    elapsed_us = float(summary.get("elapsed_us", 0.0))
-    phase_timings = dict(summary.get("phase_timings_us", {}))
-    prefill_us = float(summary.get("prefill_us", phase_timings.get("prefill", 0.0)))
-    generation_tokens = int(summary.get("generation_tokens", 0))
+def generation_tps_from_summary(summary: SummaryEvent) -> float:
+    elapsed_us = float(summary.elapsed_us)
+    phase_timings = dict(summary.phase_timings_us)
+    prefill_us = float(phase_timings.get("prefill", 0.0))
+    generation_tokens = int(summary.generation_tokens)
     generation_us = max(0.0, elapsed_us - prefill_us)
     return (generation_tokens / (generation_us / 1e6)) if generation_us > 0.0 else 0.0
 
@@ -82,20 +83,27 @@ def run_generate(
         runtime_context=runtime_context,
     )
 
-    summary: Optional[dict[str, Any]] = None
-    for event in stream:
-        if event.get("event") == "token":
-            sys.stdout.write(decode_token(tokenizer, int(event["token_id"])))
-            sys.stdout.flush()
-        elif event.get("event") == "summary":
-            summary = event
+    summary: Optional[SummaryEvent] = None
+    try:
+        for event in stream:
+            if isinstance(event, TokenEvent):
+                sys.stdout.write(decode_token(tokenizer, int(event.token_id)))
+                sys.stdout.flush()
+            elif isinstance(event, SummaryEvent):
+                summary = event
+            elif not is_engine_event(event):
+                raise TypeError(f"Unsupported DFlash engine event: {type(event).__name__}")
+    finally:
+        close = getattr(stream, "close", None)
+        if close is not None:
+            close()
 
     if summary is None:
         return 1
 
     tps = generation_tps_from_summary(summary)
-    acceptance_pct = float(summary.get("acceptance_ratio", 0.0)) * 100.0
-    token_count = int(summary.get("generation_tokens", 0))
+    acceptance_pct = float(summary.acceptance_ratio) * 100.0
+    token_count = int(summary.generation_tokens)
     sys.stderr.write(
         f"\n{token_count} tokens | {tps:.1f} tok/s | {acceptance_pct:.1f}% acceptance\n"
     )

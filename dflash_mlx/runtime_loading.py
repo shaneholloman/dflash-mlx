@@ -48,7 +48,8 @@ def resolve_model_ref(model_ref: str | Path | None, *, kind: str) -> str:
     raise ValueError(f"{kind} model reference is required")
 
 
-def _get_dflash_model_classes(_config: dict[str, Any]):
+def _get_dflash_model_classes(config: dict[str, Any]):
+    del config
     return DFlashDraftModel, DFlashDraftModelArgs
 
 

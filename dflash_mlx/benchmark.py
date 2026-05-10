@@ -38,6 +38,7 @@ from dflash_mlx.benchmark_suites import (
     slugify_prompt_id,
 )
 from dflash_mlx.draft_backend import DraftBackend
+from dflash_mlx.engine.events import SummaryEvent, TokenEvent, is_engine_event
 from dflash_mlx.metal_limits import apply_metal_limits
 from dflash_mlx.runtime import (
     get_stop_token_ids,
@@ -518,7 +519,7 @@ def _generate_dflash_stream_once(
 
     start_ns = time.perf_counter_ns()
     first_token_us: float | None = None
-    summary: dict[str, Any] | None = None
+    summary: SummaryEvent | None = None
     stream = stream_dflash_generate(
         target_model=target_model,
         target_ops=target_ops,
@@ -536,25 +537,30 @@ def _generate_dflash_stream_once(
     )
     try:
         for event in stream:
-            event_type = event.get("event")
-            if event_type == "token" and first_token_us is None:
-                first_token_us = (time.perf_counter_ns() - start_ns) / 1_000.0
-            elif event_type == "summary":
-                summary = dict(event)
+            if isinstance(event, TokenEvent):
+                if first_token_us is None:
+                    first_token_us = (time.perf_counter_ns() - start_ns) / 1_000.0
+                continue
+            if isinstance(event, SummaryEvent):
+                summary = event
+                continue
+            if not is_engine_event(event):
+                raise TypeError(f"Unsupported DFlash engine event: {type(event).__name__}")
     finally:
         stream.close()
 
     if summary is None:
         raise RuntimeError("DFlash stream did not yield a summary event")
+    summary_payload = summary.to_payload()
     if not memory_reset_ok:
-        summary["peak_memory_gb"] = None
+        summary_payload["peak_memory_gb"] = None
 
-    summary["ttft_us"] = (
+    summary_payload["ttft_us"] = (
         first_token_us
         if first_token_us is not None
-        else float(dict(summary.get("phase_timings_us", {})).get("prefill", 0.0))
+        else float(dict(summary.phase_timings_us).get("prefill", 0.0))
     )
-    return summary
+    return summary_payload
 
 def _release_loaded_models() -> None:
     gc.collect()

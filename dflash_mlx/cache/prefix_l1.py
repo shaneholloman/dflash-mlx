@@ -6,12 +6,21 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any, Optional
 
-from dflash_mlx.bench_logger import log_cache as _bench_log_cache
+from dflash_mlx.observability.cache import record_cache_event
 from dflash_mlx.diagnostics import TraceConfig
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
 from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
+
+
+@dataclass(frozen=True)
+class PrefixCacheL1InsertResult:
+    admitted: bool
+    removed_snapshots: tuple[DFlashPrefixSnapshot, ...] = ()
+    inserted_evicted_snapshot: DFlashPrefixSnapshot | None = None
+
 
 class DFlashPrefixCache:
     def __init__(
@@ -19,7 +28,6 @@ class DFlashPrefixCache:
         *,
         max_entries: int = 4,
         max_bytes: int = 8 * 1024 * 1024 * 1024,
-        l2: Optional[Any] = None,
         cross_kind_prune: bool = True,
         trace_config: Optional[TraceConfig] = None,
         max_snapshot_tokens: int = 24000,
@@ -30,7 +38,6 @@ class DFlashPrefixCache:
         self._max_entries = int(max_entries)
         self._max_bytes = int(max_bytes)
         self._lock = threading.Lock()
-        self._l2 = l2
         self._cross_kind_prune = bool(cross_kind_prune)
         self._trace_config = trace_config
         self._max_snapshot_tokens = max(0, int(max_snapshot_tokens))
@@ -46,8 +53,6 @@ class DFlashPrefixCache:
             "cross_kind_prunes": 0,
             "prefill_tokens_saved": 0,
             "fingerprint_rejects": 0,
-            "l2_hits": 0,
-            "l2_misses": 0,
         }
 
     def lookup(
@@ -147,66 +152,17 @@ class DFlashPrefixCache:
             elapsed_us=(time.perf_counter_ns() - t_start) / 1_000.0,
         )
 
-        if self._l2 is None:
-            return (0, None)
+        return (0, None)
 
-        l2_snap = self._l2.lookup(req_tuple, key)
+    def insert(self, snapshot: DFlashPrefixSnapshot) -> bool:
+        return self.insert_with_evictions(snapshot).admitted
 
-        if l2_snap is None:
-            with self._lock:
-                self._stats["l2_misses"] += 1
-            return (0, None)
-
-        l2_len = len(l2_snap.token_ids)
-        with self._lock:
-
-            for existing_eid, existing_snap in self._entries.items():
-                if (
-                    existing_snap.key == l2_snap.key
-                    and existing_snap.kind == l2_snap.kind
-                    and existing_snap.token_ids == l2_snap.token_ids
-                ):
-                    if existing_eid in self._lru_order:
-                        self._lru_order.remove(existing_eid)
-                    self._lru_order.append(existing_eid)
-                    self._stats["l2_hits"] += 1
-                    if l2_len == len(req_tuple):
-                        self._stats["exact_hits"] += 1
-                    else:
-                        self._stats["prefix_hits"] += 1
-                    self._stats["prefill_tokens_saved"] += l2_len
-                    self._log_cache(
-                        op="lookup",
-                        result="l2_hit",
-                        req_tokens=len(req_tuple),
-                        matched_len=int(l2_len),
-                        entries=len(self._entries),
-                        elapsed_us=(time.perf_counter_ns() - t_start) / 1_000.0,
-                    )
-                    return (l2_len, existing_snap)
-
-            eid = self._next_id
-            self._next_id += 1
-            self._entries[eid] = l2_snap
-            self._lru_order.append(eid)
-            self._evict_until_under_budget()
-            self._stats["l2_hits"] += 1
-            if l2_len == len(req_tuple):
-                self._stats["exact_hits"] += 1
-            else:
-                self._stats["prefix_hits"] += 1
-            self._stats["prefill_tokens_saved"] += l2_len
-            self._log_cache(
-                op="lookup",
-                result="l2_hit",
-                req_tokens=len(req_tuple),
-                matched_len=int(l2_len),
-                entries=len(self._entries),
-                elapsed_us=(time.perf_counter_ns() - t_start) / 1_000.0,
-            )
-            return (l2_len, l2_snap)
-
-    def insert(self, snapshot: DFlashPrefixSnapshot) -> None:
+    def insert_with_evictions(
+        self,
+        snapshot: DFlashPrefixSnapshot,
+        *,
+        skip_too_long: bool = True,
+    ) -> PrefixCacheL1InsertResult:
         t_start = time.perf_counter_ns()
         with self._lock:
             pre_entries = len(self._entries)
@@ -216,7 +172,7 @@ class DFlashPrefixCache:
             pre_cross_prunes = self._stats["cross_kind_prunes"]
 
             max_tokens = self._max_snapshot_tokens
-            if self._l2 is None and max_tokens > 0 and len(snapshot.token_ids) > max_tokens:
+            if skip_too_long and max_tokens > 0 and len(snapshot.token_ids) > max_tokens:
                 self._stats["skipped_too_long"] += 1
                 self._log_cache(
                     op="insert_skipped",
@@ -227,15 +183,24 @@ class DFlashPrefixCache:
                     entries_after=pre_entries,
                     elapsed_us=(time.perf_counter_ns() - t_start) / 1_000.0,
                 )
-                return
+                return PrefixCacheL1InsertResult(admitted=False)
 
-            self._prune_dominated_prefixes(snapshot)
+            removed_ids = self._prune_dominated_prefixes(snapshot)
             eid = self._next_id
             self._next_id += 1
             self._entries[eid] = snapshot
             self._lru_order.append(eid)
             self._stats["insertions"] += 1
-            self._evict_until_under_budget()
+            removed_ids.extend(self._evict_until_under_budget())
+            removed_snapshots = tuple(snapshot for _eid, snapshot in removed_ids)
+            inserted_evicted_snapshot = next(
+                (
+                    removed_snapshot
+                    for removed_eid, removed_snapshot in removed_ids
+                    if removed_eid == eid
+                ),
+                None,
+            )
             breakdown = snapshot.nbytes_breakdown()
             self._log_cache(
                 op="insert",
@@ -255,17 +220,26 @@ class DFlashPrefixCache:
                 current_bytes=int(self._current_bytes()),
                 elapsed_us=(time.perf_counter_ns() - t_start) / 1_000.0,
             )
+            return PrefixCacheL1InsertResult(
+                admitted=eid in self._entries,
+                removed_snapshots=removed_snapshots,
+                inserted_evicted_snapshot=inserted_evicted_snapshot,
+            )
 
     def set_trace_config(self, trace_config: Optional[TraceConfig]) -> None:
         self._trace_config = trace_config
 
     def _log_cache(self, **fields: Any) -> None:
-        _bench_log_cache(self._trace_config, **fields)
+        record_cache_event(self._trace_config, **fields)
 
-    def _prune_dominated_prefixes(self, snapshot: DFlashPrefixSnapshot) -> None:
+    def _prune_dominated_prefixes(
+        self,
+        snapshot: DFlashPrefixSnapshot,
+    ) -> list[tuple[int, DFlashPrefixSnapshot]]:
         incoming = snapshot.token_ids
         doomed_same: list[int] = []
         doomed_cross: list[int] = []
+        removed: list[tuple[int, DFlashPrefixSnapshot]] = []
         for eid, existing in self._entries.items():
             if existing.key != snapshot.key:
                 continue
@@ -280,18 +254,20 @@ class DFlashPrefixCache:
                     doomed_cross.append(eid)
         for eid in doomed_same:
             if eid in self._entries:
-                del self._entries[eid]
+                removed.append((eid, self._entries.pop(eid)))
                 self._stats["prefix_prunes"] += 1
             if eid in self._lru_order:
                 self._lru_order.remove(eid)
         for eid in doomed_cross:
             if eid in self._entries:
-                del self._entries[eid]
+                removed.append((eid, self._entries.pop(eid)))
                 self._stats["cross_kind_prunes"] += 1
             if eid in self._lru_order:
                 self._lru_order.remove(eid)
+        return removed
 
-    def _evict_until_under_budget(self) -> None:
+    def _evict_until_under_budget(self) -> list[tuple[int, DFlashPrefixSnapshot]]:
+        evicted: list[tuple[int, DFlashPrefixSnapshot]] = []
         while self._lru_order and (
             len(self._entries) > self._max_entries
             or self._current_bytes() > self._max_bytes
@@ -299,12 +275,12 @@ class DFlashPrefixCache:
             byte_pressure = self._current_bytes() > self._max_bytes
             eid = self._lru_order.pop(0)
             if eid in self._entries:
-                evicted = self._entries.pop(eid)
+                evicted_snapshot = self._entries.pop(eid)
                 self._stats["evictions"] += 1
                 if byte_pressure:
                     self._stats["byte_budget_evictions"] += 1
-                if self._l2 is not None:
-                    self._l2.insert_async(evicted)
+                evicted.append((eid, evicted_snapshot))
+        return evicted
 
     def _current_bytes(self) -> int:
         return sum(s.nbytes for s in self._entries.values())
@@ -316,8 +292,6 @@ class DFlashPrefixCache:
             out["current_bytes"] = self._current_bytes()
             out["max_entries"] = self._max_entries
             out["max_bytes"] = self._max_bytes
-        if self._l2 is not None:
-            out["l2"] = self._l2.stats()
         return out
 
     def memory_waterfall_bytes(self) -> dict[str, int]:
@@ -327,13 +301,9 @@ class DFlashPrefixCache:
             "l1_snapshot_gdn_state_bytes": 0,
             "l1_snapshot_target_hidden_bytes": 0,
             "l1_snapshot_last_logits_bytes": 0,
-            "l2_disk_bytes": 0,
             "prefix_prunes": 0,
             "cross_kind_prunes": 0,
             "byte_budget_evictions": 0,
-            "l2_hits": 0,
-            "l2_writes": 0,
-            "l2_misses": 0,
         }
         with self._lock:
             stats = dict(self._stats)
@@ -343,12 +313,6 @@ class DFlashPrefixCache:
         out["prefix_prunes"] = int(stats.get("prefix_prunes", 0))
         out["cross_kind_prunes"] = int(stats.get("cross_kind_prunes", 0))
         out["byte_budget_evictions"] = int(stats.get("byte_budget_evictions", 0))
-        out["l2_hits"] = int(stats.get("l2_hits", 0))
-        out["l2_misses"] = int(stats.get("l2_misses", 0))
-        if self._l2 is not None:
-            l2 = self._l2.stats()
-            out["l2_disk_bytes"] = int(l2.get("current_bytes", 0) or 0)
-            out["l2_writes"] = int(l2.get("writes", 0) or 0)
         if entries:
             fa = gdn = hidden = logits = total = 0
             for snapshot in entries:
@@ -369,9 +333,6 @@ class DFlashPrefixCache:
         with self._lock:
             self._entries.clear()
             self._lru_order.clear()
-        if self._l2 is not None:
-            self._l2.clear()
 
     def shutdown(self) -> None:
-        if self._l2 is not None:
-            self._l2.shutdown(wait=True)
+        return None

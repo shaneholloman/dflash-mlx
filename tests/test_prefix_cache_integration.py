@@ -12,6 +12,7 @@ import pytest
 from mlx_lm.models.cache import KVCache
 
 from dflash_mlx.cache.codecs import (
+    PrefixSnapshotBuilder,
     build_snapshot,
     hydrate_target_cache,
     target_cache_is_serializable,
@@ -23,6 +24,9 @@ from dflash_mlx.cache.manager import (
     RuntimeCacheManagerClosed,
 )
 from dflash_mlx.cache.prefix_l1 import DFlashPrefixCache
+from dflash_mlx.cache.prefix_l2 import DFlashPrefixL2Cache
+from dflash_mlx.cache.snapshot_service import SnapshotService
+from dflash_mlx.cache.store import PrefixSnapshotStore
 from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
 from dflash_mlx.runtime_context import build_runtime_context, runtime_config_from_profile
 
@@ -62,6 +66,44 @@ def _make_key(**overrides) -> DFlashPrefixKey:
     )
     base.update(overrides)
     return DFlashPrefixKey(**base)
+
+def _snapshot_service(
+    cache: DFlashPrefixCache | PrefixSnapshotStore,
+    key: DFlashPrefixKey,
+    *,
+    builder=None,
+) -> SnapshotService:
+    builder = builder if builder is not None else PrefixSnapshotBuilder(key=key)
+    store = cache if isinstance(cache, PrefixSnapshotStore) else _store(cache)
+    return SnapshotService(cache_manager=RuntimeCacheManager(store), builder=builder)
+
+def _store(
+    cache: DFlashPrefixCache | None = None,
+    *,
+    l2=None,
+    max_entries: int = 4,
+    max_bytes: int = 8 * 1024 * 1024 * 1024,
+) -> PrefixSnapshotStore:
+    l1 = cache if cache is not None else DFlashPrefixCache(
+        max_entries=max_entries,
+        max_bytes=max_bytes,
+    )
+    return PrefixSnapshotStore(
+        l1=l1,
+        l2=l2,
+    )
+
+
+def _manager(
+    cache: DFlashPrefixCache | None = None,
+    *,
+    l2=None,
+    max_entries: int = 4,
+    max_bytes: int = 8 * 1024 * 1024 * 1024,
+) -> RuntimeCacheManager:
+    return RuntimeCacheManager(
+        _store(cache, l2=l2, max_entries=max_entries, max_bytes=max_bytes)
+    )
 
 def _simulate_serve_insert(
     cache: DFlashPrefixCache,
@@ -352,12 +394,12 @@ class TestContextConfigExposedCorrectly:
 
         def make_cache(_runtime_context):
             make_calls.append(_runtime_context)
-            return DFlashPrefixCache(max_entries=2)
+            return _store(max_entries=2)
 
-        old_manager = RuntimeCacheManager(BrokenShutdownCache(max_entries=2))
+        old_manager = RuntimeCacheManager(_store(BrokenShutdownCache(max_entries=2)))
         monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", old_manager)
         monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", ("old",))
-        monkeypatch.setattr(cache_manager_mod, "_make_prefix_cache", make_cache)
+        monkeypatch.setattr(cache_manager_mod, "_make_prefix_store", make_cache)
 
         with pytest.raises(RuntimeError, match="cannot close"):
             cache_manager_mod.get_runtime_cache_manager(_runtime_context(prefix_cache=True))
@@ -425,12 +467,12 @@ class TestContextConfigExposedCorrectly:
 
         def make_cache(_runtime_context):
             make_calls.append(_runtime_context)
-            return DFlashPrefixCache(max_entries=2)
+            return _store(max_entries=2)
 
-        old_manager = RuntimeCacheManager(BlockingShutdownCache(max_entries=2))
+        old_manager = RuntimeCacheManager(_store(BlockingShutdownCache(max_entries=2)))
         monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", old_manager)
         monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", ("old",))
-        monkeypatch.setattr(cache_manager_mod, "_make_prefix_cache", make_cache)
+        monkeypatch.setattr(cache_manager_mod, "_make_prefix_store", make_cache)
         context = _runtime_context(prefix_cache=True)
 
         def clear_worker() -> None:
@@ -482,7 +524,7 @@ class TestContextConfigExposedCorrectly:
                 return super().set_trace_config(trace_config)
 
         context = _runtime_context(prefix_cache=True)
-        old_manager = RuntimeCacheManager(BlockingTraceCache(max_entries=2))
+        old_manager = _manager(BlockingTraceCache(max_entries=2))
         monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", old_manager)
         monkeypatch.setattr(
             cache_manager_mod,
@@ -539,7 +581,7 @@ class TestContextConfigExposedCorrectly:
                 return super().set_trace_config(trace_config)
 
         context = _runtime_context(prefix_cache=True)
-        old_manager = RuntimeCacheManager(BlockingTraceCache(max_entries=2))
+        old_manager = _manager(BlockingTraceCache(max_entries=2))
         monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", old_manager)
         monkeypatch.setattr(
             cache_manager_mod,
@@ -597,7 +639,7 @@ class TestContextConfigExposedCorrectly:
                 return super().lookup(req_tokens, lookup_key)
 
         context = _runtime_context(prefix_cache=True)
-        old_manager = RuntimeCacheManager(BlockingLookupCache(max_entries=2))
+        old_manager = _manager(BlockingLookupCache(max_entries=2))
         monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", old_manager)
         monkeypatch.setattr(
             cache_manager_mod,
@@ -661,20 +703,23 @@ class TestContextConfigExposedCorrectly:
         )
 
         class BlockingInsertCache(DFlashPrefixCache):
-            def insert(self, snapshot):
+            def insert_with_evictions(self, snapshot, *, skip_too_long=True):
                 insert_entered.set()
                 assert release_insert.wait(timeout=2.0)
-                return super().insert(snapshot)
+                return super().insert_with_evictions(
+                    snapshot,
+                    skip_too_long=skip_too_long,
+                )
 
         def make_cache(_runtime_context):
             make_calls.append(_runtime_context)
-            return DFlashPrefixCache(max_entries=2)
+            return _store(max_entries=2)
 
         context = _runtime_context(prefix_cache=True)
-        old_manager = RuntimeCacheManager(BlockingInsertCache(max_entries=2))
+        old_manager = _manager(BlockingInsertCache(max_entries=2))
         monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", old_manager)
         monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", ("old",))
-        monkeypatch.setattr(cache_manager_mod, "_make_prefix_cache", make_cache)
+        monkeypatch.setattr(cache_manager_mod, "_make_prefix_store", make_cache)
 
         def insert_worker() -> None:
             try:
@@ -742,7 +787,7 @@ class TestContextConfigExposedCorrectly:
                 assert release_shutdown.wait(timeout=2.0)
                 return super().shutdown()
 
-        old_manager = RuntimeCacheManager(BlockingShutdownCache(max_entries=2))
+        old_manager = _manager(BlockingShutdownCache(max_entries=2))
         monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", old_manager)
         monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", ("old",))
 
@@ -789,12 +834,12 @@ class TestContextConfigExposedCorrectly:
                 return super().shutdown()
 
         old_cache = TrackedShutdownCache(max_entries=2)
-        old_manager = RuntimeCacheManager(old_cache)
+        old_manager = _manager(old_cache)
         monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", old_manager)
         monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", ("old",))
         monkeypatch.setattr(
             cache_manager_mod,
-            "_make_prefix_cache",
+            "_make_prefix_store",
             lambda _runtime_context: (_ for _ in ()).throw(RuntimeError("build failed")),
         )
 
@@ -856,7 +901,7 @@ class TestContextConfigExposedCorrectly:
             def shutdown(self):
                 raise RuntimeError("broken close")
 
-        manager = RuntimeCacheManager(BrokenShutdownCache(max_entries=2))
+        manager = _manager(BrokenShutdownCache(max_entries=2))
         monkeypatch.setattr(
             cache_manager_mod,
             "_DFLASH_RUNTIME_CACHE_MANAGER",
@@ -883,7 +928,7 @@ class TestContextConfigExposedCorrectly:
             def shutdown(self):
                 raise RuntimeError("cannot close")
 
-        old_manager = RuntimeCacheManager(BrokenShutdownCache(max_entries=2))
+        old_manager = _manager(BrokenShutdownCache(max_entries=2))
         monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", old_manager)
         monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", ("old",))
 
@@ -906,10 +951,10 @@ class TestContextConfigExposedCorrectly:
 
         def make_cache(_runtime_context):
             make_calls.append(_runtime_context)
-            return DFlashPrefixCache(max_entries=2)
+            return _store(max_entries=2)
 
         context = _runtime_context(prefix_cache=True)
-        old_manager = RuntimeCacheManager(BrokenShutdownCache(max_entries=2))
+        old_manager = _manager(BrokenShutdownCache(max_entries=2))
         with pytest.raises(RuntimeError, match="cannot close"):
             old_manager.shutdown()
         monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", old_manager)
@@ -918,7 +963,7 @@ class TestContextConfigExposedCorrectly:
             "_DFLASH_RUNTIME_CACHE_CONFIG_KEY",
             cache_manager_mod._prefix_cache_config_key(context),
         )
-        monkeypatch.setattr(cache_manager_mod, "_make_prefix_cache", make_cache)
+        monkeypatch.setattr(cache_manager_mod, "_make_prefix_store", make_cache)
 
         with pytest.raises(RuntimeError, match="cannot close"):
             cache_manager_mod.sync_runtime_cache_manager(context)
@@ -940,7 +985,7 @@ class TestContextConfigExposedCorrectly:
                 return super().shutdown()
 
         context = _runtime_context(prefix_cache=True)
-        old_manager = RuntimeCacheManager(FlakyShutdownCache(max_entries=2))
+        old_manager = _manager(FlakyShutdownCache(max_entries=2))
         with pytest.raises(RuntimeError, match="first close failed"):
             old_manager.shutdown()
         monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", old_manager)
@@ -1030,7 +1075,7 @@ class TestContextConfigExposedCorrectly:
         key = _make_key()
         prompt = [51, 52, 53]
         snap, _ = _simulate_serve_insert(cache, key, prompt, n_cached_tokens=3)
-        manager = RuntimeCacheManager(cache)
+        manager = _manager(cache)
 
         memory = manager.memory_waterfall_bytes()
 
@@ -1042,7 +1087,7 @@ class TestContextConfigExposedCorrectly:
     def test_prefix_flow_memory_ignores_retired_cache_manager(self):
         import dflash_mlx.server.prefix_cache_flow as flow_mod
 
-        manager = RuntimeCacheManager(DFlashPrefixCache(max_entries=4))
+        manager = _manager(max_entries=4)
         flow = flow_mod.PrefixCacheFlow(cache_manager=manager)
         manager.shutdown()
 
@@ -1050,7 +1095,7 @@ class TestContextConfigExposedCorrectly:
 
     def test_retired_manager_handle_rejects_lookup_and_insert(self):
         cache = DFlashPrefixCache(max_entries=4)
-        manager = RuntimeCacheManager(cache)
+        manager = _manager(cache)
         key = _make_key()
         prompt = [71, 72, 73]
         snap = build_snapshot(
@@ -1113,7 +1158,7 @@ class TestContextConfigExposedCorrectly:
         monkeypatch.setattr(
             flow_mod,
             "get_runtime_cache_manager",
-            lambda _runtime_context, *, cache_identity=None: RuntimeCacheManager(cache),
+            lambda _runtime_context, *, cache_identity=None: _manager(cache),
         )
         monkeypatch.setattr(flow_mod, "build_prefix_key", lambda *_args: key)
 
@@ -1182,7 +1227,7 @@ class TestContextConfigExposedCorrectly:
         assert flow.hit_tokens == len(prompt)
         assert flow.snapshot is not None
         assert flow.lookup_ms == 0.25
-        assert flow.snapshot_builder is None
+        assert flow.snapshot_service is None
 
     def test_prefix_flow_treats_retired_lookup_manager_as_inactive(self, monkeypatch):
         import dflash_mlx.server.prefix_cache_flow as flow_mod
@@ -1199,7 +1244,7 @@ class TestContextConfigExposedCorrectly:
             def convert_tokens_to_ids(self, tokens):
                 return [-1 for _ in tokens]
 
-        manager = RuntimeCacheManager(DFlashPrefixCache(max_entries=4))
+        manager = _manager(max_entries=4)
         manager.shutdown()
         monkeypatch.setattr(
             flow_mod,
@@ -1217,63 +1262,172 @@ class TestContextConfigExposedCorrectly:
 
         assert not flow.cache_active
         assert flow.key is None
-        assert flow.snapshot_builder is None
+        assert flow.snapshot_service is None
 
-    def test_prefix_flow_inserts_built_snapshot(self):
-        import dflash_mlx.server.prefix_cache_flow as flow_mod
-
+    def test_snapshot_service_inserts_built_prefill_snapshot(self):
         cache = DFlashPrefixCache(max_entries=4)
         key = _make_key()
         prompt = [21, 22, 23]
         target_hidden = mx.arange(1 * len(prompt) * 6, dtype=mx.float32).reshape(
             1, len(prompt), 6
         )
-        snap = build_snapshot(
+        service = _snapshot_service(cache, key)
+        publication = service.publish(
             token_ids=prompt,
             target_cache=_make_populated_target_cache(n_tokens=len(prompt)),
             target_hidden=target_hidden,
             last_logits=mx.zeros((1, 32), dtype=mx.float32),
-            key=key,
+            kind="prefill",
+            require_logits=True,
+            snapshot_boundary=len(prompt),
+            allow_full_attention_context=False,
         )
-        flow = flow_mod.PrefixCacheFlow(cache_manager=RuntimeCacheManager(cache), key=key)
-
-        flow.handle_prefill_snapshot(snap)
 
         matched, found = cache.lookup(prompt, key)
+        assert publication is not None
+        assert publication.admitted is True
+        assert publication.prefix_len == len(prompt)
         assert matched == len(prompt)
-        assert found is snap
-        assert flow.insert_ms >= 0.0
+        assert found is not None
+        assert found.token_ids == tuple(prompt)
+        assert service.insert_ms >= 0.0
 
-    def test_prefix_flow_inserts_generation_snapshot_as_prefix_only(self):
-        import dflash_mlx.server.prefix_cache_flow as flow_mod
+    def test_snapshot_service_reports_skipped_snapshot_as_not_admitted(self):
+        cache = DFlashPrefixCache(max_entries=4, max_snapshot_tokens=2)
+        key = _make_key()
+        prompt = [21, 22, 23]
+        target_hidden = mx.zeros((1, len(prompt), 6), dtype=mx.float32)
+        service = _snapshot_service(cache, key)
+        publication = service.publish(
+            token_ids=prompt,
+            target_cache=_make_populated_target_cache(n_tokens=len(prompt)),
+            target_hidden=target_hidden,
+            last_logits=mx.zeros((1, 32), dtype=mx.float32),
+            kind="prefill",
+            require_logits=True,
+            snapshot_boundary=len(prompt),
+            allow_full_attention_context=False,
+        )
 
+        matched, found = cache.lookup(prompt, key)
+        assert publication is not None
+        assert publication.admitted is False
+        assert publication.prefix_len == len(prompt)
+        assert publication.insert_ms >= 0.0
+        assert service.insert_ms >= 0.0
+        assert cache.stats()["skipped_too_long"] == 1
+        assert matched == 0
+        assert found is None
+
+    def test_snapshot_service_reports_l2_only_insert_as_admitted(self):
+        class ImmediateL2:
+            def __init__(self):
+                self.snapshots = []
+
+            def insert_async(self, snapshot):
+                self.snapshots.append(snapshot)
+                return True
+
+            def lookup(self, tokens, key):
+                req = tuple(tokens)
+                for snapshot in reversed(self.snapshots):
+                    if snapshot.key == key and req[: len(snapshot.token_ids)] == snapshot.token_ids:
+                        return snapshot
+                return None
+
+            def stats(self):
+                return {"writes": len(self.snapshots)}
+
+            def clear(self):
+                self.snapshots.clear()
+
+        l2 = ImmediateL2()
+        cache = _store(DFlashPrefixCache(max_entries=0), l2=l2)
+        key = _make_key()
+        prompt = [21, 22, 23]
+        target_hidden = mx.zeros((1, len(prompt), 6), dtype=mx.float32)
+        service = _snapshot_service(cache, key)
+        publication = service.publish(
+            token_ids=prompt,
+            target_cache=_make_populated_target_cache(n_tokens=len(prompt)),
+            target_hidden=target_hidden,
+            last_logits=mx.zeros((1, 32), dtype=mx.float32),
+            kind="prefill",
+            require_logits=True,
+            snapshot_boundary=len(prompt),
+            allow_full_attention_context=False,
+        )
+
+        matched, found = cache.lookup(prompt, key)
+        assert publication is not None
+        assert publication.admitted is True
+        assert cache.stats()["current_entries"] == 0
+        assert l2.snapshots
+        assert matched == len(prompt)
+        assert found is not None
+        assert found.token_ids == tuple(prompt)
+
+    def test_snapshot_service_reports_l2_rejected_insert_as_not_admitted(self, tmp_path):
+        writable_l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        read_only_l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            assert writable_l2.writable
+            assert not read_only_l2.writable
+            cache = _store(DFlashPrefixCache(max_entries=0), l2=read_only_l2)
+            key = _make_key()
+            prompt = [21, 22, 23]
+            target_hidden = mx.zeros((1, len(prompt), 6), dtype=mx.float32)
+            service = _snapshot_service(cache, key)
+            publication = service.publish(
+                token_ids=prompt,
+                target_cache=_make_populated_target_cache(n_tokens=len(prompt)),
+                target_hidden=target_hidden,
+                last_logits=mx.zeros((1, 32), dtype=mx.float32),
+                kind="prefill",
+                require_logits=True,
+                snapshot_boundary=len(prompt),
+                allow_full_attention_context=False,
+            )
+
+            matched, found = cache.lookup(prompt, key)
+            assert publication is not None
+            assert publication.admitted is False
+            assert matched == 0
+            assert found is None
+        finally:
+            read_only_l2.shutdown()
+            writable_l2.shutdown()
+
+    def test_snapshot_service_inserts_generation_snapshot_as_prefix_only(self):
         cache = DFlashPrefixCache(max_entries=4)
         key = _make_key()
         prompt = [41, 42, 43]
         target_hidden = mx.zeros((1, len(prompt), 6), dtype=mx.float32)
-        snap = build_snapshot(
+        service = _snapshot_service(cache, key)
+        publication = service.publish(
             token_ids=prompt,
             target_cache=_make_populated_target_cache(n_tokens=len(prompt)),
             target_hidden=target_hidden,
             last_logits=None,
-            key=key,
             kind="generation",
+            require_logits=False,
+            snapshot_boundary=len(prompt),
+            allow_full_attention_context=False,
         )
-        flow = flow_mod.PrefixCacheFlow(cache_manager=RuntimeCacheManager(cache), key=key)
-
-        flow.handle_generation_snapshot(snap)
 
         exact_len, exact = cache.lookup(prompt, key)
         assert exact_len == 0
         assert exact is None
 
         prefix_len, prefix = cache.lookup(prompt + [99], key)
+        assert publication is not None
+        assert publication.admitted is True
         assert prefix_len == len(prompt)
-        assert prefix is snap
+        assert prefix is not None
+        assert prefix.kind == "generation"
+        assert prefix.token_ids == tuple(prompt)
 
-    def test_prefix_flow_raises_on_invalid_snapshot_contract(self):
-        import dflash_mlx.server.prefix_cache_flow as flow_mod
-
+    def test_snapshot_service_raises_on_invalid_snapshot_contract(self):
         cache = DFlashPrefixCache(max_entries=4)
         key = _make_key()
         wrong_key = _make_key(target_model_id="other/target")
@@ -1286,103 +1440,135 @@ class TestContextConfigExposedCorrectly:
             last_logits=mx.zeros((1, 32), dtype=mx.float32),
             key=wrong_key,
         )
-        no_logits_snap = build_snapshot(
-            token_ids=prompt,
-            target_cache=_make_populated_target_cache(n_tokens=len(prompt)),
-            target_hidden=target_hidden,
-            last_logits=None,
-            key=key,
-        )
-        flow = flow_mod.PrefixCacheFlow(cache_manager=RuntimeCacheManager(cache), key=key)
+
+        class WrongTypeBuilder:
+            def build(self, **_kwargs):
+                return {"snapshot": "not-a-snapshot"}
+
+        class WrongKeyBuilder:
+            def build(self, **_kwargs):
+                return wrong_snap
+
+        wrong_type_builder = WrongTypeBuilder()
+        wrong_type_builder.key = key
+        wrong_key_builder = WrongKeyBuilder()
+        wrong_key_builder.key = key
 
         with pytest.raises(TypeError, match="expected DFlashPrefixSnapshot"):
-            flow.handle_prefill_snapshot(
-                {
-                    "target_cache": _make_populated_target_cache(n_tokens=len(prompt)),
-                    "target_hidden": target_hidden,
-                    "last_logits": mx.zeros((1, 32), dtype=mx.float32),
-                    "token_ids": prompt,
-                }
+            _snapshot_service(cache, key, builder=wrong_type_builder).publish(
+                token_ids=prompt,
+                target_cache=_make_populated_target_cache(n_tokens=len(prompt)),
+                target_hidden=target_hidden,
+                last_logits=mx.zeros((1, 32), dtype=mx.float32),
+                kind="prefill",
+                require_logits=True,
+                snapshot_boundary=len(prompt),
+                allow_full_attention_context=False,
             )
         with pytest.raises(ValueError, match="snapshot key"):
-            flow.handle_prefill_snapshot(wrong_snap)
+            _snapshot_service(cache, key, builder=wrong_key_builder).publish(
+                token_ids=prompt,
+                target_cache=_make_populated_target_cache(n_tokens=len(prompt)),
+                target_hidden=target_hidden,
+                last_logits=mx.zeros((1, 32), dtype=mx.float32),
+                kind="prefill",
+                require_logits=True,
+                snapshot_boundary=len(prompt),
+                allow_full_attention_context=False,
+            )
         with pytest.raises(ValueError, match="requires last_logits"):
-            flow.handle_prefill_snapshot(no_logits_snap)
+            _snapshot_service(cache, key).publish(
+                token_ids=prompt,
+                target_cache=_make_populated_target_cache(n_tokens=len(prompt)),
+                target_hidden=target_hidden,
+                last_logits=None,
+                kind="prefill",
+                require_logits=True,
+                snapshot_boundary=len(prompt),
+                allow_full_attention_context=False,
+            )
 
         matched, found = cache.lookup(prompt, key)
         assert matched == 0
         assert found is None
 
-    def test_prefix_flow_ignores_retired_manager_on_snapshot_insert(self):
-        import dflash_mlx.server.prefix_cache_flow as flow_mod
-
+    def test_snapshot_service_ignores_retired_manager_on_insert(self):
         cache = DFlashPrefixCache(max_entries=4)
         key = _make_key()
         prompt = [61, 62, 63]
         target_hidden = mx.zeros((1, len(prompt), 6), dtype=mx.float32)
-        snap = build_snapshot(
+        manager = _manager(cache)
+        manager.shutdown()
+        service = SnapshotService(
+            cache_manager=manager,
+            builder=PrefixSnapshotBuilder(key=key),
+        )
+
+        publication = service.publish(
             token_ids=prompt,
             target_cache=_make_populated_target_cache(n_tokens=len(prompt)),
             target_hidden=target_hidden,
             last_logits=mx.zeros((1, 32), dtype=mx.float32),
-            key=key,
+            kind="prefill",
+            require_logits=True,
+            snapshot_boundary=len(prompt),
+            allow_full_attention_context=False,
         )
-        manager = RuntimeCacheManager(cache)
-        manager.shutdown()
-        flow = flow_mod.PrefixCacheFlow(cache_manager=manager, key=key)
 
-        flow.handle_prefill_snapshot(snap)
-
-        assert flow.cache_manager is None
-        assert flow.insert_ms == 0.0
+        assert publication is not None
+        assert publication.admitted is False
+        assert service.active is False
+        assert service.insert_ms == 0.0
         matched, found = cache.lookup(prompt, key)
         assert matched == 0
         assert found is None
 
-    def test_prefix_flow_retired_manager_insert_is_quiet(self, capsys):
-        import dflash_mlx.server.prefix_cache_flow as flow_mod
-
+    def test_snapshot_service_retired_manager_insert_is_quiet(self, capsys):
         cache = DFlashPrefixCache(max_entries=4)
         key = _make_key()
         prompt = [61, 62, 63]
         target_hidden = mx.zeros((1, len(prompt), 6), dtype=mx.float32)
-        snap = build_snapshot(
+        manager = _manager(cache)
+        manager.shutdown()
+        service = SnapshotService(
+            cache_manager=manager,
+            builder=PrefixSnapshotBuilder(key=key),
+        )
+
+        service.publish(
             token_ids=prompt,
             target_cache=_make_populated_target_cache(n_tokens=len(prompt)),
             target_hidden=target_hidden,
             last_logits=mx.zeros((1, 32), dtype=mx.float32),
-            key=key,
+            kind="prefill",
+            require_logits=True,
+            snapshot_boundary=len(prompt),
+            allow_full_attention_context=False,
         )
-        manager = RuntimeCacheManager(cache)
-        manager.shutdown()
-        flow = flow_mod.PrefixCacheFlow(cache_manager=manager, key=key)
 
-        flow.handle_prefill_snapshot(snap)
-
-        assert flow.cache_manager is None
         assert "prefix cache insert failed" not in capsys.readouterr().err
 
-    def test_prefix_flow_raises_and_logs_cache_insert_failure(self, capsys):
-        import dflash_mlx.server.prefix_cache_flow as flow_mod
-
+    def test_snapshot_service_raises_and_logs_cache_insert_failure(self, capsys):
         class BrokenInsertCache(DFlashPrefixCache):
-            def insert(self, snapshot):
+            def insert_with_evictions(self, snapshot, *, skip_too_long=True):
                 raise RuntimeError("insert failed")
 
         cache = BrokenInsertCache(max_entries=4)
         key = _make_key()
         prompt = [51, 52, 53]
         target_hidden = mx.zeros((1, len(prompt), 6), dtype=mx.float32)
-        snap = build_snapshot(
-            token_ids=prompt,
-            target_cache=_make_populated_target_cache(n_tokens=len(prompt)),
-            target_hidden=target_hidden,
-            last_logits=mx.zeros((1, 32), dtype=mx.float32),
-            key=key,
-        )
-        flow = flow_mod.PrefixCacheFlow(cache_manager=RuntimeCacheManager(cache), key=key)
+        service = _snapshot_service(cache, key)
 
         with pytest.raises(RuntimeError, match="insert failed"):
-            flow.handle_prefill_snapshot(snap)
+            service.publish(
+                token_ids=prompt,
+                target_cache=_make_populated_target_cache(n_tokens=len(prompt)),
+                target_hidden=target_hidden,
+                last_logits=mx.zeros((1, 32), dtype=mx.float32),
+                kind="prefill",
+                require_logits=True,
+                snapshot_boundary=len(prompt),
+                allow_full_attention_context=False,
+            )
 
         assert "prefix cache insert failed: insert failed" in capsys.readouterr().err

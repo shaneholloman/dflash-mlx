@@ -12,6 +12,7 @@ import mlx.core as mx
 import pytest
 
 from dflash_mlx.engine import memory_waterfall
+from dflash_mlx.observability import memory as memory_obs
 from tools.benchmarks.analyze_trace import (
     classify_verdict,
     compute_phase_deltas,
@@ -116,6 +117,28 @@ def test_collect_memory_waterfall_handles_missing_fields():
     assert out["l1_snapshot_gb"] == 0.0
     assert out["l2_disk_gb"] == 0.0
 
+def test_collect_memory_waterfall_preserves_unknown_process_memory(monkeypatch):
+    monkeypatch.setattr(
+        memory_waterfall,
+        "process_memory_bytes",
+        lambda: {
+            "rss_bytes": None,
+            "system_wired_bytes": None,
+            "mlx_active_bytes": None,
+            "mlx_cache_bytes": None,
+            "mlx_peak_bytes": None,
+            "untracked_bytes": None,
+        },
+    )
+
+    out = collect_memory_waterfall(phase="test")
+
+    assert out["rss_bytes"] is None
+    assert out["rss_gb"] is None
+    assert out["mlx_active_gb"] is None
+    assert out["untracked_gb"] is None
+    assert out["target_fa_kv_gb"] == 0.0
+
 def test_collect_memory_waterfall_deduplicates_hidden_buckets():
     hidden = mx.zeros((1, 2, 3), dtype=mx.float16)
     out = collect_memory_waterfall(
@@ -126,36 +149,42 @@ def test_collect_memory_waterfall_deduplicates_hidden_buckets():
     assert out["target_hidden_active_bytes"] == hidden.nbytes
     assert out["gen_hidden_chunks_bytes"] == 0
 
-def test_current_rss_bytes_falls_back_on_ps_parse_failure(monkeypatch):
-    monkeypatch.setattr(memory_waterfall.subprocess, "check_output", lambda *_args, **_kwargs: b"bad")
+def test_current_rss_bytes_returns_none_when_current_probe_is_unavailable(monkeypatch):
+    def missing_proc(*_args, **_kwargs):
+        raise OSError("no proc")
+
+    monkeypatch.setattr(memory_obs.sys, "platform", "linux")
+    monkeypatch.setattr(memory_obs.builtins, "open", missing_proc)
     monkeypatch.setattr(
-        memory_waterfall.resource,
+        memory_obs.resource,
         "getrusage",
         lambda _kind: SimpleNamespace(ru_maxrss=1234),
     )
-    monkeypatch.setattr(memory_waterfall.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(memory_obs.resource, "getpagesize", lambda: 4096)
 
-    assert memory_waterfall._current_rss_bytes() == 1234
+    assert memory_obs.current_rss_bytes() is None
+    assert memory_obs.rss_peak_bytes() == 1234 * 1024
 
 
 def test_current_rss_bytes_propagates_programmer_errors(monkeypatch):
-    def broken_check_output(*_args, **_kwargs):
-        raise TypeError("broken helper contract")
+    def broken_open(*_args, **_kwargs):
+        raise TypeError("broken open contract")
 
-    monkeypatch.setattr(memory_waterfall.subprocess, "check_output", broken_check_output)
+    monkeypatch.setattr(memory_obs.sys, "platform", "linux")
+    monkeypatch.setattr(memory_obs.builtins, "open", broken_open)
 
-    with pytest.raises(TypeError, match="broken helper contract"):
-        memory_waterfall._current_rss_bytes()
+    with pytest.raises(TypeError, match="broken open contract"):
+        memory_obs.current_rss_bytes()
 
 
 def test_system_wired_bytes_falls_back_on_vm_stat_failure(monkeypatch):
     def fail_vm_stat(*_args, **_kwargs):
         raise subprocess.CalledProcessError(1, ["vm_stat"])
 
-    monkeypatch.setattr(memory_waterfall.platform, "system", lambda: "Darwin")
-    monkeypatch.setattr(memory_waterfall.subprocess, "check_output", fail_vm_stat)
+    monkeypatch.setattr(memory_obs.sys, "platform", "darwin")
+    monkeypatch.setattr(memory_obs.subprocess, "check_output", fail_vm_stat)
 
-    assert memory_waterfall._system_wired_bytes() == 0
+    assert memory_obs.system_wired_bytes() is None
 
 
 def test_system_wired_bytes_parses_vm_stat(monkeypatch):
@@ -163,38 +192,38 @@ def test_system_wired_bytes_parses_vm_stat(monkeypatch):
         "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
         "Pages wired down: 2.\n"
     )
-    monkeypatch.setattr(memory_waterfall.platform, "system", lambda: "Darwin")
-    monkeypatch.setattr(memory_waterfall.subprocess, "check_output", lambda *_args, **_kwargs: out)
+    monkeypatch.setattr(memory_obs.sys, "platform", "darwin")
+    monkeypatch.setattr(memory_obs.subprocess, "check_output", lambda *_args, **_kwargs: out)
 
-    assert memory_waterfall._system_wired_bytes() == 32768
+    assert memory_obs.system_wired_bytes() == 32768
 
 
 def test_system_wired_bytes_propagates_programmer_errors(monkeypatch):
     def broken_check_output(*_args, **_kwargs):
         raise TypeError("broken helper contract")
 
-    monkeypatch.setattr(memory_waterfall.platform, "system", lambda: "Darwin")
-    monkeypatch.setattr(memory_waterfall.subprocess, "check_output", broken_check_output)
+    monkeypatch.setattr(memory_obs.sys, "platform", "darwin")
+    monkeypatch.setattr(memory_obs.subprocess, "check_output", broken_check_output)
 
     with pytest.raises(TypeError, match="broken helper contract"):
-        memory_waterfall._system_wired_bytes()
+        memory_obs.system_wired_bytes()
 
 
 def test_mlx_memory_bytes_fallbacks_and_contract_errors(monkeypatch):
-    monkeypatch.setattr(memory_waterfall.mx, "missing_memory_counter", None, raising=False)
-    assert memory_waterfall._mlx_memory_bytes("missing_memory_counter") == 0
+    monkeypatch.setattr(memory_obs.mx, "missing_memory_counter", None, raising=False)
+    assert memory_obs.mlx_memory_bytes("missing_memory_counter") is None
 
     monkeypatch.setattr(
-        memory_waterfall.mx,
+        memory_obs.mx,
         "runtime_failing_memory_counter",
         lambda: (_ for _ in ()).throw(RuntimeError("mlx unavailable")),
         raising=False,
     )
-    assert memory_waterfall._mlx_memory_bytes("runtime_failing_memory_counter") == 0
+    assert memory_obs.mlx_memory_bytes("runtime_failing_memory_counter") is None
 
-    monkeypatch.setattr(memory_waterfall.mx, "bad_memory_counter", lambda: object(), raising=False)
+    monkeypatch.setattr(memory_obs.mx, "bad_memory_counter", lambda: object(), raising=False)
     with pytest.raises(TypeError):
-        memory_waterfall._mlx_memory_bytes("bad_memory_counter")
+        memory_obs.mlx_memory_bytes("bad_memory_counter")
 
 def test_analyzer_loads_jsonl_and_classifies_target_hidden(tmp_path):
     path = tmp_path / "cycle_events.jsonl"
@@ -225,3 +254,21 @@ def test_analyzer_delta_reports_positive_phase_growth():
     assert deltas["by_phase"]["after_cleanup"]["mlx_cache"] == 3.0
     rendered = render_summary(summarize_events(events), include_delta=True)
     assert "after_target_cache_create -> after_prefill_chunk: mlx_active +12.000GB" in rendered
+
+
+def test_memory_waterfall_summary_reports_unknown_buckets():
+    rendered = memory_waterfall.format_memory_waterfall_summary(
+        {
+            "mlx_active_gb": None,
+            "mlx_cache_gb": None,
+            "untracked_gb": None,
+            "target_fa_kv_gb": 1.0,
+            "draft_kv_gb": 0.25,
+            "target_hidden_active_gb": 0.0,
+        }
+    )
+
+    assert "target_fa_kv:1.00GB" in rendered
+    assert "draft_kv:0.25GB" in rendered
+    assert "mlx_active:0.00GB" not in rendered
+    assert "unknown=mlx_active,mlx_cache,untracked" in rendered
