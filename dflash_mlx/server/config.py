@@ -22,26 +22,16 @@ from dflash_mlx.metal_limits import (
     apply_metal_limits,
     parse_memory_limit,
 )
-from dflash_mlx.runtime_profiles import (
-    format_profiles,
-    profile_names,
+from dflash_mlx.runtime.config import (
+    add_runtime_config_arguments,
     resolve_runtime_config,
 )
-from dflash_mlx.runtime_context import build_runtime_context
+from dflash_mlx.runtime.context import build_runtime_context
+from dflash_mlx.runtime.profiles import format_profiles
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="DFlash Server.")
-    parser.add_argument(
-        "--profile",
-        choices=profile_names(),
-        default=None,
-        help="Runtime preset. Explicit CLI flags override profile values.",
-    )
-    parser.add_argument(
-        "--list-profiles",
-        action="store_true",
-        help="List runtime profiles and exit.",
-    )
+    add_runtime_config_arguments(parser)
     parser.add_argument(
         "--model",
         type=str,
@@ -62,40 +52,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Draft model repo ID or local path. Omit to use the DFlash registry.",
-    )
-    parser.add_argument(
-        "--dflash-max-ctx",
-        type=int,
-        default=None,
-        help="Hard cap on runtime context length.",
-    )
-    parser.add_argument(
-        "--target-fa-window",
-        type=int,
-        default=None,
-        help=(
-            "Experimental target verifier full-attention KV window. "
-            "0 keeps full KV cache; N>0 uses a rotating KV cache of N tokens "
-            "for target full-attention layers only."
-        ),
-    )
-    parser.add_argument(
-        "--draft-sink-size",
-        type=int,
-        default=None,
-        help="Draft context cache sink tokens kept before the rolling window.",
-    )
-    parser.add_argument(
-        "--draft-window-size",
-        type=int,
-        default=None,
-        help="Draft context cache rolling window tokens.",
-    )
-    parser.add_argument(
-        "--verify-len-cap",
-        type=int,
-        default=None,
-        help="Max tokens verified per target forward; 0 uses the block size.",
     )
     parser.add_argument(
         "--diagnostics",
@@ -202,83 +158,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Set chat-template arg enable_thinking=true.",
     )
     parser.add_argument(
-        "--prefill-step-size",
-        type=int,
-        default=None,
-        help="Prompt prefill chunk size.",
-    )
-    parser.add_argument(
-        "--clear-cache-boundaries",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Clear the MLX cache at safe request boundaries.",
-    )
-    parser.add_argument(
-        "--memory-waterfall",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Emit memory bucket snapshots in runtime events.",
-    )
-    parser.add_argument(
-        "--bench-log-dir",
-        type=str,
-        default=None,
-        help="Directory for structured JSONL runtime events.",
-    )
-    parser.add_argument(
-        "--verify-mode",
-        choices=("auto", "off"),
-        default=None,
-        help="Verify path mode. Use off only for debug/parity.",
-    )
-    parser.add_argument(
-        "--max-snapshot-tokens",
-        type=int,
-        default=None,
-        help="Skip prefix-cache snapshot inserts above this token count; 0 disables the cap.",
-    )
-    parser.add_argument(
-        "--prefix-cache-l2",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Enable SSD L2 for evicted prefix snapshots.",
-    )
-    parser.add_argument(
-        "--prefix-cache-l2-dir",
-        type=str,
-        default=None,
-        help="Directory for prefix-cache L2 files.",
-    )
-    parser.add_argument(
-        "--prefix-cache-l2-max-bytes",
-        type=int,
-        default=None,
-        help="Byte budget for prefix-cache L2.",
-    )
-    parser.add_argument(
         "--prompt-cache-size",
         type=int,
         default=10,
         help="mlx_lm prompt-cache entry count.",
-    )
-    parser.add_argument(
-        "--prefix-cache",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Enable the DFlash prefix cache that reuses cross-turn KV state. Default: enabled. "
-             "Big win on multi-turn agentic workloads, ~neutral on single-turn.",
-    )
-    parser.add_argument(
-        "--prefix-cache-max-entries",
-        type=int,
-        default=None,
-        help="Maximum number of cached prefix snapshots (default: 4).",
-    )
-    parser.add_argument(
-        "--prefix-cache-max-bytes",
-        type=int,
-        default=None,
-        help="Maximum total bytes the prefix cache may hold (default: 8 GiB).",
     )
     return parser
 
@@ -290,8 +173,6 @@ def normalize_cli_args(args: argparse.Namespace) -> argparse.Namespace:
     if args.fastpath_max_tokens < 0:
         raise SystemExit("--fastpath-max-tokens must be >= 0")
     diagnostics_dir = _configure_diagnostics_args(args)
-    if args.bench_log_dir is not None and not args.bench_log_dir.strip():
-        raise SystemExit("--bench-log-dir must not be empty")
     try:
         runtime_config = resolve_runtime_config(args)
     except ValueError as exc:
@@ -307,7 +188,7 @@ def normalize_cli_args(args: argparse.Namespace) -> argparse.Namespace:
         sys.stderr.flush()
     if diagnostics_dir is not None:
         _write_diagnostics_bootstrap(args, runtime_config, diagnostics_dir)
-    diagnostics_config = _build_diagnostics_config(args, runtime_config, diagnostics_dir)
+    diagnostics_config = _build_diagnostics_config(args, diagnostics_dir)
     args.diagnostics_config = diagnostics_config
     args.runtime_config = runtime_config
     args.runtime_context = build_runtime_context(runtime_config, diagnostics_config)
@@ -340,17 +221,12 @@ def _configure_diagnostics_args(args: argparse.Namespace) -> os.PathLike[str] | 
         if diagnostics_dir is not None:
             raise SystemExit("--diagnostics-dir requires --diagnostics basic or full")
         return None
-    if diagnostics_dir is not None and getattr(args, "bench_log_dir", None) is not None:
-        raise SystemExit("--diagnostics-dir and --bench-log-dir cannot be used together")
-    if getattr(args, "bench_log_dir", None) is not None:
-        raise SystemExit("--diagnostics and --bench-log-dir cannot be used together")
 
     run_dir = create_run_dir(
         "diagnostics",
         f"serve-{mode}",
         explicit_path=diagnostics_dir,
     )
-    args.bench_log_dir = str(run_dir)
     args.diagnostics_dir_resolved = str(run_dir)
     if mode == "full":
         args.memory_waterfall = True
@@ -362,7 +238,6 @@ def _configure_diagnostics_args(args: argparse.Namespace) -> os.PathLike[str] | 
 
 def _build_diagnostics_config(
     args: argparse.Namespace,
-    runtime_config,
     diagnostics_dir: os.PathLike[str] | None,
 ) -> DiagnosticsConfig:
     trace_dir: Path | None = None
@@ -370,12 +245,10 @@ def _build_diagnostics_config(
     if diagnostics_dir is not None:
         trace_dir = Path(diagnostics_dir)
         cycle_events = getattr(args, "diagnostics", "off") == "full"
-    elif runtime_config.bench_log_dir:
-        trace_dir = Path(runtime_config.bench_log_dir)
     return DiagnosticsConfig(
         mode=getattr(args, "diagnostics", "off"),
         run_dir=Path(diagnostics_dir) if diagnostics_dir is not None else None,
-        memory_waterfall=bool(runtime_config.memory_waterfall),
+        memory_waterfall=bool(getattr(args, "memory_waterfall", None)),
         trace=TraceConfig(log_dir=trace_dir, cycle_events=cycle_events),
     )
 
@@ -387,13 +260,12 @@ def _write_diagnostics_bootstrap(
     path = os.fspath(run_dir)
     run_path = os.path.abspath(path)
     effective = asdict(runtime_config)
-    effective.update(
-        {
-            "diagnostics": args.diagnostics,
-            "diagnostics_dir": path,
-            "profile_cycles": args.diagnostics == "full",
-        }
-    )
+    diagnostics_meta = {
+        "mode": args.diagnostics,
+        "dir": path,
+        "memory_waterfall": bool(getattr(args, "memory_waterfall", None)),
+        "profile_cycles": args.diagnostics == "full",
+    }
     write_manifest(
         Path(path),
         kind="diagnostics",
@@ -409,8 +281,7 @@ def _write_diagnostics_bootstrap(
         {
             "argv": list(sys.argv),
             "cwd": os.getcwd(),
-            "diagnostics": args.diagnostics,
-            "diagnostics_dir": path,
+            "diagnostics": diagnostics_meta,
         },
     )
     write_json(Path(path) / "effective_config.json", effective)

@@ -27,7 +27,7 @@ from dflash_mlx.engine.events import (
 )
 from dflash_mlx.engine import spec_epoch
 from dflash_mlx.diagnostics import DiagnosticsConfig, TraceConfig
-from dflash_mlx.runtime_context import (
+from dflash_mlx.runtime.context import (
     build_runtime_context,
     runtime_config_from_profile,
 )

@@ -30,7 +30,8 @@ from dflash_mlx.server.metrics import (
     write_post_request_memory_line,
 )
 from dflash_mlx import serve
-from dflash_mlx.serve import DFlashAPIHandler, _build_prompt_regime
+from dflash_mlx.serve import DFlashAPIHandler
+from dflash_mlx.server.runtime import build_prompt_regime
 
 
 def _runtime_config(**overrides):
@@ -46,7 +47,6 @@ def _runtime_config(**overrides):
         "prefix_cache_l2_max_bytes": 0,
         "target_fa_window": 0,
         "dflash_max_ctx": 0,
-        "memory_waterfall": False,
         "max_snapshot_tokens": 24000,
         "clear_cache_boundaries": False,
         "verify_mode": "auto",
@@ -240,7 +240,6 @@ def test_diagnostics_post_event_records_prefill_details(tmp_path):
             prefix_cache_l2=False,
             target_fa_window=0,
             dflash_max_ctx=0,
-            memory_waterfall=True,
             max_snapshot_tokens=24000,
             clear_cache_boundaries=False,
             verify_mode="auto",
@@ -256,6 +255,7 @@ def test_diagnostics_post_event_records_prefill_details(tmp_path):
     assert row["prefill_tokens_restored"] == 3072
     assert row["prefill_tokens_computed"] == 1024
     assert row["runtime_config"]["prefill_step_size"] == 8192
+    assert "memory_waterfall" not in row["runtime_config"]
     assert row["prefill_phase_timings_us"] == {
         "phase_cold_us": 1_900_000.0,
         "phase_seam_us": 100_000.0,
@@ -721,6 +721,9 @@ def test_metrics_endpoint_reports_current_request(monkeypatch):
     assert current["cache_lookup_ms"] == 1.5
     assert current["prefill_tokens_processed"] == 1024
     assert current["prefill_tokens_total"] == 4096
+    assert current["ttft_s"] is None
+    assert current["prefill_phase_timings_us"] == {}
+    assert current["phase_timings_us"] == {}
     assert current["elapsed_s"] >= 0.0
     assert payload["last_request"] is None
 
@@ -728,16 +731,24 @@ def test_metrics_endpoint_reports_current_request(monkeypatch):
         request_id=9,
         state="decode",
         generated_tokens=3,
+        ttft_s=2.5,
         decode_tok_s=24.0,
         acceptance_rate=0.75,
+        phase_timings_us={"draft": 1000.0, "verify": 2000.0, "replay": 300.0},
     )
 
     payload = _call_metrics_endpoint()
 
     assert payload["current_request"]["state"] == "decode"
     assert payload["current_request"]["generated_tokens"] == 3
+    assert payload["current_request"]["ttft_s"] == 2.5
     assert payload["current_request"]["decode_tok_s"] == 24.0
     assert payload["current_request"]["acceptance_rate"] == 0.75
+    assert payload["current_request"]["phase_timings_us"] == {
+        "draft": 1000.0,
+        "verify": 2000.0,
+        "replay": 300.0,
+    }
     assert payload["rates"]["active_decode_tok_s"] == 24.0
 
 
@@ -757,7 +768,12 @@ def test_metrics_endpoint_reports_last_request_and_prefix_cache(monkeypatch):
             acceptance_ratio=0.81,
             cycles_completed=44,
             tokens_per_cycle=2.27,
-            phase_timings_us={"prefill": 1_000_000.0},
+            phase_timings_us={
+                "prefill": 1_000_000.0,
+                "draft": 300_000.0,
+                "verify": 400_000.0,
+                "replay": 50_000.0,
+            },
         ),
         request_start_ns=0,
         request_done_ns=4_000_000_000,
@@ -788,12 +804,20 @@ def test_metrics_endpoint_reports_last_request_and_prefix_cache(monkeypatch):
     assert last["request_id"] == 12
     assert last["prompt_tokens"] == 1000
     assert last["generated_tokens"] == 100
+    assert last["ttft_s"] == 1.0
     assert last["prefill_tok_s_physical"] == 250.0
     assert last["prefill_tok_s_apparent"] == 1000.0
     assert round(last["decode_tok_s"], 2) == 33.33
     assert last["acceptance_rate"] == 0.81
     assert last["cycles"] == 44
     assert last["finish_reason"] == "stop"
+    assert last["phase_timings_us"] == {
+        "prefill": 1_000_000.0,
+        "draft": 300_000.0,
+        "verify": 400_000.0,
+        "replay": 50_000.0,
+    }
+    assert last["prefill_phase_timings_us"] == {}
     assert payload["prefix_cache"]["hits"] == 3
     assert payload["prefix_cache"]["misses"] == 4
     assert payload["prefix_cache"]["last_restored_tokens"] == 750
@@ -818,12 +842,12 @@ def test_prompt_regime_distinguishes_text_completion_from_chat():
         chat_template="template",
     )
 
-    completion = _build_prompt_regime(
+    completion = build_prompt_regime(
         args,
         tokenizer,
         SimpleNamespace(request_type="text"),
     )
-    chat = _build_prompt_regime(
+    chat = build_prompt_regime(
         args,
         tokenizer,
         SimpleNamespace(request_type="chat"),

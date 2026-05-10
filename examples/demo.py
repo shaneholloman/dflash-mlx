@@ -28,12 +28,12 @@ from dflash_mlx.engine.events import (
 from dflash_mlx.engine.sampling import prepare_prompt_tokens
 from dflash_mlx.generate import decode_token
 from dflash_mlx.runtime import stream_dflash_generate
-from dflash_mlx.runtime_bundle import load_runtime_bundle
-from dflash_mlx.runtime_context import (
+from dflash_mlx.runtime.bundle import load_runtime_bundle
+from dflash_mlx.runtime.context import (
     RuntimeContext,
     build_offline_runtime_context,
 )
-from dflash_mlx.runtime_loading import resolve_model_ref
+from dflash_mlx.runtime.loading import resolve_model_ref
 
 DEFAULT_PROMPT = "Implement a REST API with auth"
 CONTENT_START_ROW = 4

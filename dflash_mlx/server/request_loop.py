@@ -130,6 +130,11 @@ def consume_dflash_events(
                         elapsed_s if isinstance(event, PrefillCompleteEvent) else None
                     ),
                     prefill_done=isinstance(event, PrefillCompleteEvent),
+                    prefill_phase_timings_us=(
+                        event.phase_timings()
+                        if isinstance(event, PrefillCompleteEvent)
+                        else None
+                    ),
                 )
                 if isinstance(event, PrefillProgressEvent):
                     sys.stderr.write(
@@ -159,6 +164,7 @@ def consume_dflash_events(
                     generated_tokens=int(event.generation_tokens),
                     acceptance_rate=float(event.acceptance_ratio),
                     cycles=int(event.cycles_completed),
+                    phase_timings_us=dict(event.phase_timings_us),
                 )
                 generated_token_ids = list(event.generated_token_ids)
                 if generated_token_ids:
@@ -180,6 +186,9 @@ def consume_dflash_events(
             token = int(event.token_id)
             if first_token_ns is None:
                 first_token_ns = time.perf_counter_ns()
+                ttft_s = (first_token_ns - request_start_ns) / 1e9
+            else:
+                ttft_s = None
             live_token_count += 1
             live_acceptance_pct = float(event.acceptance_ratio) * 100.0
             elapsed_s = (time.perf_counter_ns() - request_start_ns) / 1e9
@@ -188,6 +197,7 @@ def consume_dflash_events(
                 request_id=request_id,
                 state="decode",
                 generated_tokens=live_token_count,
+                ttft_s=ttft_s,
                 decode_tok_s=live_tok_s,
                 acceptance_rate=live_acceptance_pct / 100.0,
             )

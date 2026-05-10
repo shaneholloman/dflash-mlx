@@ -4,13 +4,15 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
 from dflash_mlx import generate
-from dflash_mlx.engine.events import PrefillCompleteEvent
-from dflash_mlx.runtime_loading import parse_draft_quant_spec
+from dflash_mlx.engine.events import PrefillCompleteEvent, SummaryEvent
+from dflash_mlx.runtime.loading import parse_draft_quant_spec
+from dflash_mlx.runtime.config import PROFILES
 
 
 def test_decode_token_prefers_list_decode():
@@ -101,6 +103,78 @@ def test_generate_cli_passes_verify_mode(monkeypatch):
         }
     ]
 
+
+def test_generate_help_documents_prefill_default(monkeypatch, capsys):
+    monkeypatch.setattr(generate, "apply_metal_limits", lambda: None)
+
+    with pytest.raises(SystemExit) as exc:
+        generate.main(["--help"])
+
+    out = capsys.readouterr().out
+    assert exc.value.code == 0
+    assert "--prefill-step-size INT" in out
+    assert "Default: profile balanced" in out
+    assert "value, 4096." in out
+
+
+def test_run_generate_defaults_follow_balanced_profile(monkeypatch):
+    monkeypatch.setitem(
+        PROFILES,
+        "balanced",
+        replace(PROFILES["balanced"], draft_window_size=1536),
+    )
+    captured = []
+
+    class _Tokenizer:
+        def decode(self, token):
+            return str(token)
+
+    monkeypatch.setattr(
+        generate,
+        "load_runtime_bundle",
+        lambda **_kwargs: SimpleNamespace(
+            target_model=object(),
+            tokenizer=_Tokenizer(),
+            draft_model=object(),
+            draft_backend=object(),
+            target_ops=object(),
+        ),
+    )
+    monkeypatch.setattr(generate, "get_stop_token_ids", lambda _tokenizer: [])
+
+    def _stream(**kwargs):
+        captured.append(kwargs["runtime_context"])
+        return _ClosableGenerateStream(
+            [
+                SummaryEvent(
+                    elapsed_us=1.0,
+                    prompt_token_count=1,
+                    generated_token_ids=(),
+                    generation_tokens=0,
+                    accepted_from_draft=0,
+                    acceptance_ratio=0.0,
+                    cycles_completed=0,
+                    phase_timings_us={},
+                )
+            ]
+        )
+
+    monkeypatch.setattr(generate, "stream_dflash_generate", _stream)
+
+    assert (
+        generate.run_generate(
+            model_ref="m",
+            prompt="p",
+            max_tokens=1,
+            use_chat_template=False,
+            draft_ref=None,
+            draft_quant=None,
+        )
+        == 0
+    )
+    assert captured[0].runtime.draft_window_size == 1536
+
+
 def test_generate_cli_rejects_invalid_prefill_step_size(monkeypatch):
     monkeypatch.setattr(generate, "apply_metal_limits", lambda: None)
 
@@ -184,7 +258,7 @@ def test_run_generate_rejects_stale_dict_engine_event(monkeypatch):
 
 def test_draft_quant_parser_no_env_fallback(monkeypatch):
     monkeypatch.setenv("DFLASH_DRAFT_QUANT", "w4")
-    from dflash_mlx.runtime_loading import _resolve_draft_quant
+    from dflash_mlx.runtime.loading import _resolve_draft_quant
 
     assert _resolve_draft_quant(None) is None
     assert parse_draft_quant_spec("w4").weight_bits == 4

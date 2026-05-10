@@ -11,7 +11,7 @@ import pytest
 from mlx.utils import tree_flatten
 
 from dflash_mlx import model as model_mod
-from dflash_mlx import runtime_loading
+from dflash_mlx.runtime import loading as runtime_loading
 from dflash_mlx.draft_backend import EagerDraftBackend
 from dflash_mlx.engine import spec_epoch
 from dflash_mlx.engine.config import resolve_draft_window
@@ -25,7 +25,7 @@ from dflash_mlx.model import (
     DFlashDraftModelArgs,
     FullContextDraftKVCache,
 )
-from dflash_mlx.runtime_context import build_runtime_context, runtime_config_from_profile
+from dflash_mlx.runtime.context import build_runtime_context, runtime_config_from_profile
 
 
 def _args(**overrides):

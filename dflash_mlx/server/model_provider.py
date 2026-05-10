@@ -10,8 +10,8 @@ import time
 import mlx.core as mx
 import mlx_lm.server as mlx_server
 
-from dflash_mlx.runtime_bundle import load_runtime_bundle
-from dflash_mlx.runtime_registry import resolve_optional_draft_ref
+from dflash_mlx.runtime.bundle import load_runtime_bundle
+from dflash_mlx.runtime.registry import resolve_optional_draft_ref
 
 # mlx_lm 0.31.x ModelProvider / ResponseGenerator read these attrs directly.
 _MLX_LM_SERVER_DEFAULTS: dict[str, object | None] = {

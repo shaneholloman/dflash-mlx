@@ -7,11 +7,18 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from dflash_mlx import doctor
+from dflash_mlx.runtime.config import EffectiveRuntimeConfig
+from dflash_mlx.server.config import build_parser as build_server_parser
 
 _DOCTOR_ENV_KEYS = (
     "DFLASH_RUNTIME_PROFILE",
     "DFLASH_PREFILL_STEP_SIZE",
+    "DFLASH_DRAFT_SINK_SIZE",
+    "DFLASH_DRAFT_WINDOW_SIZE",
+    "DFLASH_VERIFY_LEN_CAP",
     "DFLASH_PREFIX_CACHE",
     "DFLASH_PREFIX_CACHE_MAX_ENTRIES",
     "DFLASH_PREFIX_CACHE_MAX_BYTES",
@@ -55,6 +62,46 @@ def test_doctor_json_stable(monkeypatch, capsys):
     assert report["effective_config"]["values"]["profile"] == "balanced"
     assert report["effective_config"]["sources"]["profile"] == "default"
 
+def test_doctor_does_not_expose_internal_diagnostics_aliases():
+    parser = doctor.build_parser()
+    help_text = parser.format_help()
+
+    assert "--memory-waterfall" not in help_text
+    assert "--bench-log-dir" not in help_text
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--bench-log-dir", "/tmp/dflash-logs"])
+
+
+def test_doctor_and_serve_share_runtime_config_flags():
+    runtime_dests = set(EffectiveRuntimeConfig.__dataclass_fields__) | {
+        "list_profiles",
+    }
+
+    def runtime_actions(parser):
+        return {
+            action.dest: tuple(action.option_strings)
+            for action in parser._actions
+            if action.dest in runtime_dests
+        }
+
+    assert runtime_actions(doctor.build_parser()) == runtime_actions(build_server_parser())
+
+
+def test_doctor_invalid_bool_env_is_fatal(monkeypatch, capsys):
+    _clear_doctor_env(monkeypatch)
+    monkeypatch.setenv("DFLASH_PREFIX_CACHE", "maybe")
+
+    code, report = _json_run([], capsys)
+
+    assert code == 1
+    assert report["effective_config"]["resolved"] is False
+    profile_check = next(
+        check for check in report["checks"] if check["name"] == "profile_resolver"
+    )
+    assert profile_check["status"] == "fatal"
+    assert "DFLASH_PREFIX_CACHE" in profile_check["details"]["error"]
+
+
 def test_doctor_model_draft_resolution(monkeypatch, capsys):
     _clear_doctor_env(monkeypatch)
     code, report = _json_run(["--model", "mlx-community/Qwen3.6-27B-4bit"], capsys)
@@ -67,7 +114,7 @@ def test_doctor_load_model_uses_runtime_bundle(monkeypatch, capsys):
     _clear_doctor_env(monkeypatch)
     calls = []
 
-    import dflash_mlx.runtime_bundle as runtime_bundle
+    import dflash_mlx.runtime.bundle as runtime_bundle
 
     def fake_load_runtime_bundle(**kwargs):
         calls.append(kwargs)
@@ -118,7 +165,7 @@ def test_doctor_scripts_reject_non_callable_entrypoint(monkeypatch):
 def test_doctor_load_model_rejects_incomplete_runtime_bundle(monkeypatch, capsys):
     _clear_doctor_env(monkeypatch)
 
-    import dflash_mlx.runtime_bundle as runtime_bundle
+    import dflash_mlx.runtime.bundle as runtime_bundle
 
     def fake_load_runtime_bundle(**_kwargs):
         return SimpleNamespace(

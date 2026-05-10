@@ -420,7 +420,7 @@ def test_qwen_make_cache_windows_fa_only(monkeypatch):
 
 def test_runtime_and_spec_epoch_do_not_import_deleted_target_modules():
     root = Path(__file__).resolve().parents[1]
-    runtime_text = (root / "dflash_mlx/runtime.py").read_text()
+    runtime_text = (root / "dflash_mlx/runtime/__init__.py").read_text()
     spec_text = (root / "dflash_mlx/engine/spec_epoch.py").read_text()
 
     for text in (runtime_text, spec_text):

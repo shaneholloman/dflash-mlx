@@ -6,8 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from dflash_mlx import runtime_bundle
-from dflash_mlx.runtime_registry import (
+from dflash_mlx.runtime import bundle as runtime_bundle
+from dflash_mlx.runtime.registry import (
     DRAFT_REGISTRY,
     resolve_model_support_spec,
     resolve_optional_draft_ref,

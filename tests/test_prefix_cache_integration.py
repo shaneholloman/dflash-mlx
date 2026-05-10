@@ -28,7 +28,7 @@ from dflash_mlx.cache.prefix_l2 import DFlashPrefixL2Cache
 from dflash_mlx.cache.snapshot_service import SnapshotService
 from dflash_mlx.cache.store import PrefixSnapshotStore
 from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
-from dflash_mlx.runtime_context import build_runtime_context, runtime_config_from_profile
+from dflash_mlx.runtime.context import build_runtime_context, runtime_config_from_profile
 
 def _runtime_context(**overrides):
     values = dict(

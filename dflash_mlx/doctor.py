@@ -17,13 +17,14 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
-from dflash_mlx.runtime_profiles import (
+from dflash_mlx.runtime.config import (
+    add_runtime_config_arguments,
     EffectiveRuntimeConfig,
-    format_profiles,
-    profile_names,
     resolve_runtime_config,
+    runtime_config_sources,
 )
-from dflash_mlx.runtime_context import build_runtime_context
+from dflash_mlx.runtime.context import build_runtime_context
+from dflash_mlx.runtime.profiles import format_profiles
 
 _VERIFY_INTERNAL_ENVS = (
     "DFLASH_VERIFY_LINEAR",
@@ -33,48 +34,6 @@ _VERIFY_INTERNAL_ENVS = (
     "DFLASH_VERIFY_QMM_KPARTS",
     "DFLASH_VERIFY_INCLUDE",
 )
-
-_CONFIG_FIELDS: dict[str, tuple[str | None, str | None]] = {
-    "profile": ("DFLASH_RUNTIME_PROFILE", "balanced"),
-    "prefill_step_size": ("DFLASH_PREFILL_STEP_SIZE", None),
-    "draft_sink_size": ("DFLASH_DRAFT_SINK_SIZE", None),
-    "draft_window_size": ("DFLASH_DRAFT_WINDOW_SIZE", None),
-    "verify_len_cap": ("DFLASH_VERIFY_LEN_CAP", "0"),
-    "prefix_cache": ("DFLASH_PREFIX_CACHE", None),
-    "prefix_cache_max_entries": ("DFLASH_PREFIX_CACHE_MAX_ENTRIES", None),
-    "prefix_cache_max_bytes": ("DFLASH_PREFIX_CACHE_MAX_BYTES", None),
-    "clear_cache_boundaries": ("DFLASH_CLEAR_CACHE_BOUNDARIES", None),
-    "max_snapshot_tokens": ("DFLASH_MAX_SNAPSHOT_TOKENS", None),
-    "prefix_cache_l2": ("DFLASH_PREFIX_CACHE_L2_ENABLED", None),
-    "prefix_cache_l2_dir": ("DFLASH_PREFIX_CACHE_L2_DIR", "default"),
-    "prefix_cache_l2_max_bytes": ("DFLASH_PREFIX_CACHE_L2_MAX_BYTES", None),
-    "target_fa_window": ("DFLASH_TARGET_FA_WINDOW", "0"),
-    "dflash_max_ctx": ("DFLASH_MAX_CTX", "0"),
-    "memory_waterfall": (None, "0"),
-    "bench_log_dir": (None, ""),
-    "verify_mode": ("DFLASH_VERIFY_MODE", None),
-}
-
-_CLI_FIELDS = {
-    "profile": "profile",
-    "prefill_step_size": "prefill_step_size",
-    "draft_sink_size": "draft_sink_size",
-    "draft_window_size": "draft_window_size",
-    "verify_len_cap": "verify_len_cap",
-    "prefix_cache": "prefix_cache",
-    "prefix_cache_max_entries": "prefix_cache_max_entries",
-    "prefix_cache_max_bytes": "prefix_cache_max_bytes",
-    "clear_cache_boundaries": "clear_cache_boundaries",
-    "max_snapshot_tokens": "max_snapshot_tokens",
-    "prefix_cache_l2": "prefix_cache_l2",
-    "prefix_cache_l2_dir": "prefix_cache_l2_dir",
-    "prefix_cache_l2_max_bytes": "prefix_cache_l2_max_bytes",
-    "target_fa_window": "target_fa_window",
-    "dflash_max_ctx": "dflash_max_ctx",
-    "memory_waterfall": "memory_waterfall",
-    "bench_log_dir": "bench_log_dir",
-    "verify_mode": "verify_mode",
-}
 
 @dataclass(frozen=True)
 class DoctorCheck:
@@ -90,25 +49,7 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     parser.add_argument("--load-model", action="store_true")
     parser.add_argument("--model", type=str, default=None)
     parser.add_argument("--draft-model", "--draft", dest="draft_model", type=str, default=None)
-    parser.add_argument("--profile", choices=profile_names(), default=None)
-    parser.add_argument("--list-profiles", action="store_true")
-    parser.add_argument("--prefill-step-size", type=int, default=None)
-    parser.add_argument("--draft-sink-size", type=int, default=None)
-    parser.add_argument("--draft-window-size", type=int, default=None)
-    parser.add_argument("--verify-len-cap", type=int, default=None)
-    parser.add_argument("--clear-cache-boundaries", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--memory-waterfall", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--bench-log-dir", type=str, default=None)
-    parser.add_argument("--verify-mode", choices=("auto", "off"), default=None)
-    parser.add_argument("--max-snapshot-tokens", type=int, default=None)
-    parser.add_argument("--prefix-cache-l2", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--prefix-cache-l2-dir", type=str, default=None)
-    parser.add_argument("--prefix-cache-l2-max-bytes", type=int, default=None)
-    parser.add_argument("--prefix-cache", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--prefix-cache-max-entries", type=int, default=None)
-    parser.add_argument("--prefix-cache-max-bytes", type=int, default=None)
-    parser.add_argument("--target-fa-window", type=int, default=None)
-    parser.add_argument("--dflash-max-ctx", type=int, default=None)
+    add_runtime_config_arguments(parser)
     return parser
 
 def run(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
@@ -167,7 +108,6 @@ def collect_report(args: argparse.Namespace) -> dict[str, Any]:
     if cfg is not None:
         checks.extend(_config_warnings(cfg))
         checks.append(_check_l2_config(cfg))
-        checks.append(_check_bench_log_dir(cfg))
 
     checks.append(_check_internal_verify_env())
     checks.append(_check_model(args))
@@ -312,22 +252,6 @@ def _check_l2_config(cfg: EffectiveRuntimeConfig) -> DoctorCheck:
         },
     )
 
-def _check_bench_log_dir(cfg: EffectiveRuntimeConfig) -> DoctorCheck:
-    if not cfg.bench_log_dir:
-        return DoctorCheck(
-            "bench_log_dir",
-            "ok",
-            "bench log directory is not configured",
-            {"configured": False},
-        )
-    ok, error = _is_writable_dir(cfg.bench_log_dir)
-    return DoctorCheck(
-        "bench_log_dir",
-        "ok" if ok else "fatal",
-        "bench log directory is writable" if ok else "bench log directory is not writable",
-        {"configured": True, "dir": cfg.bench_log_dir, "error": error},
-    )
-
 def _check_internal_verify_env() -> DoctorCheck:
     active = {
         key: os.environ[key]
@@ -350,7 +274,7 @@ def _check_model(args: argparse.Namespace) -> DoctorCheck:
             {"model": None},
         )
     try:
-        from dflash_mlx.runtime_registry import resolve_optional_draft_ref
+        from dflash_mlx.runtime.registry import resolve_optional_draft_ref
 
         draft = resolve_optional_draft_ref(args.model, args.draft_model)
     except Exception as exc:
@@ -380,7 +304,7 @@ def _check_load_model(
             {"model": None},
         )
     try:
-        from dflash_mlx.runtime_bundle import load_runtime_bundle
+        from dflash_mlx.runtime.bundle import load_runtime_bundle
 
         context = build_runtime_context(cfg) if cfg is not None else None
         bundle = load_runtime_bundle(
@@ -433,24 +357,8 @@ def _effective_config_payload(
     return {
         "resolved": True,
         "values": values,
-        "sources": {
-            field: _source_for_field(args, field, cfg.profile)
-            for field in values
-        },
+        "sources": runtime_config_sources(args, cfg),
     }
-
-def _source_for_field(args: argparse.Namespace, field: str, profile: str) -> str:
-    cli_attr = _CLI_FIELDS.get(field)
-    if cli_attr and getattr(args, cli_attr, None) is not None:
-        return "cli"
-    env_key, default_value = _CONFIG_FIELDS[field]
-    if env_key is not None and os.environ.get(env_key, "").strip():
-        return "env"
-    if field == "profile" and profile == "balanced":
-        return "default"
-    if default_value is not None:
-        return "default"
-    return "profile"
 
 def _model_payload(args: argparse.Namespace) -> dict[str, Any]:
     return {

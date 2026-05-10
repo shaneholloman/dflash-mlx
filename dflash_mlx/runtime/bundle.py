@@ -11,11 +11,11 @@ from typing import Any
 from dflash_mlx.draft_backend import DraftBackend, make_draft_backend
 from dflash_mlx.engine.target_ops import TargetOps, bind_draft_to_target
 from dflash_mlx.runtime import VerifyConfig
-from dflash_mlx.runtime_loading import (
+from dflash_mlx.runtime.loading import (
     load_draft_bundle,
     load_target_bundle,
 )
-from dflash_mlx.runtime_registry import (
+from dflash_mlx.runtime.registry import (
     ModelSupportSpec,
     resolve_model_support_spec,
     resolve_optional_draft_ref,

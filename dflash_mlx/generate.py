@@ -15,8 +15,15 @@ from dflash_mlx.runtime import (
     get_stop_token_ids,
     stream_dflash_generate,
 )
-from dflash_mlx.runtime_bundle import load_runtime_bundle
-from dflash_mlx.runtime_context import (
+from dflash_mlx.runtime.bundle import load_runtime_bundle
+from dflash_mlx.runtime.config import (
+    GENERATE_RUNTIME_FIELDS,
+    add_offline_runtime_arguments,
+    offline_runtime_error_message,
+    offline_runtime_kwargs,
+)
+from dflash_mlx.runtime.context import (
+    build_offline_runtime_config,
     build_offline_runtime_context,
 )
 
@@ -42,12 +49,12 @@ def run_generate(
     max_tokens: int,
     use_chat_template: bool,
     draft_ref: Optional[str],
-    target_fa_window: int = 0,
+    target_fa_window: int | None = None,
     prefill_step_size: int | None = None,
-    draft_sink_size: int = 64,
-    draft_window_size: int = 1024,
-    verify_len_cap: int = 0,
-    verify_mode: str = "auto",
+    draft_sink_size: int | None = None,
+    draft_window_size: int | None = None,
+    verify_len_cap: int | None = None,
+    verify_mode: str | None = None,
     draft_quant: Optional[str] = None,
 ) -> int:
     runtime_context = build_offline_runtime_context(
@@ -124,56 +131,13 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         metavar="SPEC",
         help="Optional in-memory draft quantization, e.g. w4:gs64.",
     )
-    parser.add_argument(
-        "--verify-mode",
-        choices=("auto", "off"),
-        default="auto",
-        help="Verify path mode. Use off only for debug/parity.",
-    )
-    parser.add_argument(
-        "--prefill-step-size",
-        type=int,
-        default=None,
-        help="Prompt prefill chunk size. Default: profile balanced value, 4096.",
-    )
-    parser.add_argument(
-        "--target-fa-window",
-        type=int,
-        default=0,
-        help=(
-            "Experimental target verifier full-attention KV window. "
-            "0 keeps full KV cache; N>0 uses rotating KV cache for target FA layers only."
-        ),
-    )
-    parser.add_argument(
-        "--draft-sink-size",
-        type=int,
-        default=64,
-        help="Draft context cache sink tokens kept before the rolling window.",
-    )
-    parser.add_argument(
-        "--draft-window-size",
-        type=int,
-        default=1024,
-        help="Draft context cache rolling window tokens.",
-    )
-    parser.add_argument(
-        "--verify-len-cap",
-        type=int,
-        default=0,
-        help="Max tokens verified per target forward; 0 uses the block size.",
-    )
+    add_offline_runtime_arguments(parser, GENERATE_RUNTIME_FIELDS)
     args = parser.parse_args(list(argv) if argv is not None else None)
-    if args.prefill_step_size is not None and args.prefill_step_size <= 0:
-        raise SystemExit("--prefill-step-size must be > 0")
-    if args.target_fa_window < 0:
-        raise SystemExit("--target-fa-window must be >= 0")
-    if args.draft_sink_size < 0:
-        raise SystemExit("--draft-sink-size must be >= 0")
-    if args.draft_window_size <= 0:
-        raise SystemExit("--draft-window-size must be > 0")
-    if args.verify_len_cap < 0:
-        raise SystemExit("--verify-len-cap must be >= 0")
+    runtime_kwargs = offline_runtime_kwargs(args, GENERATE_RUNTIME_FIELDS)
+    try:
+        build_offline_runtime_config(**runtime_kwargs)
+    except ValueError as exc:
+        raise SystemExit(offline_runtime_error_message(str(exc))) from exc
     raise SystemExit(
         run_generate(
             model_ref=args.model,
@@ -181,12 +145,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
             max_tokens=args.max_tokens,
             use_chat_template=not args.no_chat_template,
             draft_ref=args.draft,
-            target_fa_window=args.target_fa_window,
-            prefill_step_size=args.prefill_step_size,
-            draft_sink_size=args.draft_sink_size,
-            draft_window_size=args.draft_window_size,
-            verify_len_cap=args.verify_len_cap,
-            verify_mode=args.verify_mode,
+            **runtime_kwargs,
             draft_quant=args.draft_quant,
         )
     )

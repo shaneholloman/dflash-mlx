@@ -75,13 +75,13 @@ def _exit_code(exc: SystemExit) -> int:
     return 1
 
 def _print_profiles() -> int:
-    from dflash_mlx.runtime_profiles import format_profiles
+    from dflash_mlx.runtime.profiles import format_profiles
 
     print(format_profiles())
     return 0
 
 def _print_models() -> int:
-    from dflash_mlx.runtime_registry import DRAFT_REGISTRY
+    from dflash_mlx.runtime.registry import DRAFT_REGISTRY
 
     for target, draft in DRAFT_REGISTRY.items():
         print(f"{target:22} {draft}")

@@ -44,12 +44,19 @@ from dflash_mlx.runtime import (
     get_stop_token_ids,
     stream_dflash_generate,
 )
-from dflash_mlx.runtime_bundle import load_runtime_bundle
-from dflash_mlx.runtime_loading import resolve_model_ref
-from dflash_mlx.runtime_context import (
+from dflash_mlx.runtime.bundle import load_runtime_bundle
+from dflash_mlx.runtime.config import (
+    BENCHMARK_RUNTIME_FIELDS,
+    add_offline_runtime_arguments,
+    offline_runtime_error_message,
+    offline_runtime_kwargs,
+)
+from dflash_mlx.runtime.context import (
     RuntimeContext,
+    build_offline_runtime_config,
     build_offline_runtime_context,
 )
+from dflash_mlx.runtime.loading import resolve_model_ref
 
 CONTROLLED_FLAG_NAMES = (
     "suite",
@@ -209,14 +216,7 @@ def _finalize_benchmark_args(
         args.limit = _default_limit_for_suite(args.suite)
     if args.limit < 1:
         raise ValueError("--limit must be >= 1")
-    if args.target_fa_window < 0:
-        raise ValueError("--target-fa-window must be >= 0")
-    if args.draft_sink_size < 0:
-        raise ValueError("--draft-sink-size must be >= 0")
-    if args.draft_window_size <= 0:
-        raise ValueError("--draft-window-size must be > 0")
-    if args.verify_len_cap < 0:
-        raise ValueError("--verify-len-cap must be >= 0")
+    build_offline_runtime_config(**offline_runtime_kwargs(args, BENCHMARK_RUNTIME_FIELDS))
     return args
 
 def _strip_generation_payload(result: dict[str, Any]) -> dict[str, Any]:
@@ -297,6 +297,26 @@ def _build_config(
         "prompt_tokens": int(prompt_tokens),
         "prompt_id": slugify_prompt_id(prompt),
         "git_hash": _git_hash_short(),
+    }
+
+def _offline_runtime_values(
+    *,
+    target_fa_window: int | None = None,
+    draft_sink_size: int | None = None,
+    draft_window_size: int | None = None,
+    verify_len_cap: int | None = None,
+) -> dict[str, int]:
+    cfg = build_offline_runtime_config(
+        target_fa_window=target_fa_window,
+        draft_sink_size=draft_sink_size,
+        draft_window_size=draft_window_size,
+        verify_len_cap=verify_len_cap,
+    )
+    return {
+        "target_fa_window": int(cfg.target_fa_window),
+        "draft_sink_size": int(cfg.draft_sink_size),
+        "draft_window_size": int(cfg.draft_window_size),
+        "verify_len_cap": int(cfg.verify_len_cap),
     }
 
 def _build_single_case_report(
@@ -603,10 +623,10 @@ def _run_once_sequential(
     draft_quant: str | None,
     no_eos: bool,
     split_sdpa: bool,
-    target_fa_window: int = 0,
-    draft_sink_size: int = 64,
-    draft_window_size: int = 1024,
-    verify_len_cap: int = 0,
+    target_fa_window: int | None = None,
+    draft_sink_size: int | None = None,
+    draft_window_size: int | None = None,
+    verify_len_cap: int | None = None,
 ) -> dict[str, Any]:
     pristine_target_model, pristine_tokenizer, pristine_meta = _load_pristine_target_bundle(
         target_model_ref
@@ -736,12 +756,18 @@ def benchmark_once(
     draft_quant: str | None = None,
     no_eos: bool = False,
     split_sdpa: bool = True,
-    target_fa_window: int = 0,
-    draft_sink_size: int = 64,
-    draft_window_size: int = 1024,
-    verify_len_cap: int = 0,
+    target_fa_window: int | None = None,
+    draft_sink_size: int | None = None,
+    draft_window_size: int | None = None,
+    verify_len_cap: int | None = None,
     cooldown: int = 10,
 ) -> dict[str, Any]:
+    runtime_values = _offline_runtime_values(
+        target_fa_window=target_fa_window,
+        draft_sink_size=draft_sink_size,
+        draft_window_size=draft_window_size,
+        verify_len_cap=verify_len_cap,
+    )
     thermal_pressure = _get_thermal_pressure()
     _warn_if_throttled(thermal_pressure)
     result = _run_once_sequential(
@@ -754,10 +780,7 @@ def benchmark_once(
         draft_quant=draft_quant,
         no_eos=no_eos,
         split_sdpa=split_sdpa,
-        target_fa_window=target_fa_window,
-        draft_sink_size=draft_sink_size,
-        draft_window_size=draft_window_size,
-        verify_len_cap=verify_len_cap,
+        **runtime_values,
     )
     target_meta = result.pop("target_meta")
     draft_meta = result.pop("draft_meta")
@@ -777,10 +800,7 @@ def benchmark_once(
         draft_quant=draft_quant,
         no_eos=no_eos,
         split_sdpa=split_sdpa,
-        target_fa_window=target_fa_window,
-        draft_sink_size=draft_sink_size,
-        draft_window_size=draft_window_size,
-        verify_len_cap=verify_len_cap,
+        **runtime_values,
     )
 
 def benchmark_repeated(
@@ -795,12 +815,18 @@ def benchmark_repeated(
     draft_quant: str | None = None,
     no_eos: bool = False,
     split_sdpa: bool = True,
-    target_fa_window: int = 0,
-    draft_sink_size: int = 64,
-    draft_window_size: int = 1024,
-    verify_len_cap: int = 0,
+    target_fa_window: int | None = None,
+    draft_sink_size: int | None = None,
+    draft_window_size: int | None = None,
+    verify_len_cap: int | None = None,
     cooldown: int = 10,
 ) -> dict[str, Any]:
+    runtime_values = _offline_runtime_values(
+        target_fa_window=target_fa_window,
+        draft_sink_size=draft_sink_size,
+        draft_window_size=draft_window_size,
+        verify_len_cap=verify_len_cap,
+    )
     target_meta: dict[str, Any] | None = None
     draft_meta: dict[str, Any] | None = None
     runs: list[dict[str, Any]] = []
@@ -818,10 +844,7 @@ def benchmark_repeated(
             draft_quant=draft_quant,
             no_eos=no_eos,
             split_sdpa=split_sdpa,
-            target_fa_window=target_fa_window,
-            draft_sink_size=draft_sink_size,
-            draft_window_size=draft_window_size,
-            verify_len_cap=verify_len_cap,
+            **runtime_values,
         )
         if target_meta is None:
             target_meta = run.pop("target_meta")
@@ -851,10 +874,7 @@ def benchmark_repeated(
         draft_quant=draft_quant,
         no_eos=no_eos,
         split_sdpa=split_sdpa,
-        target_fa_window=target_fa_window,
-        draft_sink_size=draft_sink_size,
-        draft_window_size=draft_window_size,
-        verify_len_cap=verify_len_cap,
+        **runtime_values,
     )
 
 def benchmark_suite(
@@ -1030,34 +1050,7 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         default=True,
         help="Enable split full-attention SDPA on target. Default: enabled.",
     )
-    parser.add_argument(
-        "--target-fa-window",
-        metavar="INT",
-        type=int,
-        default=0,
-        help="Experimental verifier FA KV window. Default: 0 = full KV.",
-    )
-    parser.add_argument(
-        "--draft-sink-size",
-        metavar="INT",
-        type=int,
-        default=64,
-        help="Draft context cache sink tokens. Default: 64.",
-    )
-    parser.add_argument(
-        "--draft-window-size",
-        metavar="INT",
-        type=int,
-        default=1024,
-        help="Draft context cache rolling window tokens. Default: 1024.",
-    )
-    parser.add_argument(
-        "--verify-len-cap",
-        metavar="INT",
-        type=int,
-        default=0,
-        help="Max tokens verified per target forward. Default: 0 = block size.",
-    )
+    add_offline_runtime_arguments(parser, BENCHMARK_RUNTIME_FIELDS)
     parser.add_argument(
         "--out",
         metavar="PATH",
@@ -1171,7 +1164,10 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     apply_metal_limits()
     parser = build_parser(prog=prog)
     argv_list = list(argv) if argv is not None else sys.argv[1:]
-    args = _finalize_benchmark_args(parser.parse_args(argv_list), argv_list)
+    try:
+        args = _finalize_benchmark_args(parser.parse_args(argv_list), argv_list)
+    except ValueError as exc:
+        parser.error(offline_runtime_error_message(str(exc)))
     prompts = resolve_benchmark_prompts(args)
     output_path = create_run_dir(
         "benchmark",

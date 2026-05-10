@@ -31,8 +31,8 @@ from dflash_mlx.engine.events import (
     is_engine_event,
 )
 from dflash_mlx.runtime import stream_dflash_generate
-from dflash_mlx.runtime_bundle import load_runtime_bundle
-from dflash_mlx.runtime_context import build_runtime_context, runtime_config_from_profile
+from dflash_mlx.runtime.bundle import load_runtime_bundle
+from dflash_mlx.runtime.context import build_runtime_context, runtime_config_from_profile
 
 def rss_mb() -> float:
     ru = resource.getrusage(resource.RUSAGE_SELF)

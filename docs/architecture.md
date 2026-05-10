@@ -37,7 +37,7 @@ can optionally load a model.
 ## Supported Model Shape
 
 The live registry is explicit. A target must resolve to a matching DFlash draft
-through `DRAFT_REGISTRY` or through `--draft`.
+through `runtime.registry.DRAFT_REGISTRY` or through `--draft`.
 
 If no draft resolves, loading fails. This runtime does not silently become a
 generic no-draft MLX server. The server does have a short-output AR fast path for
@@ -97,17 +97,21 @@ The server wraps `mlx_lm.server` rather than replacing it.
 
 1. `dflash_mlx.server.config` parses CLI flags, resolves profiles, diagnostics,
    and Metal limits.
-2. `dflash_mlx.server.model_provider` loads a shared `RuntimeBundle`.
-3. `dflash_mlx.serve.DFlashServer` receives OpenAI-compatible requests through
-   the upstream `mlx_lm.server` machinery.
-4. For short-output requests, the server may use a target-only upstream path.
-5. For DFlash requests, `server.prefix_cache_flow` computes the stable prefix
+2. `dflash_mlx.server.runtime.ServerRuntime` owns the server lifecycle, live
+   metrics setup, DFlash request orchestration, and shutdown.
+3. `dflash_mlx.server.model_provider` loads a shared `RuntimeBundle`.
+4. `dflash_mlx.serve.DFlashAPIHandler` and
+   `dflash_mlx.serve.DFlashResponseGenerator` receive OpenAI-compatible
+   requests through the upstream `mlx_lm.server` machinery.
+5. For short-output requests, the server may use a target-only upstream path.
+6. For DFlash requests, `server.prefix_cache_flow` computes the stable prefix
    and delegates lookup to `cache.manager`.
-6. `server.request_loop` drives `engine.spec_epoch.stream_dflash_generate_impl`
-   and forwards token, cache, timing, and snapshot events.
-7. At snapshot-ready events, the engine has already built a
-   `DFlashPrefixSnapshot`; `PrefixCacheFlow` delegates snapshot admission to the
-   runtime cache manager.
+7. `runtime.stream_dflash_generate` enters `engine.spec_epoch.SpeculativeSession`.
+8. `server.request_loop` consumes typed token, timing, memory, cycle, and
+   snapshot-publication events. Snapshot-publication events carry metadata only;
+   live cache arrays stay inside the engine/cache layer.
+9. `cache.snapshot_service.SnapshotService` builds and admits snapshots through
+   the runtime cache manager.
 
 The prefix cache is process-local. The runtime cache manager owns the singleton
 lifecycle keyed by relevant runtime config so repeated requests can share state.
@@ -212,7 +216,6 @@ Diagnostics are opt-in for structured JSONL artifacts:
 - `--diagnostics basic` enables request/cache post events;
 - `--diagnostics full` adds per-cycle profiling and memory waterfall events;
 - `--diagnostics-dir` controls output location;
-- `--bench-log-dir` and `--memory-waterfall` are advanced direct aliases.
 
 The server also prints a compact per-request memory line on stderr after DFlash
 requests. That line is separate from structured diagnostics artifacts.
@@ -229,24 +232,44 @@ Public surface:
 
 Runtime/config:
 
-- `dflash_mlx/runtime.py` - verify config and stream entry;
-- `dflash_mlx/runtime_registry.py` - supported target-to-draft registry;
-- `dflash_mlx/runtime_loading.py` - target/draft loading and load-time
+- `dflash_mlx/runtime/__init__.py` - verify config and stream entry;
+- `dflash_mlx/runtime/registry.py` - supported target-to-draft registry;
+- `dflash_mlx/runtime/loading.py` - target/draft loading and load-time
   target optimization;
-- `dflash_mlx/runtime_bundle.py` - shared target/draft/TargetOps/draft-backend binding;
-- `dflash_mlx/runtime_profiles.py` - profiles and effective runtime config;
-- `dflash_mlx/runtime_context.py` - typed runtime context carrier;
+- `dflash_mlx/runtime/bundle.py` - shared target/draft/TargetOps/draft-backend
+  binding;
+- `dflash_mlx/runtime/config.py` - `RuntimeConfigSpec`, runtime profiles,
+  resolver, validation, source reporting, docs tables, and offline command
+  projections;
+- `dflash_mlx/runtime/profiles.py` - `dflash profiles` display formatting;
+- `dflash_mlx/runtime/context.py` - typed runtime context carrier;
 - `dflash_mlx/diagnostics.py` - diagnostics config;
 - `dflash_mlx/metal_limits.py` - MLX wired/cache limit application;
 - `dflash_mlx/internal_debug.py` - private kernel-debug env surface.
 
+Server:
+
+- `dflash_mlx/server/runtime.py` - server lifecycle, live metrics setup, DFlash
+  request orchestration, startup banner, and shutdown;
+- `dflash_mlx/server/model_provider.py` - shared runtime bundle publication for
+  `mlx_lm.server`;
+- `dflash_mlx/server/prefix_cache_flow.py` - per-request prefix cache lookup
+  and snapshot-service setup;
+- `dflash_mlx/server/protocol.py` - response protocol helpers;
+- `dflash_mlx/server/metrics.py` - request accounting, live `/metrics`, and
+  diagnostics event projection;
+- `dflash_mlx/server/request_loop.py` - DFlash event-to-response loop.
+
 Engine:
 
 - `dflash_mlx/engine/spec_epoch.py` - DFlash request/cycle driver;
+- `dflash_mlx/engine/events.py` - typed engine event ABI;
 - `dflash_mlx/engine/prefill.py` - prefill helpers;
+- `dflash_mlx/engine/target_features.py` - target hidden feature store;
 - `dflash_mlx/engine/target_ops.py` - target architecture seam and resolver;
 - `dflash_mlx/engine/target_qwen_gdn.py` - Qwen target cache, hidden capture,
   logits, rollback/tape, and hook policy;
+- `dflash_mlx/engine/target_gemma4.py` - Gemma4 target adapter;
 - `dflash_mlx/engine/acceptance.py` - acceptance length logic;
 - `dflash_mlx/engine/fallback.py` - baseline fallback helpers;
 - `dflash_mlx/engine/memory_waterfall.py` - memory bucket snapshots.
@@ -263,6 +286,8 @@ Draft/model/kernels:
 Prefix cache:
 
 - `dflash_mlx/cache/snapshot.py` - snapshot dataclasses;
+- `dflash_mlx/cache/snapshot_service.py` - snapshot build/admission service;
+- `dflash_mlx/cache/store.py` - L1/L2 prefix snapshot store;
 - `dflash_mlx/cache/fingerprints.py` - key/fingerprint helpers;
 - `dflash_mlx/cache/codecs.py` - snapshot serialization helpers;
 - `dflash_mlx/cache/manager.py` - runtime prefix cache lifecycle, lookup, and
@@ -278,7 +303,15 @@ Server package:
 - `dflash_mlx/server/model_provider.py` - model provider;
 - `dflash_mlx/server/request_loop.py` - event/token bridge;
 - `dflash_mlx/server/metrics.py` - structured event logging;
-- `dflash_mlx/server/protocol.py` - lightweight protocol types.
+- `dflash_mlx/server/protocol.py` - lightweight protocol types;
+- `dflash_mlx/server/responses_adapter.py` - minimal non-streaming
+  `/v1/responses` compatibility adapter.
+
+Observability:
+
+- `dflash_mlx/observability/cache.py` - cache telemetry projection;
+- `dflash_mlx/observability/memory.py` - process/system/MLX memory reporting;
+- `dflash_mlx/observability/writer.py` - diagnostics JSONL writer.
 
 Lab tools:
 

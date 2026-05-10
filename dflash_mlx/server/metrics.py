@@ -252,6 +252,7 @@ class _RequestAccounting:
             prompt_tokens=self.prompt_tokens,
             generated_tokens=self.generated_tokens,
             wall_ms=self.wall_ms,
+            ttft_ms=self.ttft_ms,
             prefill_ms=self.prefill_ms,
             decode_ms=self.decode_ms,
             prefill_tok_s_physical=self.prefill_tok_s_physical,
@@ -260,6 +261,8 @@ class _RequestAccounting:
             acceptance_rate=self.acceptance_ratio,
             cycles=self.cycles_completed,
             finish_reason=self.finish_reason,
+            prefill_phase_timings_us=self.prefill_phase_timings_us,
+            phase_timings_us=self.phase_timings_us,
         )
         payload["mode_used"] = self.mode_used
         payload["max_tokens"] = int(self.max_tokens)
@@ -434,11 +437,14 @@ def start_live_request(
         "prefill_tokens_processed": None,
         "prefill_tokens_total": _int_or_none(prompt_tokens),
         "prefill_s": None,
+        "ttft_s": None,
         "decode_s": None,
         "decode_tok_s": None,
         "acceptance_rate": None,
         "cycles": None,
         "finish_reason": None,
+        "prefill_phase_timings_us": {},
+        "phase_timings_us": {},
         "_started_at": time.time(),
         "_prefill_done_at": None,
     }
@@ -454,11 +460,14 @@ def update_live_request(
     prefill_tokens_processed: Optional[int] = None,
     prefill_tokens_total: Optional[int] = None,
     prefill_s: Optional[float] = None,
+    ttft_s: Optional[float] = None,
     prefill_done: bool = False,
     decode_tok_s: Optional[float] = None,
     acceptance_rate: Optional[float] = None,
     cycles: Optional[int] = None,
     finish_reason: Optional[str] = None,
+    prefill_phase_timings_us: Optional[dict[str, float]] = None,
+    phase_timings_us: Optional[dict[str, float]] = None,
 ) -> None:
     with _LIVE_LOCK:
         current = _LIVE_CURRENT_REQUEST
@@ -474,6 +483,8 @@ def update_live_request(
             current["prefill_tokens_total"] = int(prefill_tokens_total)
         if prefill_s is not None:
             current["prefill_s"] = float(prefill_s)
+        if ttft_s is not None:
+            current["ttft_s"] = float(ttft_s)
         if prefill_done:
             current["_prefill_done_at"] = time.time()
         if decode_tok_s is not None:
@@ -484,6 +495,10 @@ def update_live_request(
             current["cycles"] = int(cycles)
         if finish_reason is not None:
             current["finish_reason"] = finish_reason
+        if prefill_phase_timings_us is not None:
+            current["prefill_phase_timings_us"] = dict(prefill_phase_timings_us)
+        if phase_timings_us is not None:
+            current["phase_timings_us"] = dict(phase_timings_us)
 
 def clear_live_request(*, request_id: int) -> None:
     with _LIVE_LOCK:
@@ -796,7 +811,6 @@ def _runtime_config_payload(runtime_config: Optional[Any]) -> dict[str, Any]:
         "prefix_cache_l2",
         "target_fa_window",
         "dflash_max_ctx",
-        "memory_waterfall",
         "max_snapshot_tokens",
         "clear_cache_boundaries",
         "verify_mode",
@@ -904,6 +918,7 @@ def _last_request_payload(
     prompt_tokens: Optional[int],
     generated_tokens: Optional[int],
     wall_ms: Optional[float],
+    ttft_ms: Optional[float],
     prefill_ms: Optional[float],
     decode_ms: Optional[float],
     prefill_tok_s_physical: Optional[float],
@@ -912,12 +927,15 @@ def _last_request_payload(
     acceptance_rate: Optional[float],
     cycles: Optional[int],
     finish_reason: Optional[str],
+    prefill_phase_timings_us: Optional[dict[str, float]] = None,
+    phase_timings_us: Optional[dict[str, float]] = None,
 ) -> dict[str, Any]:
     return {
         "request_id": int(request_id),
         "prompt_tokens": _int_or_none(prompt_tokens),
         "generated_tokens": _int_or_none(generated_tokens),
         "wall_s": _seconds_or_none(wall_ms),
+        "ttft_s": _seconds_or_none(ttft_ms),
         "prefill_s": _seconds_or_none(prefill_ms),
         "decode_s": _seconds_or_none(decode_ms),
         "prefill_tok_s_physical": _float_or_none(prefill_tok_s_physical),
@@ -926,6 +944,8 @@ def _last_request_payload(
         "acceptance_rate": _float_or_none(acceptance_rate),
         "cycles": _int_or_none(cycles),
         "finish_reason": finish_reason,
+        "prefill_phase_timings_us": dict(prefill_phase_timings_us or {}),
+        "phase_timings_us": dict(phase_timings_us or {}),
     }
 
 def _prefix_cache_stats(prefix_cache_manager: Optional[Any]) -> Optional[dict[str, Any]]:

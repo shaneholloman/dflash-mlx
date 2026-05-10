@@ -14,9 +14,9 @@ from mlx_lm.generate import generate_step
 from dflash_mlx.engine.events import SummaryEvent, TokenEvent
 from dflash_mlx.engine.target_gemma4 import Gemma4TargetOps
 from dflash_mlx.runtime import VerifyConfig, stream_dflash_generate
-from dflash_mlx.runtime_bundle import load_runtime_bundle
-from dflash_mlx.runtime_loading import load_draft_bundle, load_target_bundle
-from dflash_mlx.runtime_context import build_offline_runtime_context
+from dflash_mlx.runtime.bundle import load_runtime_bundle
+from dflash_mlx.runtime.loading import load_draft_bundle, load_target_bundle
+from dflash_mlx.runtime.context import build_offline_runtime_context
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("DFLASH_RUN_GEMMA4_REAL_MODEL_TESTS") != "1",

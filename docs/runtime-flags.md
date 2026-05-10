@@ -29,12 +29,14 @@ dflash profiles
 
 Current profiles:
 
+<!-- dflash-runtime-config:profiles:start -->
 | Profile | Prefill | Draft window | Prefix cache | L1 entries / byte budget | L2 | Intent |
 | --- | ---: | --- | --- | --- | --- | --- |
 | `balanced` | 4096 | `64+1024` | on | `4 / 8GiB` | off | default normal coding |
 | `fast` | 8192 | `64+1024` | on | `4 / 16GiB` | off | throughput first |
 | `low-memory` | 1024 | `64+1024` | on | `2 / 2GiB` | off | lower pressure, slower prefill |
 | `long-session` | 4096 | `64+1024` | on | `8 / 8GiB` | on / `50GiB` | revisit-oriented long sessions |
+<!-- dflash-runtime-config:profiles:end -->
 
 `clear_cache_boundaries` is currently off in all profiles.
 
@@ -69,6 +71,7 @@ Generation defaults:
 
 DFlash runtime:
 
+<!-- dflash-runtime-config:serve-runtime:start -->
 | Flag | Meaning |
 | --- | --- |
 | `--prefill-step-size INT` | target prefill chunk size |
@@ -78,10 +81,18 @@ DFlash runtime:
 | `--verify-mode {auto,off}` | verifier path mode; `off` is debug/parity only |
 | `--dflash-max-ctx INT` | DFlash runtime context cap; `0` means no cap |
 | `--target-fa-window INT` | experimental target FA rotating window; `0` means full KV |
+| `--clear-cache-boundaries`, `--no-clear-cache-boundaries` | clear the MLX cache at safe request boundaries |
+<!-- dflash-runtime-config:serve-runtime:end -->
+
+Draft loading:
+
+| Flag | Meaning |
+| --- | --- |
 | `--draft-quant SPEC` | optional in-memory draft quantization, e.g. `w4:gs64` |
 
 Prefix cache:
 
+<!-- dflash-runtime-config:prefix-cache:start -->
 | Flag | Meaning |
 | --- | --- |
 | `--prefix-cache`, `--no-prefix-cache` | enable/disable DFlash prefix snapshots |
@@ -91,6 +102,7 @@ Prefix cache:
 | `--prefix-cache-l2`, `--no-prefix-cache-l2` | enable/disable SSD L2 for evicted snapshots |
 | `--prefix-cache-l2-dir PATH` | L2 root directory |
 | `--prefix-cache-l2-max-bytes BYTES` | L2 disk budget |
+<!-- dflash-runtime-config:prefix-cache:end -->
 
 Notes:
 
@@ -113,15 +125,13 @@ Diagnostics:
 | --- | --- |
 | `--diagnostics {off,basic,full}` | structured diagnostics mode |
 | `--diagnostics-dir PATH` | output directory |
-| `--memory-waterfall`, `--no-memory-waterfall` | advanced direct toggle for memory bucket events |
-| `--bench-log-dir PATH` | advanced direct event log directory |
 
 Metal limits:
 
 | Flag | Meaning |
 | --- | --- |
-| `--wired-limit auto|none|BYTES` | MLX wired memory limit policy |
-| `--cache-limit auto|none|BYTES` | MLX cache limit policy |
+| `--wired-limit auto\|none\|BYTES` | MLX wired memory limit policy |
+| `--cache-limit auto\|none\|BYTES` | MLX cache limit policy |
 
 ## `dflash generate`
 
@@ -139,11 +149,19 @@ Flags:
 | `--no-chat-template` | use raw prompt text |
 | `--draft REF_OR_PATH` | draft override |
 | `--draft-quant SPEC` | optional in-memory draft quantization, e.g. `w4:gs64` |
-| `--verify-mode {auto,off}` | verifier path mode |
-| `--target-fa-window INT` | target FA rotating window |
+
+Runtime override flags:
+
+<!-- dflash-runtime-config:generate-runtime:start -->
+| Flag | Meaning |
+| --- | --- |
+| `--verify-mode {auto,off}` | verifier path mode; `off` is debug/parity only |
+| `--prefill-step-size INT` | target prefill chunk size |
+| `--target-fa-window INT` | experimental target FA rotating window; `0` means full KV |
 | `--draft-sink-size INT` | draft cache sink tokens |
 | `--draft-window-size INT` | draft cache rolling window tokens |
-| `--verify-len-cap INT` | max tokens per verify forward |
+| `--verify-len-cap INT` | max tokens per verify forward, `0` means block size |
+<!-- dflash-runtime-config:generate-runtime:end -->
 
 Generate disables cross-request prefix caching. Use it for local sanity checks, not for
 benchmark claims.
@@ -190,10 +208,22 @@ Flags:
 | `--draft-quant SPEC` | optional in-memory draft quantization, e.g. `w4:gs64` |
 | `--no-eos` | suppress EOS so generation reaches token cap |
 | `--split-sdpa`, `--no-split-sdpa` | target split-SDPA verifier path; enabled by default |
-| `--target-fa-window INT` | target FA rotating window |
+
+Runtime override flags:
+
+<!-- dflash-runtime-config:benchmark-runtime:start -->
+| Flag | Meaning |
+| --- | --- |
+| `--target-fa-window INT` | experimental target FA rotating window; `0` means full KV |
 | `--draft-sink-size INT` | draft cache sink tokens |
 | `--draft-window-size INT` | draft cache rolling window tokens |
-| `--verify-len-cap INT` | max tokens per verify forward |
+| `--verify-len-cap INT` | max tokens per verify forward, `0` means block size |
+<!-- dflash-runtime-config:benchmark-runtime:end -->
+
+Benchmark output flags:
+
+| Flag | Meaning |
+| --- | --- |
 | `--no-memory` | omit memory medians from summary |
 | `--out PATH` | artifact directory |
 
@@ -225,24 +255,26 @@ Common flags:
 These are accepted as startup inputs for server/doctor config. CLI flags override
 them.
 
+<!-- dflash-runtime-config:env:start -->
 | Env var | Matching config |
 | --- | --- |
-| `DFLASH_RUNTIME_PROFILE` | `--profile` |
-| `DFLASH_PREFILL_STEP_SIZE` | `--prefill-step-size` |
-| `DFLASH_DRAFT_SINK_SIZE` | `--draft-sink-size` |
-| `DFLASH_DRAFT_WINDOW_SIZE` | `--draft-window-size` |
-| `DFLASH_VERIFY_LEN_CAP` | `--verify-len-cap` |
-| `DFLASH_PREFIX_CACHE` | `--prefix-cache` / `--no-prefix-cache` |
-| `DFLASH_PREFIX_CACHE_MAX_ENTRIES` | `--prefix-cache-max-entries` |
-| `DFLASH_PREFIX_CACHE_MAX_BYTES` | `--prefix-cache-max-bytes` |
-| `DFLASH_CLEAR_CACHE_BOUNDARIES` | `--clear-cache-boundaries` |
-| `DFLASH_MAX_SNAPSHOT_TOKENS` | `--max-snapshot-tokens` |
-| `DFLASH_PREFIX_CACHE_L2_ENABLED` | `--prefix-cache-l2` |
-| `DFLASH_PREFIX_CACHE_L2_DIR` | `--prefix-cache-l2-dir` |
-| `DFLASH_PREFIX_CACHE_L2_MAX_BYTES` | `--prefix-cache-l2-max-bytes` |
-| `DFLASH_TARGET_FA_WINDOW` | `--target-fa-window` |
-| `DFLASH_MAX_CTX` | `--dflash-max-ctx` |
-| `DFLASH_VERIFY_MODE` | `--verify-mode` |
+| `DFLASH_RUNTIME_PROFILE` | `--profile {balanced,fast,low-memory,long-session}` |
+| `DFLASH_PREFILL_STEP_SIZE` | `--prefill-step-size INT` |
+| `DFLASH_DRAFT_SINK_SIZE` | `--draft-sink-size INT` |
+| `DFLASH_DRAFT_WINDOW_SIZE` | `--draft-window-size INT` |
+| `DFLASH_VERIFY_LEN_CAP` | `--verify-len-cap INT` |
+| `DFLASH_CLEAR_CACHE_BOUNDARIES` | `--clear-cache-boundaries`, `--no-clear-cache-boundaries` |
+| `DFLASH_VERIFY_MODE` | `--verify-mode {auto,off}` |
+| `DFLASH_MAX_SNAPSHOT_TOKENS` | `--max-snapshot-tokens INT` |
+| `DFLASH_PREFIX_CACHE_L2_ENABLED` | `--prefix-cache-l2`, `--no-prefix-cache-l2` |
+| `DFLASH_PREFIX_CACHE_L2_DIR` | `--prefix-cache-l2-dir PATH` |
+| `DFLASH_PREFIX_CACHE_L2_MAX_BYTES` | `--prefix-cache-l2-max-bytes BYTES` |
+| `DFLASH_PREFIX_CACHE` | `--prefix-cache`, `--no-prefix-cache` |
+| `DFLASH_PREFIX_CACHE_MAX_ENTRIES` | `--prefix-cache-max-entries INT` |
+| `DFLASH_PREFIX_CACHE_MAX_BYTES` | `--prefix-cache-max-bytes BYTES` |
+| `DFLASH_TARGET_FA_WINDOW` | `--target-fa-window INT` |
+| `DFLASH_MAX_CTX` | `--dflash-max-ctx INT` |
+<!-- dflash-runtime-config:env:end -->
 
 Prefer CLI flags for reproducible local runs. Env vars are mainly for Docker,
 CI, and wrappers.
@@ -271,6 +303,7 @@ The runtime rejects invalid config before serving:
 - `prefix_cache_max_entries > 0`
 - `prefix_cache_max_bytes >= 0`
 - `max_snapshot_tokens >= 0`
+- `prefix_cache_l2_dir` must be non-empty when L2 is enabled
 - `prefix_cache_l2_max_bytes >= 0`
 - `target_fa_window >= 0`
 - `dflash_max_ctx >= 0`

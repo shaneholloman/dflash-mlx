@@ -2,18 +2,21 @@
 # Licensed under the Apache License, Version 2.0 - see LICENSE file
 # Based on DFlash (arXiv:2602.06036)
 
+from __future__ import annotations
+
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
-import mlx.core as mx
+if TYPE_CHECKING:
+    from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
+    from dflash_mlx.cache.snapshot_service import SnapshotService
+    from dflash_mlx.draft_backend import DraftBackend
+    from dflash_mlx.engine.events import EngineEvent
+    from dflash_mlx.engine.target_ops import TargetOps
+    from dflash_mlx.model import DFlashDraftModel
 
-from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
-from dflash_mlx.cache.snapshot_service import SnapshotService
-from dflash_mlx.draft_backend import DraftBackend
-from dflash_mlx.engine.events import EngineEvent
-from dflash_mlx.engine.target_ops import TargetOps
-from dflash_mlx.model import DFlashDraftModel
+__all__ = ["VerifyConfig", "get_stop_token_ids", "stream_dflash_generate"]
 
 
 def get_stop_token_ids(tokenizer: Any) -> list[int]:
@@ -64,6 +67,12 @@ def stream_dflash_generate(
         raise ValueError("target_ops is required")
     if draft_backend is None:
         raise ValueError("draft_backend is required")
+    import mlx.core as mx
+
+    from dflash_mlx.engine.spec_epoch import (
+        stream_dflash_generate_impl as _stream_dflash_generate_impl,
+    )
+
     gen_stream = mx.default_stream(mx.default_device())
     with mx.stream(gen_stream):
         yield from _stream_dflash_generate_impl(
@@ -86,9 +95,3 @@ def stream_dflash_generate(
             prefix_cache_active=prefix_cache_active,
             runtime_context=runtime_context,
         )
-
-
-from dflash_mlx.engine.fallback import stream_baseline_generate
-from dflash_mlx.engine.spec_epoch import (
-    stream_dflash_generate_impl as _stream_dflash_generate_impl,
-)

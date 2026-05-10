@@ -4,9 +4,8 @@
 
 from __future__ import annotations
 
-import importlib
+import json
 import os
-import tomllib
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -36,6 +35,7 @@ _PROFILE_ENV_KEYS = (
     "DFLASH_PREFIX_CACHE_L2_DIR",
     "DFLASH_PREFIX_CACHE_L2_MAX_BYTES",
     "DFLASH_TARGET_FA_WINDOW",
+    "DFLASH_MAX_CTX",
     "DFLASH_VERIFY_MODE",
     "DFLASH_VERIFY_LINEAR",
     "DFLASH_VERIFY_QMM",
@@ -56,19 +56,12 @@ def test_serve_cli_wires_runtime_env_flags(monkeypatch):
             "--prefill-step-size",
             "4096",
             "--clear-cache-boundaries",
-            "--memory-waterfall",
-            "--bench-log-dir",
-            "/tmp/dflash-logs",
         ]
     )
     normalize_cli_args(args)
 
     assert args.runtime_config.prefill_step_size == 4096
     assert args.runtime_config.clear_cache_boundaries is True
-    assert args.runtime_config.memory_waterfall is True
-    assert args.runtime_config.bench_log_dir == "/tmp/dflash-logs"
-    assert args.diagnostics_config.memory_waterfall is True
-    assert args.diagnostics_config.trace.log_dir == Path("/tmp/dflash-logs")
 
 def test_serve_cli_thinking_default_is_disabled(monkeypatch):
     _clear_profile_env(monkeypatch)
@@ -131,6 +124,43 @@ def test_serve_help_documents_enable_thinking(capsys):
     out = capsys.readouterr().out
     assert "--enable-thinking" in out
     assert "--fastpath-max-tokens" in out
+    assert "--memory-waterfall" not in out
+    assert "--bench-log-dir" not in out
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--model", "m", "--memory-waterfall"],
+        ["--model", "m", "--bench-log-dir", "/tmp/dflash-logs"],
+    ],
+)
+def test_serve_rejects_removed_diagnostics_aliases(argv):
+    parser = build_parser()
+
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(argv)
+
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "env_key",
+    [
+        "DFLASH_PREFIX_CACHE",
+        "DFLASH_CLEAR_CACHE_BOUNDARIES",
+        "DFLASH_PREFIX_CACHE_L2_ENABLED",
+    ],
+)
+def test_runtime_bool_env_rejects_invalid_values(monkeypatch, env_key):
+    _clear_profile_env(monkeypatch)
+    monkeypatch.setenv(env_key, "maybe")
+    args = build_parser().parse_args(["--model", "m"])
+
+    with pytest.raises(SystemExit) as exc:
+        normalize_cli_args(args)
+
+    assert env_key in str(exc.value)
+
 
 def test_model_provider_adds_mlx_lm_server_boundary_defaults(monkeypatch):
     _clear_profile_env(monkeypatch)
@@ -330,7 +360,7 @@ def test_diagnostics_full_enables_profile_memory_and_cycle_log(monkeypatch, tmp_
     out = Path(args.diagnostics_dir_resolved)
     assert out.parts[:3] == (".artifacts", "dflash", "diagnostics")
     assert out.name.endswith("-serve-full")
-    assert args.runtime_config.memory_waterfall is True
+    assert not hasattr(args.runtime_config, "memory_waterfall")
     assert args.diagnostics_config.run_dir == out
     assert args.diagnostics_config.memory_waterfall is True
     assert args.diagnostics_config.trace.log_dir == out
@@ -363,38 +393,6 @@ def test_diagnostics_dir_override_is_exact(monkeypatch, tmp_path):
     assert args.diagnostics_config.trace.log_dir == out
     assert (out / "manifest.json").exists()
 
-def test_diagnostics_rejects_ambiguous_bench_log_dir(monkeypatch, tmp_path):
-    _clear_profile_env(monkeypatch)
-    args = build_parser().parse_args(
-        [
-            "--model",
-            "m",
-            "--diagnostics",
-            "basic",
-            "--diagnostics-dir",
-            str(tmp_path / "diag"),
-            "--bench-log-dir",
-            str(tmp_path / "logs"),
-        ]
-    )
-    with pytest.raises(SystemExit, match="diagnostics-dir"):
-        normalize_cli_args(args)
-
-def test_diagnostics_rejects_bench_log_dir_without_diagnostics_dir(monkeypatch, tmp_path):
-    _clear_profile_env(monkeypatch)
-    args = build_parser().parse_args(
-        [
-            "--model",
-            "m",
-            "--diagnostics",
-            "basic",
-            "--bench-log-dir",
-            str(tmp_path / "logs"),
-        ]
-    )
-    with pytest.raises(SystemExit, match="diagnostics and --bench-log-dir"):
-        normalize_cli_args(args)
-
 def test_diagnostics_manifest_contains_required_fields(monkeypatch, tmp_path):
     _clear_profile_env(monkeypatch)
     monkeypatch.chdir(tmp_path)
@@ -417,6 +415,18 @@ def test_diagnostics_manifest_contains_required_fields(monkeypatch, tmp_path):
         '"output_schema_version": 1',
     ):
         assert text in manifest
+
+    effective = json.loads(
+        (Path(args.diagnostics_dir_resolved) / "effective_config.json").read_text()
+    )
+    invocation = json.loads(
+        (Path(args.diagnostics_dir_resolved) / "invocation.json").read_text()
+    )
+    assert "diagnostics" not in effective
+    assert "diagnostics_dir" not in effective
+    assert "memory_waterfall" not in effective
+    assert invocation["diagnostics"]["mode"] == "basic"
+    assert invocation["diagnostics"]["memory_waterfall"] is False
 
 def test_serve_cli_parses_memory_limit_flags():
     args = build_parser().parse_args(
@@ -503,7 +513,7 @@ def test_configure_metal_limits_supports_none_and_explicit_cache(monkeypatch):
     assert limits.cache_applied is True
 
 def test_startup_banner_prints_resolved_metal_limits(monkeypatch, capsys):
-    from dflash_mlx import serve
+    from dflash_mlx.server.runtime import ServerRuntime
 
     limits = MetalLimitConfig(
         metal_available=True,
@@ -527,7 +537,13 @@ def test_startup_banner_prints_resolved_metal_limits(monkeypatch, capsys):
         ),
     )
 
-    serve._print_startup_banner(port=8000, model_provider=provider)
+    runtime = ServerRuntime(
+        host="127.0.0.1",
+        port=8000,
+        model_provider=provider,
+        version="test-version",
+    )
+    runtime.print_startup_banner()
 
     err = capsys.readouterr().err
     assert "Thinking:     enabled" in err
@@ -537,7 +553,7 @@ def test_startup_banner_prints_resolved_metal_limits(monkeypatch, capsys):
 
     provider.cli_args.chat_template_args = {}
     provider.cli_args.fastpath_max_tokens = 0
-    serve._print_startup_banner(port=8000, model_provider=provider)
+    runtime.print_startup_banner()
     err = capsys.readouterr().err
     assert "Thinking:     disabled" in err
     assert "Fast path:    off" in err
@@ -550,23 +566,12 @@ def test_startup_banner_prints_resolved_metal_limits(monkeypatch, capsys):
         (["--model", "m", "--draft-window-size", "0"], "draft_window_size"),
         (["--model", "m", "--verify-len-cap", "-1"], "verify_len_cap"),
         (["--model", "m", "--fastpath-max-tokens", "-1"], "--fastpath-max-tokens"),
-        (["--model", "m", "--bench-log-dir", ""], "--bench-log-dir"),
     ],
 )
 def test_serve_cli_rejects_invalid_runtime_flags(argv, error):
     args = build_parser().parse_args(argv)
     with pytest.raises(SystemExit, match=error):
         normalize_cli_args(args)
-
-def test_project_scripts_import():
-    data = tomllib.loads(Path("pyproject.toml").read_text())
-    scripts = data["project"]["scripts"]
-    assert "dflash-opencode-bench" not in scripts
-    assert "dflash-pi-bench" not in scripts
-    for target in scripts.values():
-        module_name, func_name = target.split(":", 1)
-        module = importlib.import_module(module_name)
-        assert callable(getattr(module, func_name))
 
 def test_profile_balanced_sets_product_defaults(monkeypatch):
     _clear_profile_env(monkeypatch)

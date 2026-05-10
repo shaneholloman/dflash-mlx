@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import random
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,7 +20,8 @@ from dflash_mlx.engine.events import (
     SummaryEvent,
     TokenEvent,
 )
-from dflash_mlx.runtime_context import build_offline_runtime_context
+from dflash_mlx.runtime.context import build_offline_runtime_context
+from dflash_mlx.runtime.config import PROFILES
 
 def test_prompt_slug_distinguishes_long_prompts_with_same_prefix():
     prefix = "same prefix " * 8
@@ -98,6 +100,41 @@ def test_benchmark_rejects_removed_public_flags(flag):
         parser.parse_args([flag])
 
     assert exc.value.code == 2
+
+def test_benchmark_finalize_uses_offline_runtime_validation():
+    parser = benchmark.build_parser()
+    args = parser.parse_args(
+        [
+            "--model",
+            "m",
+            "--draft-window-size",
+            "0",
+        ]
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="--draft-window-size / draft_window_size must be > 0",
+    ):
+        benchmark._finalize_benchmark_args(args, ["--model", "m"])
+
+def test_benchmark_cli_reports_offline_runtime_validation_cleanly(capsys):
+    with pytest.raises(SystemExit) as exc:
+        benchmark.main(
+            [
+                "--model",
+                "m",
+                "--draft-window-size",
+                "0",
+            ],
+            prog="dflash benchmark",
+        )
+
+    err = capsys.readouterr().err
+    assert exc.value.code == 2
+    assert "--draft-window-size must be > 0" in err
+    assert "draft_window_size" not in err
+    assert "Traceback" not in err
 
 def test_benchmark_invocation_records_explicit_and_effective_values():
     parser = benchmark.build_parser()
@@ -531,6 +568,17 @@ def test_benchmark_runtime_context_uses_product_verify_config():
     assert context.runtime.prefix_cache is False
     assert context.verify.mode == "auto"
     assert context.verify.enable_qmm is True
+
+def test_benchmark_direct_defaults_follow_balanced_profile(monkeypatch):
+    monkeypatch.setitem(
+        PROFILES,
+        "balanced",
+        replace(PROFILES["balanced"], draft_window_size=1536),
+    )
+
+    values = benchmark._offline_runtime_values()
+
+    assert values["draft_window_size"] == 1536
 
 def test_benchmark_runtime_context_is_required():
     stream = benchmark.stream_dflash_generate()

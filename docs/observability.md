@@ -33,6 +33,11 @@ Prefill throughput is split deliberately:
   divided by user-visible prefill wall time.
 - `prefill_tok_s_apparent`: logical prompt tokens divided by the same wall time.
 
+Completed requests also expose `ttft_s`, `phase_timings_us`, and
+`prefill_phase_timings_us` in `last_request` and `recent_requests`.
+`phase_timings_us` carries the runtime phase totals reported by the engine,
+including `draft`, `verify`, and `replay` when DFlash produced those phases.
+
 Use live metrics for debugging, dashboards, and benchmark visibility. Use
 diagnostics artifacts when you need reproducible traces.
 
@@ -62,9 +67,8 @@ Default output:
 .artifacts/dflash/diagnostics/<timestamp>-serve-<mode>/
 ```
 
-Use the `--diagnostics` form for normal operation. Advanced direct aliases are
-listed in [runtime-flags.md](runtime-flags.md), but bug reports and benchmark
-debugging should use `basic` or `full` diagnostics directories.
+Use the `--diagnostics` form for operation, bug reports, and benchmark
+debugging.
 
 ## Files
 

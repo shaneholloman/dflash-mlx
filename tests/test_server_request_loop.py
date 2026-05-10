@@ -16,6 +16,12 @@ from dflash_mlx.engine.events import (
     SummaryEvent,
     TokenEvent,
 )
+from dflash_mlx.server import metrics as metrics_mod
+from dflash_mlx.server.metrics import (
+    get_live_metrics_payload,
+    reset_live_metrics_for_tests,
+    start_live_request,
+)
 from dflash_mlx.server.request_loop import consume_dflash_events
 
 class FakeDetokenizer:
@@ -105,6 +111,80 @@ def test_consume_dflash_events_streams_pending_token_and_summary():
     assert responses[0].text == "T10"
     assert responses[1].token == 11
     assert responses[1].text == "T11"
+
+
+def test_consume_dflash_events_updates_live_metrics_from_engine_events(monkeypatch):
+    reset_live_metrics_for_tests()
+    monkeypatch.setattr(metrics_mod, "current_runtime_cache_manager", lambda: None)
+    start_live_request(
+        request_id=15,
+        mode_used="dflash",
+        prompt_tokens=3,
+        max_tokens=16,
+        cache_hit_tokens=1,
+        cache_lookup_ms=0.25,
+    )
+    rqueue = SimpleQueue()
+    events = ClosableEvents(
+        [
+            PrefillCompleteEvent(
+                prefill_us=1.0,
+                prompt_token_count=3,
+                logical_ctx_tokens=3,
+                physical_prefill_tokens=2,
+                prefill_tokens_restored=1,
+                prefill_tokens_computed=2,
+                phase_cold_us=100.0,
+                phase_seam_us=20.0,
+            ),
+            TokenEvent(token_id=10, generated_tokens=1, acceptance_ratio=0.5, cycles_completed=1),
+            SummaryEvent(
+                elapsed_us=10.0,
+                prompt_token_count=3,
+                generated_token_ids=(10,),
+                generation_tokens=1,
+                accepted_from_draft=1,
+                acceptance_ratio=0.5,
+                cycles_completed=1,
+                phase_timings_us={
+                    "prefill": 1.0,
+                    "draft": 2.0,
+                    "verify": 3.0,
+                    "replay": 4.0,
+                },
+            ),
+        ]
+    )
+
+    result = consume_dflash_events(
+        event_iter=events,
+        rqueue=rqueue,
+        ctx=FakeContext(),
+        tokenizer=FakeTokenizer(),
+        prompt=[1, 2, 3],
+        max_tokens=16,
+        eos_token_ids=set(),
+        request_start_ns=0,
+        request_id=15,
+    )
+
+    current = get_live_metrics_payload()["current_request"]
+
+    assert result.summary_event is not None
+    assert current["request_id"] == 15
+    assert current["state"] == "finishing"
+    assert current["ttft_s"] is not None
+    assert current["ttft_s"] >= 0.0
+    assert current["prefill_phase_timings_us"] == {
+        "phase_cold_us": 100.0,
+        "phase_seam_us": 20.0,
+    }
+    assert current["phase_timings_us"] == {
+        "prefill": 1.0,
+        "draft": 2.0,
+        "verify": 3.0,
+        "replay": 4.0,
+    }
 
 
 def test_consume_dflash_events_ignores_snapshot_publication_metadata():
