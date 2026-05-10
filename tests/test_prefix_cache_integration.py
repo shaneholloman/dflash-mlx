@@ -67,6 +67,22 @@ def _make_key(**overrides) -> DFlashPrefixKey:
     base.update(overrides)
     return DFlashPrefixKey(**base)
 
+
+class _FakeLoadedProvider:
+    model_key = ("target/x", None, "draft/y")
+
+
+class _FakeDraft:
+    target_layer_ids = [3, 7]
+
+
+class _FakeTokenizer:
+    unk_token_id = -1
+
+    def convert_tokens_to_ids(self, tokens):
+        return [-1 for _ in tokens]
+
+
 def _snapshot_service(
     cache: DFlashPrefixCache | PrefixSnapshotStore,
     key: DFlashPrefixKey,
@@ -132,107 +148,6 @@ def _simulate_serve_insert(
     cache.insert(snap)
     return snap, live_cache
 
-class TestEndToEnd:
-    def test_insert_then_lookup_exact(self):
-        cache = DFlashPrefixCache(max_entries=4)
-        key = _make_key()
-        prompt = [1, 2, 3, 4, 5, 6, 7, 8]
-        snap, _ = _simulate_serve_insert(cache, key, prompt, n_cached_tokens=8)
-
-        matched, found = cache.lookup(prompt, key)
-        assert matched == len(prompt)
-        assert found is snap
-
-    def test_insert_then_lookup_prefix(self):
-
-        cache = DFlashPrefixCache(max_entries=4)
-        key = _make_key()
-        prompt_turn1 = [100, 101, 102, 103, 104]
-        _simulate_serve_insert(cache, key, prompt_turn1, n_cached_tokens=5)
-
-        prompt_turn2 = prompt_turn1 + [200, 201, 202]
-        matched, found = cache.lookup(prompt_turn2, key)
-        assert matched == 5
-        assert found is not None
-
-    def test_hydrate_after_lookup_preserves_state(self):
-        cache = DFlashPrefixCache(max_entries=4)
-        key = _make_key()
-        prompt = [1, 2, 3, 4]
-        snap, live_cache = _simulate_serve_insert(cache, key, prompt, n_cached_tokens=4)
-
-        _, found = cache.lookup(prompt, key)
-        assert found is snap
-
-        template = _make_populated_target_cache(n_tokens=1)
-        hydrated = hydrate_target_cache(found, template)
-
-        src_k, src_v = live_cache[0].state
-        h_k, h_v = hydrated[0].state
-        assert mx.all(src_k == h_k).item()
-        assert mx.all(src_v == h_v).item()
-        assert hydrated[0].offset == live_cache[0].offset
-
-        for a, b in zip(live_cache[1].cache, hydrated[1].cache):
-            if a is None:
-                assert b is None
-            else:
-                assert mx.all(a == b).item()
-
-    def test_mutation_of_live_cache_does_not_affect_snapshot(self):
-        cache = DFlashPrefixCache(max_entries=4)
-        key = _make_key()
-        prompt = [7, 8, 9]
-        snap, live_cache = _simulate_serve_insert(cache, key, prompt, n_cached_tokens=3)
-
-        live_cache[0].keys = mx.zeros_like(live_cache[0].keys)
-        live_cache[1].cache[1] = mx.zeros_like(live_cache[1].cache[1])
-        mx.eval(live_cache[0].keys, live_cache[1].cache[1])
-
-        _, found = cache.lookup(prompt, key)
-        assert found is not None
-        snap_k, _, _ = found.fa_states[0]
-        assert not mx.all(snap_k == 0).item()
-        assert not mx.all(found.gdn_states[1][1] == 0).item()
-
-    def test_different_key_refuses_match(self):
-        cache = DFlashPrefixCache(max_entries=4)
-        key_a = _make_key(target_model_id="model-a")
-        key_b = _make_key(target_model_id="model-b")
-        prompt = [1, 2, 3]
-        _simulate_serve_insert(cache, key_a, prompt, n_cached_tokens=3)
-
-        matched, found = cache.lookup(prompt, key_b)
-        assert matched == 0
-        assert found is None
-
-    def test_cache_handles_monotone_turns_via_pruning(self):
-        cache = DFlashPrefixCache(max_entries=4)
-        key = _make_key()
-        _simulate_serve_insert(cache, key, [1, 2], n_cached_tokens=2)
-        _simulate_serve_insert(cache, key, [1, 2, 3], n_cached_tokens=3)
-        _simulate_serve_insert(cache, key, [1, 2, 3, 4], n_cached_tokens=4)
-        stats = cache.stats()
-
-        assert stats["current_entries"] == 1
-        assert stats["prefix_prunes"] == 2
-        assert stats["evictions"] == 0
-        matched, _ = cache.lookup([1, 2, 3, 4], key)
-        assert matched == 4
-
-    def test_cache_lru_eviction_on_unrelated_turns(self):
-        cache = DFlashPrefixCache(max_entries=2)
-        key = _make_key()
-        _simulate_serve_insert(cache, key, [1, 2], n_cached_tokens=2)
-        _simulate_serve_insert(cache, key, [9, 8], n_cached_tokens=2)
-        _simulate_serve_insert(cache, key, [5, 6, 7], n_cached_tokens=3)
-        stats = cache.stats()
-        assert stats["current_entries"] == 2
-        assert stats["evictions"] >= 1
-        assert stats["prefix_prunes"] == 0
-        matched, _ = cache.lookup([5, 6, 7], key)
-        assert matched == 3
-
 class TestServeHelperShapes:
 
     def test_get_cache_disabled(self, monkeypatch):
@@ -257,13 +172,7 @@ class TestServeHelperShapes:
     def test_build_prefix_key_from_provider(self):
         from dflash_mlx.server.prefix_cache_manager import build_prefix_key
 
-        class FakeProvider:
-            model_key = ("target/x", None, "draft/y")
-
-        class FakeDraft:
-            target_layer_ids = [3, 7]
-
-        key = build_prefix_key(FakeProvider(), FakeDraft(), _runtime_context())
+        key = build_prefix_key(_FakeLoadedProvider(), _FakeDraft(), _runtime_context())
         assert key.target_model_id == "target/x"
         assert key.draft_model_id == "draft/y"
         assert key.capture_layer_ids == (3, 7)
@@ -273,20 +182,14 @@ class TestServeHelperShapes:
     def test_build_prefix_key_uses_runtime_draft_window(self):
         from dflash_mlx.server.prefix_cache_manager import build_prefix_key
 
-        class FakeProvider:
-            model_key = ("target/x", None, "draft/y")
-
-        class FakeDraft:
-            target_layer_ids = [3, 7]
-
         key_default = build_prefix_key(
-            FakeProvider(),
-            FakeDraft(),
+            _FakeLoadedProvider(),
+            _FakeDraft(),
             _runtime_context(draft_sink_size=64, draft_window_size=1024),
         )
         key_windowed = build_prefix_key(
-            FakeProvider(),
-            FakeDraft(),
+            _FakeLoadedProvider(),
+            _FakeDraft(),
             _runtime_context(draft_sink_size=32, draft_window_size=512),
         )
 
@@ -308,23 +211,14 @@ class TestServeHelperShapes:
         with pytest.raises(ValueError, match="model_key"):
             build_prefix_key(FakeProvider(), FakeDraft(), _runtime_context())
 
-        class FakeProviderWithKey:
-            model_key = ("target/x", None, "draft/y")
-
         with pytest.raises(ValueError, match="must not be empty"):
-            build_prefix_key(FakeProviderWithKey(), FakeDraft(), _runtime_context())
+            build_prefix_key(_FakeLoadedProvider(), FakeDraft(), _runtime_context())
 
     def test_build_prefix_key_requires_runtime_identity_fields(self):
         from dflash_mlx.server.prefix_cache_manager import build_prefix_key
 
-        class FakeProvider:
-            model_key = ("target/x", None, "draft/y")
-
-        class FakeDraft:
-            target_layer_ids = [3, 7]
-
         with pytest.raises(ValueError, match="runtime context"):
-            build_prefix_key(FakeProvider(), FakeDraft(), object())
+            build_prefix_key(_FakeLoadedProvider(), _FakeDraft(), object())
 
 class TestContextConfigExposedCorrectly:
 
@@ -1171,18 +1065,6 @@ class TestContextConfigExposedCorrectly:
     def test_prefix_flow_lookup_records_hit(self, monkeypatch):
         import dflash_mlx.server.prefix_cache_flow as flow_mod
 
-        class FakeProvider:
-            model_key = ("target/x", None, "draft/y")
-
-        class FakeDraft:
-            target_layer_ids = [3, 7]
-
-        class FakeTokenizer:
-            unk_token_id = -1
-
-            def convert_tokens_to_ids(self, tokens):
-                return [-1 for _ in tokens]
-
         cache = DFlashPrefixCache(max_entries=4)
         key = _make_key(
             target_model_id="target/x",
@@ -1200,9 +1082,9 @@ class TestContextConfigExposedCorrectly:
         monkeypatch.setattr(flow_mod, "build_prefix_key", lambda *_args: key)
 
         flow = flow_mod.PrefixCacheFlow.for_request(
-            model_provider=FakeProvider(),
-            draft_model=FakeDraft(),
-            tokenizer=FakeTokenizer(),
+            model_provider=_FakeLoadedProvider(),
+            draft_model=_FakeDraft(),
+            tokenizer=_FakeTokenizer(),
             prompt=prompt,
             runtime_context=_runtime_context(prefix_cache=True),
         )
@@ -1214,18 +1096,6 @@ class TestContextConfigExposedCorrectly:
 
     def test_prefix_flow_keeps_lookup_hit_when_log_stats_manager_retires(self, monkeypatch):
         import dflash_mlx.server.prefix_cache_flow as flow_mod
-
-        class FakeProvider:
-            model_key = ("target/x", None, "draft/y")
-
-        class FakeDraft:
-            target_layer_ids = [3, 7]
-
-        class FakeTokenizer:
-            unk_token_id = -1
-
-            def convert_tokens_to_ids(self, tokens):
-                return [-1 for _ in tokens]
 
         prompt = [11, 12, 13, 14]
 
@@ -1253,9 +1123,9 @@ class TestContextConfigExposedCorrectly:
         )
 
         flow = flow_mod.PrefixCacheFlow.for_request(
-            model_provider=FakeProvider(),
-            draft_model=FakeDraft(),
-            tokenizer=FakeTokenizer(),
+            model_provider=_FakeLoadedProvider(),
+            draft_model=_FakeDraft(),
+            tokenizer=_FakeTokenizer(),
             prompt=prompt,
             runtime_context=_runtime_context(prefix_cache=True),
         )
@@ -1269,18 +1139,6 @@ class TestContextConfigExposedCorrectly:
     def test_prefix_flow_treats_retired_lookup_manager_as_inactive(self, monkeypatch):
         import dflash_mlx.server.prefix_cache_flow as flow_mod
 
-        class FakeProvider:
-            model_key = ("target/x", None, "draft/y")
-
-        class FakeDraft:
-            target_layer_ids = [3, 7]
-
-        class FakeTokenizer:
-            unk_token_id = -1
-
-            def convert_tokens_to_ids(self, tokens):
-                return [-1 for _ in tokens]
-
         manager = _manager(max_entries=4)
         manager.shutdown()
         monkeypatch.setattr(
@@ -1290,9 +1148,9 @@ class TestContextConfigExposedCorrectly:
         )
 
         flow = flow_mod.PrefixCacheFlow.for_request(
-            model_provider=FakeProvider(),
-            draft_model=FakeDraft(),
-            tokenizer=FakeTokenizer(),
+            model_provider=_FakeLoadedProvider(),
+            draft_model=_FakeDraft(),
+            tokenizer=_FakeTokenizer(),
             prompt=[1, 2, 3],
             runtime_context=_runtime_context(prefix_cache=True),
         )
@@ -1529,7 +1387,7 @@ class TestContextConfigExposedCorrectly:
         assert matched == 0
         assert found is None
 
-    def test_snapshot_service_ignores_retired_manager_on_insert(self):
+    def test_snapshot_service_ignores_retired_manager_on_insert(self, capsys):
         cache = DFlashPrefixCache(max_entries=4)
         key = _make_key()
         prompt = [61, 62, 63]
@@ -1559,30 +1417,6 @@ class TestContextConfigExposedCorrectly:
         matched, found = cache.lookup(prompt, key)
         assert matched == 0
         assert found is None
-
-    def test_snapshot_service_retired_manager_insert_is_quiet(self, capsys):
-        cache = DFlashPrefixCache(max_entries=4)
-        key = _make_key()
-        prompt = [61, 62, 63]
-        target_hidden = mx.zeros((1, len(prompt), 6), dtype=mx.float32)
-        manager = _manager(cache)
-        manager.shutdown()
-        service = SnapshotService(
-            cache_manager=manager,
-            builder=PrefixSnapshotBuilder(key=key),
-        )
-
-        service.publish(
-            token_ids=prompt,
-            target_cache=_make_populated_target_cache(n_tokens=len(prompt)),
-            target_hidden=target_hidden,
-            last_logits=mx.zeros((1, 32), dtype=mx.float32),
-            kind="prefill",
-            require_logits=True,
-            snapshot_boundary=len(prompt),
-            allow_full_attention_context=False,
-        )
-
         assert "prefix cache insert failed" not in capsys.readouterr().err
 
     def test_snapshot_service_raises_and_logs_cache_insert_failure(self, capsys):

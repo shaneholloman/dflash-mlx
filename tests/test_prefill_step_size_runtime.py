@@ -100,6 +100,16 @@ class _FakeDraftBackend:
         return mx.zeros((max(0, block_len - 1),), dtype=mx.uint32)
 
 
+class _RecordingDraftBackend(_FakeDraftBackend):
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, bool]] = []
+
+    def draft_greedy(self, **kwargs):
+        block_len = int(kwargs["block_len"])
+        self.calls.append((block_len, bool(kwargs["async_launch"])))
+        return mx.zeros((max(0, block_len - 1),), dtype=mx.uint32)
+
+
 def _runtime_context(
     diagnostics_config: DiagnosticsConfig | None = None,
     verify_mode: str | None = None,
@@ -938,19 +948,6 @@ def test_generation_snapshot_skipped_when_request_policy_disallows_it():
 def test_request_state_preserves_async_prefetched_draft_reuse():
     target_ops = _FakeTargetOps()
     draft_model = _draft_model()
-
-    class _RecordingDraftBackend:
-        def __init__(self) -> None:
-            self.calls: list[tuple[int, bool]] = []
-
-        def make_cache(self, **_kwargs):
-            return []
-
-        def draft_greedy(self, **kwargs):
-            block_len = int(kwargs["block_len"])
-            self.calls.append((block_len, bool(kwargs["async_launch"])))
-            return mx.zeros((max(0, block_len - 1),), dtype=mx.uint32)
-
     draft_backend = _RecordingDraftBackend()
 
     events = list(
@@ -980,19 +977,6 @@ def test_request_state_preserves_async_prefetched_draft_reuse():
 def test_profile_cycle_events_disable_async_prefetch_and_match_summary():
     target_ops = _FakeTargetOps()
     draft_model = _draft_model()
-
-    class _RecordingDraftBackend:
-        def __init__(self) -> None:
-            self.calls: list[tuple[int, bool]] = []
-
-        def make_cache(self, **_kwargs):
-            return []
-
-        def draft_greedy(self, **kwargs):
-            block_len = int(kwargs["block_len"])
-            self.calls.append((block_len, bool(kwargs["async_launch"])))
-            return mx.zeros((max(0, block_len - 1),), dtype=mx.uint32)
-
     draft_backend = _RecordingDraftBackend()
 
     events = list(
@@ -1065,18 +1049,6 @@ def test_adaptive_verify_mode_drops_and_recovers_block_len():
             hidden = {1: mx.zeros((batch, seq_len, 2), dtype=mx.float32)}
             return logits, hidden
 
-    class _RecordingDraftBackend:
-        def __init__(self) -> None:
-            self.calls: list[tuple[int, bool]] = []
-
-        def make_cache(self, **_kwargs):
-            return []
-
-        def draft_greedy(self, **kwargs):
-            block_len = int(kwargs["block_len"])
-            self.calls.append((block_len, bool(kwargs["async_launch"])))
-            return mx.zeros((max(0, block_len - 1),), dtype=mx.uint32)
-
     target_ops = _PatternTargetOps()
     draft_backend = _RecordingDraftBackend()
 
@@ -1136,14 +1108,6 @@ def test_adaptive_verify_mode_ignores_mixed_commit_windows():
             hidden = {1: mx.zeros((batch, seq_len, 2), dtype=mx.float32)}
             return logits, hidden
 
-    class _RecordingDraftBackend:
-        def make_cache(self, **_kwargs):
-            return []
-
-        def draft_greedy(self, **kwargs):
-            block_len = int(kwargs["block_len"])
-            return mx.zeros((max(0, block_len - 1),), dtype=mx.uint32)
-
     target_ops = _MixedTargetOps()
 
     events = list(
@@ -1152,7 +1116,7 @@ def test_adaptive_verify_mode_ignores_mixed_commit_windows():
             target_ops=target_ops,
             tokenizer=object(),
             draft_model=draft_model,
-            draft_backend=_RecordingDraftBackend(),
+            draft_backend=_FakeDraftBackend(),
             prompt="unused",
             max_new_tokens=64,
             prompt_tokens_override=[1, 2],

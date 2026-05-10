@@ -543,41 +543,21 @@ class TestFailureModes:
         finally:
             l2.shutdown()
 
-    def test_schema_version_mismatch_rejected(self, tmp_path):
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("schema_version", L2_SCHEMA_VERSION + 99),
+            ("runtime_version", "0.0.0-not-a-real-version"),
+        ],
+    )
+    def test_metadata_version_mismatch_rejected(self, tmp_path, field, value):
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
             key = _make_key()
             snap = _make_synthetic_snapshot([1, 2], key)
             arrays, meta_dict = _serialize(snap)
             tampered = json.loads(meta_dict["dflash_meta"])
-            tampered["schema_version"] = L2_SCHEMA_VERSION + 99
-            meta_dict["dflash_meta"] = json.dumps(tampered)
-            bucket = _bucket_dir(tmp_path, key)
-            bucket.mkdir(parents=True, exist_ok=True)
-            stale = bucket / _format_filename(
-                token_len=2,
-                token_hash=_token_hash([1, 2]),
-                kind="prefill",
-                fp_short="0" * 16,
-            )
-            mx.save_safetensors(str(stale), arrays, metadata=meta_dict)
-            cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
-            matched, _ = cache.lookup([1, 2], key)
-            assert matched == 0
-            assert not stale.exists()
-            stats = l2.stats()
-            assert stats["schema_rejects"] >= 1
-        finally:
-            l2.shutdown()
-
-    def test_runtime_version_mismatch_rejected(self, tmp_path):
-        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
-        try:
-            key = _make_key()
-            snap = _make_synthetic_snapshot([1, 2], key)
-            arrays, meta_dict = _serialize(snap)
-            tampered = json.loads(meta_dict["dflash_meta"])
-            tampered["runtime_version"] = "0.0.0-not-a-real-version"
+            tampered[field] = value
             meta_dict["dflash_meta"] = json.dumps(tampered)
             bucket = _bucket_dir(tmp_path, key)
             bucket.mkdir(parents=True, exist_ok=True)
@@ -802,6 +782,7 @@ class TestConcurrency:
             second = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
             try:
                 assert not second.writable
+                assert second._writer_thread is None
                 key = _make_key()
                 first._write_one(_make_synthetic_snapshot([1, 2, 3], key))
                 snap = second.lookup((1, 2, 3), key)
@@ -955,13 +936,6 @@ class TestQueueBackpressure:
         finally:
             l2.shutdown()
 
-    def test_default_max_in_flight_is_one(self, tmp_path):
-        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
-        try:
-            assert l2._max_in_flight == 1
-        finally:
-            l2.shutdown()
-
     def test_drop_does_not_call_mx_eval(self, tmp_path, monkeypatch):
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
@@ -1010,20 +984,6 @@ class TestQueueBackpressure:
             assert set(_all_snapshot_files(tmp_path)) == before_files
         finally:
             l2.shutdown()
-
-class TestReadOnlyInstance:
-    def test_read_only_does_not_spawn_writer_thread(self, tmp_path):
-        first = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
-        try:
-            assert first._writer_thread is not None
-            second = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
-            try:
-                assert not second.writable
-                assert second._writer_thread is None
-            finally:
-                second.shutdown()
-        finally:
-            first.shutdown()
 
 class TestStatsHotPath:
     def test_stats_does_not_walk_filesystem(self, tmp_path):

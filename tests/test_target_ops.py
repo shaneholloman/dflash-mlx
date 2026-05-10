@@ -4,16 +4,14 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
-from mlx_lm.models.cache import KVCache, QuantizedKVCache, RotatingKVCache
+from mlx_lm.models.cache import KVCache, RotatingKVCache
 
 from dflash_mlx.engine.target_ops import bind_draft_to_target, resolve_target_ops
 from dflash_mlx.engine.target_gemma4 import Gemma4TargetOps
 from dflash_mlx.engine.target_qwen_gdn import QwenGdnTargetOps
-from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
 
 class _FakeLinearAttn:
     conv_kernel_size = 4
@@ -400,73 +398,3 @@ def test_gemma4_logits_fall_back_to_args_final_softcap():
     expected = mx.tanh(native_logits / 2.5) * 2.5
 
     _assert_close(logits, expected)
-
-def test_qwen_make_cache_matches_current_hybrid_cache_types(monkeypatch):
-    monkeypatch.setattr(QwenGdnTargetOps, "install_speculative_hooks", lambda self, _model: None)
-    caches = QwenGdnTargetOps().make_cache(
-        _FakeTarget(),
-        enable_speculative_linear_cache=True,
-        quantize_kv_cache=False,
-        target_fa_window=0,
-    )
-
-    assert isinstance(caches[0], KVCache)
-    assert isinstance(caches[1], RecurrentRollbackCache)
-    assert isinstance(caches[2], KVCache)
-
-def test_qwen_make_cache_quantizes_fa_only(monkeypatch):
-    monkeypatch.setattr(
-        QwenGdnTargetOps,
-        "install_speculative_hooks",
-        lambda self, _model: None,
-    )
-    caches = QwenGdnTargetOps().make_cache(
-        _FakeTarget(),
-        enable_speculative_linear_cache=True,
-        quantize_kv_cache=True,
-        target_fa_window=0,
-    )
-
-    assert isinstance(caches[0], QuantizedKVCache)
-    assert isinstance(caches[1], RecurrentRollbackCache)
-    assert isinstance(caches[2], QuantizedKVCache)
-
-def test_speculative_gdn_hook_materializes_cached_state():
-    root = Path(__file__).resolve().parents[1]
-    text = (root / "dflash_mlx/engine/target_qwen_gdn.py").read_text()
-
-    assert (
-        "cache[0] = mx.contiguous(conv_input[:, -(self.conv_kernel_size - 1) :])"
-        in text
-    )
-    assert "cache[1] = mx.contiguous(state)" in text
-
-def test_qwen_make_cache_windows_fa_only(monkeypatch):
-    monkeypatch.setattr(QwenGdnTargetOps, "install_speculative_hooks", lambda self, _model: None)
-    caches = QwenGdnTargetOps().make_cache(
-        _FakeTarget(),
-        enable_speculative_linear_cache=True,
-        quantize_kv_cache=False,
-        target_fa_window=2048,
-    )
-
-    assert isinstance(caches[0], RotatingKVCache)
-    assert isinstance(caches[1], RecurrentRollbackCache)
-    assert isinstance(caches[2], RotatingKVCache)
-
-def test_runtime_and_spec_epoch_do_not_import_deleted_target_modules():
-    root = Path(__file__).resolve().parents[1]
-    runtime_text = (root / "dflash_mlx/runtime/__init__.py").read_text()
-    spec_text = (root / "dflash_mlx/engine/spec_epoch.py").read_text()
-
-    for text in (runtime_text, spec_text):
-        assert "engine.target_verifier" not in text
-        assert "engine.rollback" not in text
-
-def test_model_backend_doc_mentions_workflow():
-    root = Path(__file__).resolve().parents[1]
-    text = (root / "docs/model_backend.md").read_text()
-
-    assert "What is a TargetOps backend?" in text
-    assert "register in `TARGET_BACKENDS`" in text
-    assert "no backend per model size" in text

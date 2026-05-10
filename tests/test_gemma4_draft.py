@@ -57,6 +57,86 @@ def _args(**overrides):
     return DFlashDraftModelArgs(**base)
 
 
+class _TinyTargetOps:
+    def __init__(self, *, token_id: int, supports_prefix_snapshot: bool = True) -> None:
+        self.token_id = int(token_id)
+        self.supports_prefix_snapshot = bool(supports_prefix_snapshot)
+
+    def capabilities_for(self, _target_model):
+        return SimpleNamespace(supports_prefix_snapshot=self.supports_prefix_snapshot)
+
+    def make_cache(self, *_args, **_kwargs):
+        return []
+
+    def forward_with_hidden_capture(
+        self,
+        _target_model,
+        *,
+        input_ids,
+        cache,
+        capture_layer_ids,
+        logits_last_only=False,
+    ):
+        del cache, capture_layer_ids
+        batch, seq_len = input_ids.shape
+        logits_len = 1 if logits_last_only else seq_len
+        logits = mx.zeros((batch, logits_len, 8), dtype=mx.float32)
+        logits[:, :, self.token_id] = 1.0
+        hidden = {1: mx.zeros((batch, seq_len, 2), dtype=mx.float32)}
+        return logits, hidden
+
+    def verify_block(
+        self,
+        *,
+        target_model,
+        verify_ids,
+        target_cache,
+        capture_layer_ids,
+    ):
+        return self.forward_with_hidden_capture(
+            target_model,
+            input_ids=verify_ids,
+            cache=target_cache,
+            capture_layer_ids=capture_layer_ids,
+        )
+
+    def extract_context_feature(self, hidden_states, target_layer_id_list):
+        return hidden_states[int(target_layer_id_list[0]) + 1]
+
+    def arm_rollback(self, *_args, **_kwargs):
+        return None
+
+    def restore_after_acceptance(self, *_args, **_kwargs):
+        return 0
+
+    def cleanup_generation_caches(self, *_args):
+        return None
+
+
+class _EmptyDraftBackend:
+    def make_cache(self, **_kwargs):
+        return []
+
+
+def _tiny_runtime_context():
+    return build_runtime_context(
+        runtime_config_from_profile(
+            profile="balanced",
+            prefix_cache=False,
+            prefix_cache_l2=False,
+        )
+    )
+
+
+def _tiny_draft_model(*, mask_token_id: int = 5):
+    return SimpleNamespace(
+        target_layer_ids=[0],
+        block_size=1,
+        mask_token_id=mask_token_id,
+        project_target_hidden=lambda value: value,
+    )
+
+
 def test_gemma4_draft_args_default_missing_layer_types_to_official_swa_pattern():
     args = DFlashDraftModelArgs.from_dict(
         {
@@ -509,93 +589,17 @@ def test_load_draft_bundle_rejects_index_declared_draft_owned_lm_head(tmp_path):
 def test_mask_token_id_can_be_generated():
     mask_token_id = 5
 
-    class _TargetOps:
-        def capabilities_for(self, _target_model):
-            class _Capabilities:
-                supports_prefix_snapshot = True
-
-            return _Capabilities()
-
-        def make_cache(self, *_args, **_kwargs):
-            return []
-
-        def forward_with_hidden_capture(
-            self,
-            _target_model,
-            *,
-            input_ids,
-            cache,
-            capture_layer_ids,
-            logits_last_only=False,
-        ):
-            del cache, capture_layer_ids
-            batch, seq_len = input_ids.shape
-            logits_len = 1 if logits_last_only else seq_len
-            logits = mx.zeros((batch, logits_len, 8), dtype=mx.float32)
-            logits[:, :, mask_token_id] = 1.0
-            hidden = {1: mx.zeros((batch, seq_len, 2), dtype=mx.float32)}
-            return logits, hidden
-
-        def verify_block(
-            self,
-            *,
-            target_model,
-            verify_ids,
-            target_cache,
-            capture_layer_ids,
-        ):
-            return self.forward_with_hidden_capture(
-                target_model,
-                input_ids=verify_ids,
-                cache=target_cache,
-                capture_layer_ids=capture_layer_ids,
-            )
-
-        def extract_context_feature(self, hidden_states, target_layer_id_list):
-            return hidden_states[int(target_layer_id_list[0]) + 1]
-
-        def arm_rollback(self, *_args, **_kwargs):
-            return None
-
-        def restore_after_acceptance(self, *_args, **_kwargs):
-            return 0
-
-        def cleanup_generation_caches(self, *_args):
-            return None
-
-    class _DraftBackend:
-        def make_cache(self, **_kwargs):
-            return []
-
-    target_ops = _TargetOps()
-    draft_backend = _DraftBackend()
-    context = build_runtime_context(
-        runtime_config_from_profile(
-            profile="balanced",
-            prefix_cache=False,
-            prefix_cache_l2=False,
-        )
-    )
-
-    class _DraftModel:
-        target_layer_ids = [0]
-        block_size = 1
-        project_target_hidden = staticmethod(lambda value: value)
-
-    draft_model = _DraftModel()
-    draft_model.mask_token_id = mask_token_id
-
     events = list(
         spec_epoch.stream_dflash_generate_impl(
             target_model=object(),
-            target_ops=target_ops,
+            target_ops=_TinyTargetOps(token_id=mask_token_id),
             tokenizer=object(),
-            draft_model=draft_model,
-            draft_backend=draft_backend,
+            draft_model=_tiny_draft_model(mask_token_id=mask_token_id),
+            draft_backend=_EmptyDraftBackend(),
             prompt="unused",
             max_new_tokens=1,
             prompt_tokens_override=[1],
-            runtime_context=context,
+            runtime_context=_tiny_runtime_context(),
         )
     )
 
@@ -618,92 +622,18 @@ def test_prefix_snapshot_capability_disables_snapshot_events(monkeypatch):
             generation_concat_calls += 1
         return original_concatenate(values, *args, **kwargs)
 
-    class _TargetOps:
-        def capabilities_for(self, _target_model):
-            class _Capabilities:
-                supports_prefix_snapshot = False
-
-            return _Capabilities()
-
-        def make_cache(self, *_args, **_kwargs):
-            return []
-
-        def forward_with_hidden_capture(
-            self,
-            _target_model,
-            *,
-            input_ids,
-            cache,
-            capture_layer_ids,
-            logits_last_only=False,
-        ):
-            del cache, capture_layer_ids
-            batch, seq_len = input_ids.shape
-            logits_len = 1 if logits_last_only else seq_len
-            logits = mx.zeros((batch, logits_len, 8), dtype=mx.float32)
-            logits[:, :, 2] = 1.0
-            hidden = {1: mx.zeros((batch, seq_len, 2), dtype=mx.float32)}
-            return logits, hidden
-
-        def verify_block(
-            self,
-            *,
-            target_model,
-            verify_ids,
-            target_cache,
-            capture_layer_ids,
-        ):
-            return self.forward_with_hidden_capture(
-                target_model,
-                input_ids=verify_ids,
-                cache=target_cache,
-                capture_layer_ids=capture_layer_ids,
-            )
-
-        def extract_context_feature(self, hidden_states, target_layer_id_list):
-            return hidden_states[int(target_layer_id_list[0]) + 1]
-
-        def arm_rollback(self, *_args, **_kwargs):
-            return None
-
-        def restore_after_acceptance(self, *_args, **_kwargs):
-            return 0
-
-        def cleanup_generation_caches(self, *_args):
-            return None
-
-    class _DraftBackend:
-        def make_cache(self, **_kwargs):
-            return []
-
     monkeypatch.setattr(spec_epoch.mx, "concatenate", tracked_concatenate)
-    target_ops = _TargetOps()
-    draft_backend = _DraftBackend()
-    context = build_runtime_context(
-        runtime_config_from_profile(
-            profile="balanced",
-            prefix_cache=False,
-            prefix_cache_l2=False,
-        )
-    )
-
-    class _DraftModel:
-        target_layer_ids = [0]
-        block_size = 1
-        mask_token_id = 5
-        project_target_hidden = staticmethod(lambda value: value)
-
     events = list(
         spec_epoch.stream_dflash_generate_impl(
             target_model=object(),
-            target_ops=target_ops,
+            target_ops=_TinyTargetOps(token_id=2, supports_prefix_snapshot=False),
             tokenizer=object(),
-            draft_model=_DraftModel(),
-            draft_backend=draft_backend,
+            draft_model=_tiny_draft_model(),
+            draft_backend=_EmptyDraftBackend(),
             prompt="unused",
             max_new_tokens=1,
             prompt_tokens_override=[1],
-            runtime_context=context,
+            runtime_context=_tiny_runtime_context(),
         )
     )
 

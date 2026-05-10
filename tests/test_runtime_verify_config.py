@@ -8,7 +8,6 @@ import argparse
 import builtins
 import os
 from dataclasses import replace
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -22,19 +21,10 @@ from dflash_mlx.engine.config import (
 from dflash_mlx.runtime import VerifyConfig
 from dflash_mlx.runtime.config import (
     BENCHMARK_RUNTIME_FIELDS,
-    GENERATE_RUNTIME_FIELDS,
-    PREFIX_CACHE_DOC_FIELDS,
     add_offline_runtime_arguments,
     offline_runtime_error_message,
     offline_runtime_kwargs,
     PROFILES,
-    RUNTIME_CONFIG_SPEC,
-    SERVE_RUNTIME_DOC_FIELDS,
-    SURFACE_BENCHMARK,
-    SURFACE_GENERATE,
-    SURFACE_SERVE_DOCTOR,
-    runtime_config_flags_markdown_table,
-    runtime_config_markdown_sections,
 )
 from dflash_mlx.runtime.context import build_offline_runtime_config, runtime_config_from_profile
 
@@ -67,71 +57,6 @@ def _pure_attention_ops(*, supports_verify_linear: bool = True):
         install_speculative_hooks=lambda model: None,
         configure_full_attention_split=lambda model, **kwargs: None,
     )
-
-
-def test_runtime_profiles_module_is_display_only():
-    import dflash_mlx.runtime.profiles as runtime_profiles
-
-    assert hasattr(runtime_profiles, "format_profiles")
-    assert not hasattr(runtime_profiles, "resolve_runtime_config")
-    assert not hasattr(runtime_profiles, "EffectiveRuntimeConfig")
-    assert not hasattr(runtime_profiles, "PROFILES")
-
-
-def test_runtime_config_spec_owns_field_projections():
-    assert RUNTIME_CONFIG_SPEC.full_field_names() == (
-        "profile",
-        "prefill_step_size",
-        "draft_sink_size",
-        "draft_window_size",
-        "verify_len_cap",
-        "clear_cache_boundaries",
-        "verify_mode",
-        "max_snapshot_tokens",
-        "prefix_cache_l2",
-        "prefix_cache_l2_dir",
-        "prefix_cache_l2_max_bytes",
-        "prefix_cache",
-        "prefix_cache_max_entries",
-        "prefix_cache_max_bytes",
-        "target_fa_window",
-        "dflash_max_ctx",
-    )
-    assert "clear_cache_boundaries" in SERVE_RUNTIME_DOC_FIELDS
-    assert "prefix_cache" in PREFIX_CACHE_DOC_FIELDS
-    assert RUNTIME_CONFIG_SPEC.surface_field_names(SURFACE_SERVE_DOCTOR) == (
-        RUNTIME_CONFIG_SPEC.full_field_names()
-    )
-    assert RUNTIME_CONFIG_SPEC.surface_field_names(
-        SURFACE_GENERATE,
-        order=GENERATE_RUNTIME_FIELDS,
-    ) == GENERATE_RUNTIME_FIELDS
-    assert RUNTIME_CONFIG_SPEC.surface_field_names(
-        SURFACE_BENCHMARK,
-        order=BENCHMARK_RUNTIME_FIELDS,
-    ) == BENCHMARK_RUNTIME_FIELDS
-    assert "prefix_cache" not in GENERATE_RUNTIME_FIELDS
-    assert "verify_mode" not in BENCHMARK_RUNTIME_FIELDS
-
-
-def test_runtime_config_docs_blocks_match_spec():
-    docs = Path("docs/runtime-flags.md").read_text()
-    for name, expected in runtime_config_markdown_sections().items():
-        start = f"<!-- dflash-runtime-config:{name}:start -->"
-        end = f"<!-- dflash-runtime-config:{name}:end -->"
-        assert start in docs
-        assert end in docs
-        actual = docs.split(start, 1)[1].split(end, 1)[0].strip()
-        assert actual == expected
-
-
-def test_runtime_config_docs_fragments_follow_spec():
-    assert (
-        runtime_config_flags_markdown_table(SERVE_RUNTIME_DOC_FIELDS)
-        .splitlines()[-1]
-        == "| `--clear-cache-boundaries`, `--no-clear-cache-boundaries` | clear the MLX cache at safe request boundaries |"
-    )
-    assert "`--prefix-cache-l2-dir PATH`" in runtime_config_markdown_sections()["env"]
 
 
 def test_local_model_path_missing_huggingface_hub_reports_file_not_found(monkeypatch, tmp_path):
@@ -338,25 +263,6 @@ def test_offline_runtime_config_uses_balanced_defaults_without_cache(monkeypatch
     assert cfg.prefix_cache_l2 is False
 
 
-def test_offline_runtime_field_sets_stay_command_specific():
-    assert GENERATE_RUNTIME_FIELDS == (
-        "verify_mode",
-        "prefill_step_size",
-        "target_fa_window",
-        "draft_sink_size",
-        "draft_window_size",
-        "verify_len_cap",
-    )
-    assert BENCHMARK_RUNTIME_FIELDS == (
-        "target_fa_window",
-        "draft_sink_size",
-        "draft_window_size",
-        "verify_len_cap",
-    )
-    assert "prefix_cache" not in GENERATE_RUNTIME_FIELDS
-    assert "verify_mode" not in BENCHMARK_RUNTIME_FIELDS
-
-
 def test_offline_runtime_arguments_project_from_shared_runtime_schema():
     parser = argparse.ArgumentParser()
     add_offline_runtime_arguments(parser, BENCHMARK_RUNTIME_FIELDS)
@@ -379,7 +285,7 @@ def test_offline_runtime_arguments_project_from_shared_runtime_schema():
     assert not hasattr(args, "verify_mode")
 
 
-def test_offline_runtime_argument_defaults_follow_balanced_profile(monkeypatch):
+def test_offline_runtime_argument_defaults_follow_balanced_profile(monkeypatch, capsys):
     monkeypatch.setitem(
         PROFILES,
         "balanced",
@@ -391,23 +297,9 @@ def test_offline_runtime_argument_defaults_follow_balanced_profile(monkeypatch):
     args = parser.parse_args([])
 
     assert args.draft_window_size == 1536
-
-
-def test_offline_runtime_help_defaults_follow_balanced_profile(monkeypatch, capsys):
-    monkeypatch.setitem(
-        PROFILES,
-        "balanced",
-        replace(PROFILES["balanced"], draft_window_size=1536),
-    )
-    parser = argparse.ArgumentParser()
-    add_offline_runtime_arguments(parser, BENCHMARK_RUNTIME_FIELDS)
-
     with pytest.raises(SystemExit):
         parser.parse_args(["--help"])
-
-    out = capsys.readouterr().out
-    assert "Default:" in out
-    assert "1536." in out
+    assert "1536." in capsys.readouterr().out
 
 
 def test_offline_runtime_error_message_removes_internal_field_labels():

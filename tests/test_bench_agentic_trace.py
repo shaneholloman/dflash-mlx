@@ -28,6 +28,119 @@ from tools.benchmarks._agentic_trace import (
     summarize_cycles,
 )
 
+
+class _DummyServerProc:
+    def __init__(self, pid: int = 1) -> None:
+        self.pid = pid
+
+    def poll(self):
+        return None
+
+    def wait(self, timeout=None):
+        return 0
+
+
+class _ClosingClientProc:
+    def __init__(self, *_args, **kwargs) -> None:
+        for key in ("stdout", "stderr"):
+            stream = kwargs.get(key)
+            if hasattr(stream, "close"):
+                stream.close()
+
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self):
+        return None
+
+
+def _patch_agentic_process(monkeypatch, *, server_pid: int = 1, terminate=None) -> None:
+    monkeypatch.setattr(agentic_trace, "_wait_health", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(agentic_trace, "_ensure_port_available", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(agentic_trace, "_verify_ready_model", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(agentic_trace, "_terminate", terminate or (lambda *_args, **_kwargs: None))
+    monkeypatch.setattr(agentic_trace, "_git", lambda _args: "test-git")
+    monkeypatch.setattr(agentic_trace.platform, "platform", lambda: "test-platform")
+    monkeypatch.setattr(artifacts, "_git", lambda _args: "test-git")
+    monkeypatch.setattr(artifacts, "_git_dirty", lambda: False)
+
+    def fake_spawn(_cmd, stdout_path, stderr_path, env=None):
+        stdout_path.write_text("")
+        stderr_path.write_text("")
+        return _DummyServerProc(server_pid)
+
+    monkeypatch.setattr(agentic_trace, "_spawn", fake_spawn)
+
+
+def _write_source_trace(tmp_path):
+    source = tmp_path / "source-trace"
+    (source / "requests").mkdir(parents=True)
+    (source / "requests" / "001.json").write_text(
+        json.dumps(
+            {
+                "idx": 1,
+                "path": "/v1/chat/completions",
+                "headers": {"Content-Type": "application/json"},
+                "body": {
+                    "model": "captured",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            }
+        )
+    )
+    return source
+
+
+def _write_replay_outputs(run_dir, target):
+    req = {
+        "idx": 1,
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "stream": True,
+        "headers": {"Content-Type": "application/json"},
+        "body": {
+            "model": target,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        },
+        "body_bytes": 80,
+    }
+    (run_dir / "requests").mkdir(exist_ok=True)
+    (run_dir / "sse").mkdir(exist_ok=True)
+    (run_dir / "requests" / "001.json").write_text(json.dumps(req))
+    (run_dir / "sse" / "001.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "first_byte", "t_ms": 10.0}),
+                json.dumps(
+                    {
+                        "type": "event",
+                        "t_ms": 20.0,
+                        "payload": {
+                            "data": {
+                                "choices": [{"delta": {"content": "ok"}}],
+                                "usage": {"prompt_tokens": 4, "completion_tokens": 1},
+                            }
+                        },
+                    }
+                ),
+                json.dumps({"type": "end", "t_ms": 30.0}),
+            ]
+        )
+        + "\n"
+    )
+    return 1, 0.03
+
+
+def _patch_replay_outputs(monkeypatch) -> None:
+    monkeypatch.setattr(
+        agentic_trace,
+        "_run_replay_requests",
+        lambda *, run_dir, target, **_kwargs: _write_replay_outputs(run_dir, target),
+    )
+
+
 def test_summarize_cycles_reports_tokens_per_cycle():
     summary = summarize_cycles(
         [
@@ -1372,44 +1485,8 @@ def test_agentic_trace_metadata_records_dflash_runtime_overrides(tmp_path, monke
     config_path = tmp_path / "opencode.jsonc"
     config_path.write_text('{"provider": {}}\n')
     monkeypatch.setattr(agentic_trace, "OPENCODE_CONFIG", config_path)
-    monkeypatch.setattr(agentic_trace, "_wait_health", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(agentic_trace, "_ensure_port_available", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(agentic_trace, "_verify_ready_model", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(agentic_trace, "_terminate", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(agentic_trace, "_git", lambda _args: "test-git")
-    monkeypatch.setattr(agentic_trace.platform, "platform", lambda: "test-platform")
-    monkeypatch.setattr(artifacts, "_git", lambda _args: "test-git")
-    monkeypatch.setattr(artifacts, "_git_dirty", lambda: False)
-
-    class DummyProc:
-        pid = 1
-
-        def poll(self):
-            return None
-
-        def wait(self, timeout=None):
-            return 0
-
-    def fake_spawn(_cmd, stdout_path, stderr_path, env=None):
-        stdout_path.write_text("")
-        stderr_path.write_text("")
-        return DummyProc()
-
-    class DummyClientProc:
-        def __init__(self, *_args, **kwargs):
-            for key in ("stdout", "stderr"):
-                stream = kwargs.get(key)
-                if hasattr(stream, "close"):
-                    stream.close()
-
-        def wait(self, timeout=None):
-            return 0
-
-        def kill(self):
-            return None
-
-    monkeypatch.setattr(agentic_trace, "_spawn", fake_spawn)
-    monkeypatch.setattr(agentic_trace.subprocess, "Popen", DummyClientProc)
+    _patch_agentic_process(monkeypatch)
+    monkeypatch.setattr(agentic_trace.subprocess, "Popen", _ClosingClientProc)
     l2_dir = tmp_path / "custom-l2"
 
     rc = agentic_trace.main(
@@ -1565,91 +1642,10 @@ def test_system_sampler_writes_jsonl_rows(tmp_path, monkeypatch):
     assert [cmd[0] for cmd in calls] == ["ps", "vm_stat", "pmset"]
 
 def test_agentic_replay_metadata_records_source_trace(tmp_path, monkeypatch):
-    source = tmp_path / "source-trace"
-    (source / "requests").mkdir(parents=True)
-    (source / "requests" / "001.json").write_text(
-        json.dumps(
-            {
-                "idx": 1,
-                "path": "/v1/chat/completions",
-                "headers": {"Content-Type": "application/json"},
-                "body": {
-                    "model": "captured",
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "stream": True,
-                },
-            }
-        )
-    )
-    monkeypatch.setattr(agentic_trace, "_wait_health", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(agentic_trace, "_ensure_port_available", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(agentic_trace, "_verify_ready_model", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(agentic_trace, "_terminate", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(agentic_trace, "_git", lambda _args: "test-git")
-    monkeypatch.setattr(agentic_trace.platform, "platform", lambda: "test-platform")
-    monkeypatch.setattr(artifacts, "_git", lambda _args: "test-git")
-    monkeypatch.setattr(artifacts, "_git_dirty", lambda: False)
+    source = _write_source_trace(tmp_path)
+    _patch_agentic_process(monkeypatch)
+    _patch_replay_outputs(monkeypatch)
     sampler_calls = []
-
-    class DummyProc:
-        pid = 1
-
-        def poll(self):
-            return None
-
-        def wait(self, timeout=None):
-            return 0
-
-    def fake_spawn(_cmd, stdout_path, stderr_path, env=None):
-        stdout_path.write_text("")
-        stderr_path.write_text("")
-        return DummyProc()
-
-    def fake_replay_requests(*, run_dir, target, **_kwargs):
-        req = {
-            "idx": 1,
-            "method": "POST",
-            "path": "/v1/chat/completions",
-            "stream": True,
-            "headers": {"Content-Type": "application/json"},
-            "body": {
-                "model": target,
-                "messages": [{"role": "user", "content": "hi"}],
-                "stream": True,
-            },
-            "body_bytes": 80,
-        }
-        (run_dir / "requests").mkdir(exist_ok=True)
-        (run_dir / "sse").mkdir(exist_ok=True)
-        (run_dir / "requests" / "001.json").write_text(json.dumps(req))
-        (run_dir / "sse" / "001.jsonl").write_text(
-            "\n".join(
-                [
-                    json.dumps({"type": "first_byte", "t_ms": 10.0}),
-                    json.dumps(
-                        {
-                            "type": "event",
-                            "t_ms": 20.0,
-                            "payload": {
-                                "data": {
-                                    "choices": [{"delta": {"content": "ok"}}],
-                                    "usage": {
-                                        "prompt_tokens": 4,
-                                        "completion_tokens": 1,
-                                    },
-                                }
-                            },
-                        }
-                    ),
-                    json.dumps({"type": "end", "t_ms": 30.0}),
-                ]
-            )
-            + "\n"
-        )
-        return 1, 0.03
-
-    monkeypatch.setattr(agentic_trace, "_spawn", fake_spawn)
-    monkeypatch.setattr(agentic_trace, "_run_replay_requests", fake_replay_requests)
 
     class DummySampler:
         def stop(self):
@@ -1698,90 +1694,9 @@ def test_agentic_replay_metadata_records_source_trace(tmp_path, monkeypatch):
 
 
 def test_replay_forwards_no_prefix_cache_l2_for_long_session(tmp_path, monkeypatch):
-    source = tmp_path / "source-trace"
-    (source / "requests").mkdir(parents=True)
-    (source / "requests" / "001.json").write_text(
-        json.dumps(
-            {
-                "idx": 1,
-                "path": "/v1/chat/completions",
-                "headers": {"Content-Type": "application/json"},
-                "body": {
-                    "model": "captured",
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "stream": True,
-                },
-            }
-        )
-    )
-    monkeypatch.setattr(agentic_trace, "_wait_health", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(agentic_trace, "_ensure_port_available", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(agentic_trace, "_verify_ready_model", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(agentic_trace, "_terminate", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(agentic_trace, "_git", lambda _args: "test-git")
-    monkeypatch.setattr(agentic_trace.platform, "platform", lambda: "test-platform")
-    monkeypatch.setattr(artifacts, "_git", lambda _args: "test-git")
-    monkeypatch.setattr(artifacts, "_git_dirty", lambda: False)
-
-    class DummyProc:
-        pid = 1
-
-        def poll(self):
-            return None
-
-        def wait(self, timeout=None):
-            return 0
-
-    def fake_spawn(_cmd, stdout_path, stderr_path, env=None):
-        stdout_path.write_text("")
-        stderr_path.write_text("")
-        return DummyProc()
-
-    def fake_replay_requests(*, run_dir, target, **_kwargs):
-        req = {
-            "idx": 1,
-            "method": "POST",
-            "path": "/v1/chat/completions",
-            "stream": True,
-            "headers": {"Content-Type": "application/json"},
-            "body": {
-                "model": target,
-                "messages": [{"role": "user", "content": "hi"}],
-                "stream": True,
-            },
-            "body_bytes": 80,
-        }
-        (run_dir / "requests").mkdir(exist_ok=True)
-        (run_dir / "sse").mkdir(exist_ok=True)
-        (run_dir / "requests" / "001.json").write_text(json.dumps(req))
-        (run_dir / "sse" / "001.jsonl").write_text(
-            "\n".join(
-                [
-                    json.dumps({"type": "first_byte", "t_ms": 10.0}),
-                    json.dumps(
-                        {
-                            "type": "event",
-                            "t_ms": 20.0,
-                            "payload": {
-                                "data": {
-                                    "choices": [{"delta": {"content": "ok"}}],
-                                    "usage": {
-                                        "prompt_tokens": 4,
-                                        "completion_tokens": 1,
-                                    },
-                                }
-                            },
-                        }
-                    ),
-                    json.dumps({"type": "end", "t_ms": 30.0}),
-                ]
-            )
-            + "\n"
-        )
-        return 1, 0.03
-
-    monkeypatch.setattr(agentic_trace, "_spawn", fake_spawn)
-    monkeypatch.setattr(agentic_trace, "_run_replay_requests", fake_replay_requests)
+    source = _write_source_trace(tmp_path)
+    _patch_agentic_process(monkeypatch)
+    _patch_replay_outputs(monkeypatch)
 
     rc = agentic_trace.replay_main(
         [
@@ -1812,95 +1727,18 @@ def test_replay_forwards_no_prefix_cache_l2_for_long_session(tmp_path, monkeypat
     assert "--prefix-cache-l2" not in server_cmd
 
 def test_replay_terminates_server_when_sampler_stop_fails(tmp_path, monkeypatch):
-    source = tmp_path / "source-trace"
-    (source / "requests").mkdir(parents=True)
-    (source / "requests" / "001.json").write_text(
-        json.dumps(
-            {
-                "idx": 1,
-                "path": "/v1/chat/completions",
-                "headers": {"Content-Type": "application/json"},
-                "body": {
-                    "model": "captured",
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "stream": True,
-                },
-            }
-        )
-    )
+    source = _write_source_trace(tmp_path)
     terminated = []
-    monkeypatch.setattr(agentic_trace, "_wait_health", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(agentic_trace, "_ensure_port_available", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(agentic_trace, "_verify_ready_model", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(agentic_trace, "_terminate", lambda proc, label: terminated.append((proc.pid, label)))
-    monkeypatch.setattr(agentic_trace, "_git", lambda _args: "test-git")
-    monkeypatch.setattr(agentic_trace.platform, "platform", lambda: "test-platform")
-    monkeypatch.setattr(artifacts, "_git", lambda _args: "test-git")
-    monkeypatch.setattr(artifacts, "_git_dirty", lambda: False)
-
-    class DummyProc:
-        pid = 123
-
-        def poll(self):
-            return None
-
-        def wait(self, timeout=None):
-            return 0
+    _patch_agentic_process(
+        monkeypatch,
+        server_pid=123,
+        terminate=lambda proc, label: terminated.append((proc.pid, label)),
+    )
+    _patch_replay_outputs(monkeypatch)
 
     class BrokenSampler:
         def stop(self):
             raise RuntimeError("sample failed")
-
-    def fake_spawn(_cmd, stdout_path, stderr_path, env=None):
-        stdout_path.write_text("")
-        stderr_path.write_text("")
-        return DummyProc()
-
-    def fake_replay_requests(*, run_dir, target, **_kwargs):
-        req = {
-            "idx": 1,
-            "method": "POST",
-            "path": "/v1/chat/completions",
-            "stream": True,
-            "headers": {"Content-Type": "application/json"},
-            "body": {
-                "model": target,
-                "messages": [{"role": "user", "content": "hi"}],
-                "stream": True,
-            },
-            "body_bytes": 80,
-        }
-        (run_dir / "requests").mkdir(exist_ok=True)
-        (run_dir / "sse").mkdir(exist_ok=True)
-        (run_dir / "requests" / "001.json").write_text(json.dumps(req))
-        (run_dir / "sse" / "001.jsonl").write_text(
-            "\n".join(
-                [
-                    json.dumps({"type": "first_byte", "t_ms": 10.0}),
-                    json.dumps(
-                        {
-                            "type": "event",
-                            "t_ms": 20.0,
-                            "payload": {
-                                "data": {
-                                    "choices": [{"delta": {"content": "ok"}}],
-                                    "usage": {
-                                        "prompt_tokens": 4,
-                                        "completion_tokens": 1,
-                                    },
-                                }
-                            },
-                        }
-                    ),
-                    json.dumps({"type": "end", "t_ms": 30.0}),
-                ]
-            )
-            + "\n"
-        )
-        return 1, 0.03
-
-    monkeypatch.setattr(agentic_trace, "_spawn", fake_spawn)
-    monkeypatch.setattr(agentic_trace, "_run_replay_requests", fake_replay_requests)
     monkeypatch.setattr(agentic_trace, "_start_system_sampler", lambda **_kwargs: BrokenSampler())
 
     rc = agentic_trace.replay_main(

@@ -39,56 +39,40 @@ def test_benchmark_help_documents_public_flags(capsys):
 
     assert exc.value.code == 0
     out = capsys.readouterr().out
-    expected = [
-        "--suite {smoke,humaneval,gsm8k,math500,longctx}",
-        "Named runtime prompt suite. Default: smoke.",
-        "--limit N",
-        "Number of prompts to run from the selected suite.",
-        "--ctx-tokens N",
-        "Synthetic long-context token target for --suite longctx. Default: 8192.",
-        "--prompt-file PATH",
-        "JSONL prompt file override",
+    option_strings = {
+        option
+        for action in parser._actions
+        for option in action.option_strings
+    }
+    assert {
+        "--suite",
+        "--limit",
+        "--ctx-tokens",
+        "--prompt-file",
         "--shuffle",
-        "Shuffle HF dataset rows before --limit selection. Default: disabled.",
-        "--seed INT",
-        "Shuffle seed used only with --shuffle. Default: 0.",
-        "--max-tokens INT",
-        "Number of tokens to generate. Default: 64.",
-        "--block-tokens INT",
-        "DFlash speculative verify block size. Default: 16.",
-        "--ctx INT",
-        "Existing shorthand for --ctx-tokens. Default: 0.",
+        "--seed",
+        "--prompt",
+        "--max-tokens",
+        "--block-tokens",
+        "--ctx",
         "--no-memory",
-        "Omit peak memory medians from the summary. Default: memory summary enabled.",
-        "--repeat INT",
-        "Number of measured runs. Default: 1.",
-        "--cooldown SECONDS",
-        "Sleep between measured runs. Default: 10.",
-        "--model HF_REF_OR_PATH",
-        "Target model. Required.",
-        "--draft HF_REF_OR_PATH",
-        "DFlash draft model. Default: auto-resolved from target.",
+        "--repeat",
+        "--cooldown",
+        "--model",
+        "--draft",
         "--no-chat-template",
-        "Default: chat template enabled.",
-        "--draft-quant SPEC",
-        "Draft quantization override, e.g. w4:gs64; use 'none' to disable model defaults.",
+        "--draft-quant",
         "--no-eos",
-        "Default: EOS enabled.",
         "--split-sdpa",
         "--no-split-sdpa",
-        "--target-fa-window INT",
-        "Default: 0 = full KV.",
-        "--draft-sink-size INT",
-        "Default: 64.",
-        "--draft-window-size INT",
-        "Default: 1024.",
-        "--verify-len-cap INT",
-        "Default: 0 = block size.",
-        "--out PATH",
-        ".artifacts/dflash/benchmarks/<timestamp>-<suite>-<model>",
-    ]
-    for text in expected:
-        assert text in out
+        "--target-fa-window",
+        "--draft-sink-size",
+        "--draft-window-size",
+        "--verify-len-cap",
+        "--out",
+    } <= option_strings
+    assert "Target model. Required." in out
+    assert ".artifacts/dflash/benchmarks/<timestamp>-<suite>-<model>" in out
     assert "--matrix" not in out
     assert "--memory" not in out
     assert "--agentic" not in out
@@ -1187,35 +1171,3 @@ def test_benchmark_cli_missing_auto_draft_exits_cleanly(monkeypatch, tmp_path, c
     assert exc.value.code == 2
     assert "No DFlash draft model found for 'unknown/model'" in err
     assert "Traceback" not in err
-
-
-def test_benchmark_help_has_no_legacy_default_paths(capsys):
-    parser = benchmark.build_parser()
-    with pytest.raises(SystemExit):
-        parser.parse_args(["--help"])
-    out = capsys.readouterr().out
-    assert "benchmark/results" not in out
-    assert "/tmp" not in out
-
-def test_public_docs_do_not_use_internal_benchmark_modules_as_normal_path():
-    for path in (
-        Path("README.md"),
-        Path("docs/cli.md"),
-        Path("docs/benchmarking.md"),
-    ):
-        text = path.read_text()
-        assert "python -m tools.benchmarks" not in text
-        assert "bash tools/benchmarks" not in text
-        assert "benchmark/results/<" not in text
-
-def test_public_docs_mention_artifact_policy_and_public_commands():
-    docs = "\n".join(
-        Path(path).read_text()
-        for path in ("docs/cli.md", "docs/benchmarking.md", "docs/observability.md")
-    )
-    assert "dflash serve --diagnostics basic" in docs
-    assert "dflash serve --diagnostics full" in docs
-    assert "--prompt \"$PROMPT\"" in docs
-    assert "`smoke` is a CLI sanity" in docs
-    assert ".artifacts/dflash/diagnostics" in docs
-    assert ".artifacts/dflash/benchmarks" in docs

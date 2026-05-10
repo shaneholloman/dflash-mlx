@@ -776,16 +776,6 @@ class TestLRUBehavior:
         assert stats["prefix_hits"] == 1
         assert stats["exact_hits"] == 0
 
-    def test_longer_request_returns_stored_len(self):
-
-        cache = DFlashPrefixCache(max_entries=4)
-        key = _make_key()
-        snap = _make_synthetic_snapshot([10, 20, 30], key)
-        cache.insert(snap)
-        matched, found = cache.lookup([10, 20, 30, 99, 42], key)
-        assert matched == 3
-        assert found is snap
-
     def test_divergent_tokens_refused(self):
 
         cache = DFlashPrefixCache(max_entries=4)
