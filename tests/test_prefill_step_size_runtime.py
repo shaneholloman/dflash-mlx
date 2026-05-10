@@ -431,6 +431,49 @@ def test_runtime_prefill_accounting_reports_warm_restore():
     assert prefill_event.prefill_tokens_computed == 4
 
 
+def test_warm_exact_hit_skips_prefill_republish():
+    target_ops = _FakeTargetOps()
+    draft_backend = _FakeDraftBackend()
+    draft_model = _draft_model()
+    prefix_snapshot = _prefix_snapshot(
+        token_ids=(1, 2),
+        last_logits=mx.zeros((1, 8), dtype=mx.float32),
+    )
+    cache = DFlashPrefixCache(max_entries=4)
+    snapshot_service = _snapshot_service(draft_model, cache=cache)
+    context = build_runtime_context(
+        runtime_config_from_profile(
+            profile="balanced",
+            prefill_step_size=4,
+            prefix_cache=True,
+            prefix_cache_l2=False,
+        )
+    )
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=draft_model,
+            draft_backend=draft_backend,
+            prompt="unused",
+            max_new_tokens=0,
+            prompt_tokens_override=[1, 2],
+            prefix_snapshot=prefix_snapshot,
+            snapshot_service=snapshot_service,
+            stable_prefix_len=2,
+            prefix_cache_active=True,
+            runtime_context=context,
+        )
+    )
+
+    assert not any(
+        isinstance(event, SnapshotPublishedEvent) and event.kind == "prefill"
+        for event in events
+    )
+
+
 def test_prefix_snapshot_hydration_failure_raises():
     target_ops = _FakeTargetOps()
     draft_backend = _FakeDraftBackend()

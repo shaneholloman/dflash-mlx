@@ -13,10 +13,12 @@ import mlx.core as mx
 
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
 
+FAState = tuple[mx.array, mx.array, int] | tuple[mx.array, mx.array, int, int]
+
 @dataclass
 class DFlashPrefixSnapshot:
     token_ids: tuple[int, ...]
-    fa_states: tuple[Optional[tuple[mx.array, mx.array, int]], ...]
+    fa_states: tuple[Optional[FAState], ...]
     gdn_states: tuple[Optional[tuple[Optional[mx.array], ...]], ...]
     target_hidden_chunks: tuple[mx.array, ...]
     target_hidden_chunk_spans: tuple[tuple[int, int], ...]
@@ -40,7 +42,7 @@ class DFlashPrefixSnapshot:
         fa_bytes = 0
         for fa in self.fa_states:
             if fa is not None:
-                k, v, _ = fa
+                k, v = fa[0], fa[1]
                 fa_bytes += int(k.nbytes) + int(v.nbytes)
         gdn_bytes = 0
         for gdn in self.gdn_states:

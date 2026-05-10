@@ -19,7 +19,7 @@ from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
 from dflash_mlx.cache.snapshot_service import SnapshotService
 from dflash_mlx.server.prefix_cache_manager import (
     build_prefix_key,
-    chat_template_marker_ids,
+    chat_template_stable_marker,
 )
 
 def compute_stable_prefix_len(
@@ -27,15 +27,17 @@ def compute_stable_prefix_len(
     *,
     im_start_id: Optional[int] = None,
     assistant_id: Optional[int] = None,
+    boundary_offset: int = 0,
 ) -> int:
     if im_start_id is None or assistant_id is None:
         return len(tokens)
     n = len(tokens)
     if n < 2:
         return n
+    offset = max(0, int(boundary_offset))
     for i in range(n - 2, -1, -1):
         if tokens[i] == im_start_id and tokens[i + 1] == assistant_id:
-            return i
+            return min(n, i + offset)
     return n
 
 @dataclass
@@ -89,11 +91,12 @@ class PrefixCacheFlow:
         if cache_manager is None:
             return cls(cache_manager=None)
 
-        im_start_id, assistant_id = chat_template_marker_ids(tokenizer)
+        im_start_id, assistant_id, boundary_offset = chat_template_stable_marker(tokenizer)
         stable_prefix_len = compute_stable_prefix_len(
             prompt,
             im_start_id=im_start_id,
             assistant_id=assistant_id,
+            boundary_offset=boundary_offset,
         )
         lookup_tokens = prompt[:stable_prefix_len]
         try:

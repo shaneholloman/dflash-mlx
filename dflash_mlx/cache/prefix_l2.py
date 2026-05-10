@@ -28,11 +28,11 @@ from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
 
 _LOG = logging.getLogger(__name__)
 
-L2_SCHEMA_VERSION = 1
+L2_SCHEMA_VERSION = 2
 L2_FILE_SUFFIX = ".safetensors"
 L2_TMP_SUFFIX = ".tmp.safetensors"
 L2_LOCK_NAME = ".dflash_l2.lock"
-L2_LAYOUT_ROOT = "v1"
+L2_LAYOUT_ROOT = "v2"
 
 _VALID_KINDS = ("prefill", "generation")
 _HEX = set("0123456789abcdef")
@@ -159,15 +159,18 @@ def _serialize(snapshot: DFlashPrefixSnapshot) -> tuple[dict[str, mx.array], dic
     arrays: dict[str, mx.array] = {}
     fa_present: list[bool] = []
     fa_offsets: dict[str, int] = {}
+    fa_indices: dict[str, int] = {}
     for i, fa in enumerate(snapshot.fa_states):
         if fa is None:
             fa_present.append(False)
         else:
-            k, v, offset = fa
+            k, v, offset = fa[:3]
             arrays[f"fa_{i}_k"] = k
             arrays[f"fa_{i}_v"] = v
             fa_present.append(True)
             fa_offsets[str(i)] = int(offset)
+            if len(fa) > 3:
+                fa_indices[str(i)] = int(fa[3])
 
     gdn_present: list[bool] = []
     gdn_arity: list[int] = []
@@ -208,6 +211,7 @@ def _serialize(snapshot: DFlashPrefixSnapshot) -> tuple[dict[str, mx.array], dic
         "created_at": float(snapshot.created_at),
         "fa_present": fa_present,
         "fa_offsets": fa_offsets,
+        "fa_indices": fa_indices,
         "gdn_present": gdn_present,
         "gdn_arity": gdn_arity,
         "gdn_array_present": gdn_array_present,
@@ -229,7 +233,8 @@ def _deserialize(arrays: dict[str, mx.array], meta: dict[str, Any]) -> DFlashPre
 
     fa_present = meta["fa_present"]
     fa_offsets = meta.get("fa_offsets", {}) or {}
-    fa_states: list[Optional[tuple[mx.array, mx.array, int]]] = []
+    fa_indices = meta.get("fa_indices", {}) or {}
+    fa_states = []
     for i, present in enumerate(fa_present):
         if not present:
             fa_states.append(None)
@@ -237,9 +242,12 @@ def _deserialize(arrays: dict[str, mx.array], meta: dict[str, Any]) -> DFlashPre
             k_name = f"fa_{i}_k"
             v_name = f"fa_{i}_v"
             offset = int(fa_offsets.get(str(i), 0))
-            fa_states.append(
-                (_clone(arrays[k_name], k_name), _clone(arrays[v_name], v_name), offset)
-            )
+            k = _clone(arrays[k_name], k_name)
+            v = _clone(arrays[v_name], v_name)
+            if str(i) in fa_indices:
+                fa_states.append((k, v, offset, int(fa_indices[str(i)])))
+            else:
+                fa_states.append((k, v, offset))
 
     gdn_present = meta["gdn_present"]
     gdn_arity = meta["gdn_arity"]

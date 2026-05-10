@@ -431,7 +431,17 @@ class SpeculativeSession:
         if hasattr(mx, "clear_cache"):
             mx.clear_cache()
 
-        if supports_prefix_snapshot:
+        exact_snapshot_restore = bool(
+            snap_prefix_len > 0 and snap_prefix_len == snapshot_boundary
+        )
+        if (
+            exact_snapshot_restore
+            and snapshot_service is not None
+            and prefix_snapshot is not None
+            and prefix_snapshot.last_logits is None
+        ):
+            raise ValueError("prefill snapshot requires last_logits")
+        if supports_prefix_snapshot and not exact_snapshot_restore:
             _snapshot_build = yield_pause.mark()
             snapshot_event = _publish_snapshot_event(
                 token_ids=list(prompt_tokens[:snapshot_boundary]),

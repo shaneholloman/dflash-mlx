@@ -430,6 +430,7 @@ def test_benchmark_summary_markdown_handles_missing_metrics():
             "max_tokens": 8,
             "block_tokens": 16,
             "prompt_count": 1,
+            "draft_quant": "w4",
             "prompt_tokenization_mode": "chat_template",
         },
         "summary": {
@@ -448,6 +449,7 @@ def test_benchmark_summary_markdown_handles_missing_metrics():
     text = benchmark_report.summary_markdown(result)
 
     assert "| smoke | 1 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a |" in text
+    assert "- draft_quant: w4" in text
 
 def test_benchmark_manifest_config_fields_are_suite_aware(monkeypatch):
     monkeypatch.setattr(
@@ -513,8 +515,10 @@ def test_benchmark_runs_json_rows_keep_provenance():
     ]
     parser = benchmark.build_parser()
     args = benchmark._finalize_benchmark_args(
-        parser.parse_args(["--suite", "smoke", "--model", "m", "--draft", "d"]),
-        ["--suite", "smoke", "--model", "m", "--draft", "d"],
+        parser.parse_args(
+            ["--suite", "smoke", "--model", "m", "--draft", "d", "--draft-quant", "w4"]
+        ),
+        ["--suite", "smoke", "--model", "m", "--draft", "d", "--draft-quant", "w4"],
     )
     result = benchmark_report.suite_report(
         prompts=prompts,
@@ -549,6 +553,7 @@ def test_benchmark_runs_json_rows_keep_provenance():
     assert row["prompt_id"] == "p0"
     assert row["model"] == "m"
     assert row["draft"] == "d"
+    assert row["draft_quant"] == "w4"
     assert row["git_hash"] == "abc123"
     assert row["prompt_tokenization_mode"] == "chat_template"
     assert row["max_tokens"] == 64

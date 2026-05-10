@@ -5,11 +5,12 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 import threading
 
 import mlx.core as mx
 import pytest
-from mlx_lm.models.cache import KVCache
+from mlx_lm.models.cache import KVCache, RotatingKVCache
 
 from dflash_mlx.cache.codecs import (
     PrefixSnapshotBuilder,
@@ -34,6 +35,42 @@ def _make_kv_cache_populated(n_tokens: int = 4, hkv: int = 2, d: int = 8) -> KVC
     cache.offset = n_tokens
     mx.eval(cache.keys, cache.values)
     return cache
+
+def _make_rotating_cache_populated(
+    n_tokens: int = 7,
+    *,
+    max_size: int = 4,
+    keep: int = 1,
+    hkv: int = 2,
+    d: int = 8,
+) -> RotatingKVCache:
+    cache = RotatingKVCache(max_size=max_size, keep=keep)
+    for token in range(n_tokens):
+        base = token * hkv * d
+        keys = (
+            mx.arange(hkv * d, dtype=mx.float32).reshape(1, hkv, 1, d)
+            + float(base)
+        )
+        vals = keys + 1000.0
+        cache.update_and_fetch(keys, vals)
+    mx.eval(cache.keys, cache.values)
+    return cache
+
+def _append_rotating_token(
+    cache: RotatingKVCache,
+    token: int,
+    *,
+    hkv: int = 2,
+    d: int = 8,
+) -> None:
+    base = token * hkv * d
+    keys = (
+        mx.arange(hkv * d, dtype=mx.float32).reshape(1, hkv, 1, d)
+        + float(base)
+    )
+    vals = keys + 1000.0
+    cache.update_and_fetch(keys, vals)
+    mx.eval(cache.keys, cache.values)
 
 def _make_gdn_cache_populated(size: int = 3, conv_k: int = 4) -> RecurrentRollbackCache:
     cache = RecurrentRollbackCache(size=size, conv_kernel_size=conv_k)
@@ -179,6 +216,238 @@ class TestSerializeHydrate:
         h_k, h_v = hydrated[0].state
         assert mx.all(src_k == h_k).item()
         assert mx.all(src_v == h_v).item()
+
+    def test_rotating_kv_round_trip_uses_temporal_order(self):
+        src = [_make_rotating_cache_populated(n_tokens=7, max_size=4, keep=1)]
+        assert target_cache_is_serializable(src) is False
+        assert target_cache_is_serializable(src, allow_rotating=True)
+        fa, gdn = serialize_target_cache(src)
+        assert fa[0] is not None
+        assert gdn[0] is None
+        k, v, offset = fa[0][:3]
+        assert offset == 7
+        assert k.shape[2] == 4
+        assert fa[0][3] == src[0]._idx
+
+        template = [RotatingKVCache(max_size=4, keep=1)]
+        snapshot = _make_full_hidden_snapshot(
+            token_ids=tuple(range(7)),
+            fa_states=fa,
+            gdn_states=gdn,
+            target_hidden=mx.zeros((1, 7, 4)),
+            last_logits=mx.zeros((1, 10)),
+            key=_make_key(),
+        )
+        hydrated = hydrate_target_cache(snapshot, template)
+        assert isinstance(hydrated[0], RotatingKVCache)
+        assert hydrated[0].offset == 7
+        assert hydrated[0].max_size == 4
+        assert hydrated[0].keep == 1
+        src_k = src[0]._temporal_order(src[0].keys)
+        src_v = src[0]._temporal_order(src[0].values)
+        h_k = hydrated[0]._temporal_order(hydrated[0].keys)
+        h_v = hydrated[0]._temporal_order(hydrated[0].values)
+        assert hydrated[0]._idx == src[0]._idx
+        assert mx.all(src_k == h_k).item()
+        assert mx.all(src_v == h_v).item()
+
+        _append_rotating_token(src[0], 7)
+        _append_rotating_token(hydrated[0], 7)
+        src_k = src[0]._temporal_order(src[0].keys)
+        h_k = hydrated[0]._temporal_order(hydrated[0].keys)
+        assert hydrated[0].offset == src[0].offset
+        assert mx.all(src_k == h_k).item()
+
+    def test_rotating_kv_round_trip_before_window_wrap(self):
+        src = [_make_rotating_cache_populated(n_tokens=3, max_size=8, keep=1)]
+        fa, gdn = serialize_target_cache(src)
+        k, _v, offset = fa[0][:3]
+        assert offset == 3
+        assert k.shape[2] == 8
+        snapshot = _make_full_hidden_snapshot(
+            token_ids=(0, 1, 2),
+            fa_states=fa,
+            gdn_states=gdn,
+            target_hidden=mx.zeros((1, 3, 4)),
+            last_logits=mx.zeros((1, 10)),
+            key=_make_key(),
+        )
+        hydrated = hydrate_target_cache(
+            snapshot,
+            [RotatingKVCache(max_size=8, keep=1)],
+        )
+        assert isinstance(hydrated[0], RotatingKVCache)
+        assert hydrated[0].offset == 3
+        assert hydrated[0]._idx == 3
+        assert mx.all(
+            src[0]._temporal_order(src[0].keys)
+            == hydrated[0]._temporal_order(hydrated[0].keys)
+        ).item()
+        assert mx.all(
+            src[0]._temporal_order(src[0].values)
+            == hydrated[0]._temporal_order(hydrated[0].values)
+        ).item()
+
+    def test_rotating_kv_round_trip_preserves_ring_index_for_masks(self):
+        src = [_make_rotating_cache_populated(n_tokens=8, max_size=4, keep=1)]
+        fa, gdn = serialize_target_cache(src)
+        assert fa[0][3] == src[0]._idx
+        snapshot = _make_full_hidden_snapshot(
+            token_ids=tuple(range(8)),
+            fa_states=fa,
+            gdn_states=gdn,
+            target_hidden=mx.zeros((1, 8, 4)),
+            last_logits=mx.zeros((1, 10)),
+            key=_make_key(),
+        )
+        hydrated = hydrate_target_cache(
+            snapshot,
+            [RotatingKVCache(max_size=4, keep=1)],
+        )
+        assert isinstance(hydrated[0], RotatingKVCache)
+        assert hydrated[0]._idx == src[0]._idx
+        src_mask = src[0].make_mask(1, window_size=2)
+        hydrated_mask = hydrated[0].make_mask(1, window_size=2)
+        assert mx.all(src_mask == hydrated_mask).item()
+
+    def test_rotating_kv_round_trip_clone_isolated(self):
+        src = [_make_rotating_cache_populated(n_tokens=7, max_size=4, keep=1)]
+        fa, gdn = serialize_target_cache(src)
+        snap_k, snap_v = fa[0][0], fa[0][1]
+        src[0].keys = mx.zeros_like(src[0].keys)
+        src[0].values = mx.zeros_like(src[0].values)
+        mx.eval(src[0].keys, src[0].values)
+        assert not mx.all(snap_k == 0).item()
+        assert not mx.all(snap_v == 0).item()
+        snapshot = _make_full_hidden_snapshot(
+            token_ids=tuple(range(7)),
+            fa_states=fa,
+            gdn_states=gdn,
+            target_hidden=mx.zeros((1, 7, 4)),
+            last_logits=mx.zeros((1, 10)),
+            key=_make_key(),
+        )
+        hydrated = hydrate_target_cache(
+            snapshot,
+            [RotatingKVCache(max_size=4, keep=1)],
+        )
+        assert not mx.all(hydrated[0].keys == 0).item()
+        assert not mx.all(hydrated[0].values == 0).item()
+
+    def test_rotating_and_gdn_mixed_round_trip(self):
+        src = [
+            _make_rotating_cache_populated(n_tokens=7, max_size=4, keep=1),
+            _make_gdn_cache_populated(),
+        ]
+        fa, gdn = serialize_target_cache(src)
+        snapshot = _make_full_hidden_snapshot(
+            token_ids=tuple(range(7)),
+            fa_states=fa,
+            gdn_states=gdn,
+            target_hidden=mx.zeros((1, 7, 4)),
+            last_logits=mx.zeros((1, 10)),
+            key=_make_key(),
+        )
+        hydrated = hydrate_target_cache(
+            snapshot,
+            [
+                RotatingKVCache(max_size=4, keep=1),
+                RecurrentRollbackCache(size=3, conv_kernel_size=4),
+            ],
+        )
+        assert isinstance(hydrated[0], RotatingKVCache)
+        assert isinstance(hydrated[1], RecurrentRollbackCache)
+        assert mx.all(
+            src[0]._temporal_order(src[0].keys)
+            == hydrated[0]._temporal_order(hydrated[0].keys)
+        ).item()
+        for a, b in zip(src[1].cache, hydrated[1].cache):
+            if a is None:
+                assert b is None
+            else:
+                assert mx.all(a == b).item()
+
+    def test_rotating_hydrate_missing_state_fails_fast(self):
+        snapshot = _make_full_hidden_snapshot(
+            token_ids=(1, 2, 3),
+            fa_states=(None,),
+            gdn_states=(None,),
+            target_hidden=mx.zeros((1, 3, 4)),
+            last_logits=mx.zeros((1, 10)),
+            key=_make_key(),
+        )
+        with pytest.raises(ValueError, match="missing rotating FA state"):
+            hydrate_target_cache(
+                snapshot,
+                [RotatingKVCache(max_size=4, keep=1)],
+            )
+
+    def test_rotating_hydrate_missing_ring_index_fails_fast(self):
+        src = [_make_rotating_cache_populated(n_tokens=7, max_size=4, keep=1)]
+        fa, gdn = serialize_target_cache(src)
+        k, v, offset = fa[0][:3]
+        snapshot = _make_full_hidden_snapshot(
+            token_ids=tuple(range(7)),
+            fa_states=((k, v, offset),),
+            gdn_states=gdn,
+            target_hidden=mx.zeros((1, 7, 4)),
+            last_logits=mx.zeros((1, 10)),
+            key=_make_key(),
+        )
+
+        with pytest.raises(ValueError, match="missing rotating FA ring index"):
+            hydrate_target_cache(
+                snapshot,
+                [RotatingKVCache(max_size=4, keep=1)],
+            )
+
+    def test_mixed_full_attention_draft_snapshot_keeps_full_target_hidden(self):
+        target_hidden = mx.zeros((1, 100, 4), dtype=mx.float32)
+        draft_model = SimpleNamespace(
+            args=SimpleNamespace(
+                layer_types=("sliding_attention", "full_attention"),
+                sliding_window=16,
+            )
+        )
+        snapshot = build_snapshot(
+            token_ids=list(range(100)),
+            target_cache=[_make_kv_cache_populated(n_tokens=100)],
+            target_hidden=target_hidden,
+            last_logits=mx.zeros((1, 10), dtype=mx.float32),
+            key=_make_key(),
+            draft_model=draft_model,
+            draft_sink_size=4,
+            draft_window_size=16,
+            allow_full_attention_context=True,
+        )
+
+        assert len(snapshot.target_hidden_chunks) == 1
+        assert snapshot.target_hidden_chunk_spans == ((0, 100),)
+        assert snapshot.target_hidden_total_len == 100
+
+    def test_mixed_full_attention_draft_snapshot_stays_trimmed_when_not_allowed(self):
+        target_hidden = mx.zeros((1, 100, 4), dtype=mx.float32)
+        draft_model = SimpleNamespace(
+            args=SimpleNamespace(
+                layer_types=("sliding_attention", "full_attention"),
+                sliding_window=16,
+            )
+        )
+        snapshot = build_snapshot(
+            token_ids=list(range(100)),
+            target_cache=[_make_kv_cache_populated(n_tokens=100)],
+            target_hidden=target_hidden,
+            last_logits=mx.zeros((1, 10), dtype=mx.float32),
+            key=_make_key(),
+            draft_model=draft_model,
+            draft_sink_size=4,
+            draft_window_size=16,
+            allow_full_attention_context=False,
+        )
+
+        assert len(snapshot.target_hidden_chunks) == 2
+        assert snapshot.target_hidden_chunk_spans == ((0, 4), (84, 100))
+        assert snapshot.target_hidden_total_len == 100
 
     def test_gdn_only_round_trip(self):
         src = [_make_gdn_cache_populated(size=3, conv_k=4)]
@@ -568,6 +837,57 @@ class TestStablePrefixLen:
 
         assert s2 >= s1
 
+    def test_gemma_turn_model_boundary_matches_continuation(self):
+        turn = 105
+        model = 4368
+        newline = 107
+        thought_channel_start = 100
+        thought = 45518
+        channel_end = 101
+        turn1 = [
+            10,
+            11,
+            turn,
+            model,
+            newline,
+            thought_channel_start,
+            thought,
+            newline,
+            channel_end,
+        ]
+        turn2 = [10, 11, turn, model, newline, 2021, 1586, 784]
+
+        s1 = compute_stable_prefix_len(turn1, im_start_id=turn, assistant_id=model)
+        s2 = compute_stable_prefix_len(turn2, im_start_id=turn, assistant_id=model)
+
+        assert s1 == 2
+        assert s2 == 2
+        assert turn1[:s1] == turn2[:s2]
+
+    def test_gemma_turn_model_boundary_offset_keeps_role_line(self):
+        turn = 105
+        model = 4368
+        newline = 107
+        turn1 = [10, 11, turn, model, newline, 100, 45518, newline, 101]
+        turn2 = [10, 11, turn, model, newline, 2021, 1586, 784]
+
+        s1 = compute_stable_prefix_len(
+            turn1,
+            im_start_id=turn,
+            assistant_id=model,
+            boundary_offset=3,
+        )
+        s2 = compute_stable_prefix_len(
+            turn2,
+            im_start_id=turn,
+            assistant_id=model,
+            boundary_offset=3,
+        )
+
+        assert s1 == 5
+        assert s2 == 5
+        assert turn1[:s1] == turn2[:s2]
+
     def test_tuple_input(self):
 
         tokens = (10, 11, self.IM_START, self.ASST, 300)
@@ -664,7 +984,7 @@ class TestPrefixPruning:
         assert cache.stats()["evictions"] == 0
 
 class TestCrossKindPrune:
-    def test_generation_prunes_dominated_prefill(self):
+    def test_generation_keeps_dominated_prefill_for_exact_prompt_reuse(self):
 
         cache = DFlashPrefixCache(max_entries=8, max_bytes=8 * 1024 * 1024 * 1024)
         key = _make_key()
@@ -673,8 +993,16 @@ class TestCrossKindPrune:
 
         cache.insert(prefill)
         cache.insert(generation)
-        assert cache.stats()["current_entries"] == 1
-        assert cache.stats()["cross_kind_prunes"] == 1
+        assert cache.stats()["current_entries"] == 2
+        assert cache.stats()["cross_kind_prunes"] == 0
+
+        exact_len, exact_snapshot = cache.lookup([1, 2, 3], key)
+        assert exact_len == 3
+        assert exact_snapshot is prefill
+
+        prefix_len, prefix_snapshot = cache.lookup([1, 2, 3, 4, 5, 6], key)
+        assert prefix_len == 5
+        assert prefix_snapshot is generation
 
     def test_disabled_keeps_both_kinds(self):
         cache = DFlashPrefixCache(
@@ -795,3 +1123,63 @@ class TestByteBudget:
         assert stats["evictions"] == 1
         assert stats["byte_budget_evictions"] == 1
         assert stats["current_bytes"] <= cache._max_bytes
+
+    def test_generation_yields_to_matching_prefill_under_byte_pressure(self):
+        key = _make_key()
+        prefill = _make_synthetic_snapshot([1, 2, 3], key, kind="prefill")
+        generation = _make_synthetic_snapshot(
+            [1, 2, 3, 4, 5],
+            key,
+            kind="generation",
+        )
+        cache = DFlashPrefixCache(
+            max_entries=999,
+            max_bytes=max(prefill.nbytes, generation.nbytes) + 1,
+        )
+
+        assert cache.insert(prefill)
+        result = cache.insert_with_evictions(generation)
+
+        assert result.admitted is False
+        assert result.inserted_evicted_snapshot is generation
+        exact_len, exact = cache.lookup([1, 2, 3], key)
+        assert exact_len == 3
+        assert exact is prefill
+        prefix_len, prefix = cache.lookup([1, 2, 3, 9], key)
+        assert prefix_len == 3
+        assert prefix is prefill
+        stats = cache.stats()
+        assert stats["current_entries"] == 1
+        assert stats["evictions"] == 1
+        assert stats["byte_budget_evictions"] == 1
+
+    def test_generation_coexists_with_prefill_when_unrelated_entry_can_evict(self):
+        key = _make_key()
+        prefill = _make_synthetic_snapshot([1, 2, 3], key, kind="prefill")
+        generation = _make_synthetic_snapshot(
+            [1, 2, 3, 4, 5],
+            key,
+            kind="generation",
+        )
+        unrelated = _make_synthetic_snapshot([9, 9, 9], key, kind="prefill")
+        cache = DFlashPrefixCache(
+            max_entries=999,
+            max_bytes=prefill.nbytes + generation.nbytes + 1,
+        )
+
+        assert cache.insert(unrelated)
+        assert cache.insert(prefill)
+        result = cache.insert_with_evictions(generation)
+
+        assert result.admitted is True
+        assert result.inserted_evicted_snapshot is None
+        exact_len, exact = cache.lookup([1, 2, 3], key)
+        assert exact_len == 3
+        assert exact is prefill
+        prefix_len, prefix = cache.lookup([1, 2, 3, 4, 5, 6], key)
+        assert prefix_len == 5
+        assert prefix is generation
+        stats = cache.stats()
+        assert stats["current_entries"] == 2
+        assert stats["evictions"] == 1
+        assert stats["byte_budget_evictions"] == 1

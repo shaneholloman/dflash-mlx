@@ -222,7 +222,18 @@ def _kv_cache_nbytes(cache: Any) -> int:
         total += tree_nbytes([getattr(cache, "keys", None), getattr(cache, "values", None)])
     state = None
     if inspect.getattr_static(cache, "state", _MISSING) is not _MISSING:
-        state = getattr(cache, "state")
+        try:
+            state = getattr(cache, "state")
+        except AttributeError:
+            keys_attr = inspect.getattr_static(cache, "keys", _MISSING)
+            values_attr = inspect.getattr_static(cache, "values", _MISSING)
+            if (
+                keys_attr is _MISSING
+                or values_attr is _MISSING
+                or getattr(cache, "keys") is not None
+                or getattr(cache, "values") is not None
+            ):
+                raise
     if state is not None:
         total += tree_nbytes(state)
     return int(total)

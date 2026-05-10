@@ -120,6 +120,11 @@ Each public benchmark run writes:
 - `summary.json` - aggregate numbers;
 - `summary.md` - human-readable report.
 
+When comparing `--draft-quant`, use separate artifact directories. Compact
+reports include the selected `draft_quant` value in `summary.md` and
+`runs.jsonl` so quantized and non-quantized runs do not collapse into the same
+row during review.
+
 The artifact directory is local by default. New raw benchmark outputs should not
 be committed.
 

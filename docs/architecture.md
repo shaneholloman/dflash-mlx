@@ -59,9 +59,14 @@ row. The required seam for more architectures is:
 - cache adapter: active cache type, rollback behavior, and snapshot codec;
 - parity tests: adapter logits must match the model's own MLX forward path.
 
-Gemma4 is supported through its own adapter. Prefix snapshots stay disabled for
-Gemma4 until snapshot parity is proven. Future adapters must prove load and
-parity before becoming product-supported targets.
+Gemma4 is supported through its own adapter. Prefix snapshots are enabled for
+Gemma4 configs only when the adapter can prove known non-shared KV
+(`num_kv_shared_layers == 0`); shared-KV, missing, or malformed capability data
+fails closed. Product `dflash serve` diagnostics have verified exact repeated
+prompt restore and stable long-chat continuation restore for the current Gemma4
+31B and 26B-A4B targets, without turning those diagnostics into public
+throughput claims. Future adapters must prove load, cache policy, and parity
+before becoming product-supported targets.
 
 Contributor workflow for a future target family is documented in
 [`docs/model_backend.md`](model_backend.md).

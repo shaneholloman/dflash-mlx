@@ -120,6 +120,7 @@ def flatten_prompt_runs(
             row["model"] = suite_config.get("model")
             row["draft"] = suite_config.get("draft")
             row["git_hash"] = suite_config.get("git_hash")
+            row["draft_quant"] = suite_config.get("draft_quant")
             row["prompt_tokenization_mode"] = suite_config.get("prompt_tokenization_mode")
             row["max_tokens"] = suite_config.get("max_tokens")
             row["block_tokens"] = suite_config.get("block_tokens")
@@ -195,6 +196,7 @@ def summary_markdown(result: dict[str, Any]) -> str:
         f"- suite: {config.get('suite')}",
         f"- model: {config.get('model')}",
         f"- draft: {config.get('draft')}",
+        f"- draft_quant: {config.get('draft_quant')}",
         f"- git_hash: {config.get('git_hash')}",
         f"- max_tokens: {config.get('max_tokens')}",
         f"- block_tokens: {config.get('block_tokens')}",

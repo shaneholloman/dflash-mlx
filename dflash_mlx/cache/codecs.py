@@ -11,7 +11,7 @@ import mlx.core as mx
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
-from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
+from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot, FAState
 from dflash_mlx.engine.config import _effective_draft_window_size
 from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
 
@@ -40,7 +40,23 @@ def _resolve_effective_trim_window(
         context_len=int(total_len),
         allow_full_attention_context=allow_full_attention_context,
     )
+    if _requires_full_target_hidden(
+        draft_model,
+        allow_full_attention_context=allow_full_attention_context,
+    ):
+        effective = max(effective, int(total_len))
     return max(0, int(sink)), max(0, int(effective))
+
+def _requires_full_target_hidden(
+    draft_model: Any,
+    *,
+    allow_full_attention_context: bool,
+) -> bool:
+    if not allow_full_attention_context:
+        return False
+    args = getattr(draft_model, "args", None)
+    layer_types = tuple(str(kind) for kind in (getattr(args, "layer_types", ()) or ()))
+    return any(kind == "full_attention" for kind in layer_types)
 
 def _build_target_hidden_chunks(
     target_hidden: mx.array,
@@ -76,11 +92,17 @@ def _build_target_hidden_chunks(
         total_len,
     )
 
-def target_cache_is_serializable(target_cache: list[Any]) -> bool:
+def target_cache_is_serializable(
+    target_cache: list[Any],
+    *,
+    allow_rotating: bool = False,
+) -> bool:
     for entry in target_cache:
         if isinstance(entry, RecurrentRollbackCache):
             continue
         if isinstance(entry, RotatingKVCache):
+            if allow_rotating:
+                continue
             return False
         if isinstance(entry, KVCache):
             continue
@@ -90,15 +112,31 @@ def target_cache_is_serializable(target_cache: list[Any]) -> bool:
 def serialize_target_cache(
     target_cache: list[Any],
 ) -> tuple[
-    tuple[Optional[tuple[mx.array, mx.array, int]], ...],
+    tuple[Optional[FAState], ...],
     tuple[Optional[tuple[Optional[mx.array], ...]], ...],
 ]:
-    fa: list[Optional[tuple[mx.array, mx.array, int]]] = []
+    fa: list[Optional[FAState]] = []
     gdn: list[Optional[tuple[Optional[mx.array], ...]]] = []
     for layer_idx, entry in enumerate(target_cache):
         if isinstance(entry, RecurrentRollbackCache):
             fa.append(None)
             gdn.append(tuple(_clone_array(a) for a in entry.cache))
+        elif isinstance(entry, RotatingKVCache):
+            keys = getattr(entry, "keys", None)
+            values = getattr(entry, "values", None)
+            if keys is None or values is None:
+                fa.append(None)
+                gdn.append(None)
+            else:
+                fa.append(
+                    (
+                        _clone_array(keys),
+                        _clone_array(values),
+                        int(entry.offset),
+                        int(entry._idx),
+                    )
+                )
+                gdn.append(None)
         elif isinstance(entry, KVCache):
             state = entry.state
             if state is None or state[0] is None:
@@ -142,11 +180,28 @@ def hydrate_target_cache(
         elif isinstance(tmpl, KVCache):
             if fa_state is None:
                 raise ValueError(f"Snapshot missing FA state at layer {i}")
-            k, v, offset = fa_state
+            k, v, offset = fa_state[:3]
             new_cache = KVCache()
             new_cache.keys = _clone_array(k)
             new_cache.values = _clone_array(v)
             new_cache.offset = offset
+            result.append(new_cache)
+        elif isinstance(tmpl, RotatingKVCache):
+            if fa_state is None:
+                raise ValueError(f"Snapshot missing rotating FA state at layer {i}")
+            if len(fa_state) != 4:
+                raise ValueError(
+                    f"Snapshot missing rotating FA ring index at layer {i}"
+                )
+            k, v, offset = fa_state[:3]
+            new_cache = RotatingKVCache(
+                max_size=int(tmpl.max_size),
+                keep=int(tmpl.keep),
+            )
+            new_cache.keys = _clone_array(k)
+            new_cache.values = _clone_array(v)
+            new_cache.offset = int(offset)
+            new_cache._idx = int(fa_state[3])
             result.append(new_cache)
         else:
             raise TypeError(

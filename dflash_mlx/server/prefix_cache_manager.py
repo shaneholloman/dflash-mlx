@@ -51,20 +51,55 @@ def build_prefix_key(
 def chat_template_marker_ids(
     tokenizer: Any,
 ) -> tuple[int | None, int | None]:
+    marker_start, marker_role, _boundary_offset = chat_template_stable_marker(tokenizer)
+    return marker_start, marker_role
+
+def chat_template_stable_marker(
+    tokenizer: Any,
+) -> tuple[int | None, int | None, int]:
     im_start = None
     assistant = None
     convert = getattr(tokenizer, "convert_tokens_to_ids", None)
     if not callable(convert):
-        return im_start, assistant
+        return im_start, assistant, 0
     try:
         ids = convert(["<|im_start|>", "assistant"])
     except Exception as exc:
         raise RuntimeError("tokenizer failed to resolve chat template marker ids") from exc
     if not isinstance(ids, (list, tuple)):
-        return im_start, assistant
+        return im_start, assistant, 0
     unk_token_id = getattr(tokenizer, "unk_token_id", None)
     if ids and ids[0] is not None and ids[0] != unk_token_id:
         im_start = int(ids[0])
     if ids and len(ids) > 1 and ids[1] is not None and ids[1] != unk_token_id:
         assistant = int(ids[1])
-    return im_start, assistant
+    if im_start is not None and assistant is not None:
+        return im_start, assistant, 0
+
+    gemma_start = None
+    gemma_model = None
+    if im_start is None:
+        try:
+            ids = convert(["<|turn>", "model"])
+        except Exception as exc:
+            raise RuntimeError("tokenizer failed to resolve chat template marker ids") from exc
+        if isinstance(ids, (list, tuple)):
+            if ids and ids[0] is not None and ids[0] != unk_token_id:
+                gemma_start = int(ids[0])
+            if ids and len(ids) > 1 and ids[1] is not None and ids[1] != unk_token_id:
+                gemma_model = int(ids[1])
+    if gemma_start is None or gemma_model is None:
+        return im_start, assistant, 0
+
+    boundary_offset = 2
+    encode = getattr(tokenizer, "encode", None)
+    if callable(encode):
+        try:
+            role_prefix = encode("<|turn>model\n")
+        except Exception as exc:
+            raise RuntimeError("tokenizer failed to resolve chat template marker ids") from exc
+        if isinstance(role_prefix, (list, tuple)) and len(role_prefix) >= 2:
+            role_prefix_ids = tuple(int(x) for x in role_prefix)
+            if role_prefix_ids[:2] == (gemma_start, gemma_model):
+                boundary_offset = len(role_prefix_ids)
+    return gemma_start, gemma_model, int(boundary_offset)

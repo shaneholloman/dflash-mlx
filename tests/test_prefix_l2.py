@@ -12,7 +12,9 @@ from pathlib import Path
 
 import mlx.core as mx
 import pytest
+from mlx_lm.models.cache import RotatingKVCache
 
+from dflash_mlx.cache.codecs import hydrate_target_cache, serialize_target_cache
 from dflash_mlx.cache.prefix_l1 import DFlashPrefixCache
 from dflash_mlx.cache.prefix_l2 import (
     L2_FILE_SUFFIX,
@@ -29,7 +31,9 @@ from dflash_mlx.cache.prefix_l2 import (
 from dflash_mlx.cache.store import PrefixSnapshotStore
 from dflash_mlx.diagnostics import TraceConfig
 from tests.test_prefix_cache import (
+    _make_full_hidden_snapshot,
     _make_key,
+    _make_rotating_cache_populated,
     _make_synthetic_snapshot,
 )
 
@@ -182,6 +186,35 @@ class TestSerializationRoundTrip:
         del snap2
         del loaded_arrays
         assert float(k1[0, 0, 0, 0].item()) == before
+
+    def test_rotating_snapshot_l2_roundtrip_hydrates(self, tmp_path):
+        src = [_make_rotating_cache_populated(n_tokens=7, max_size=4, keep=1)]
+        fa, gdn = serialize_target_cache(src)
+        snap = _make_full_hidden_snapshot(
+            token_ids=tuple(range(7)),
+            fa_states=fa,
+            gdn_states=gdn,
+            target_hidden=mx.zeros((1, 7, 4)),
+            last_logits=mx.zeros((1, 10)),
+            key=_make_key(),
+        )
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            l2._write_one(snap)
+            loaded = l2.lookup(tuple(range(7)), snap.key)
+            assert loaded is not None
+            hydrated = hydrate_target_cache(
+                loaded,
+                [RotatingKVCache(max_size=4, keep=1)],
+            )
+            assert isinstance(hydrated[0], RotatingKVCache)
+            assert hydrated[0].offset == 7
+            assert mx.all(
+                src[0]._temporal_order(src[0].keys)
+                == hydrated[0]._temporal_order(hydrated[0].keys)
+            ).item()
+        finally:
+            l2.shutdown()
 
 class TestL2Lifecycle:
     def test_disabled_when_no_l2_attached(self):

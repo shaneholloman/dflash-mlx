@@ -108,15 +108,21 @@ class Gemma4TargetOps:
 
     def capabilities_for(self, target_model: Any) -> TargetCapabilities:
         args = getattr(self.text_wrapper(target_model), "args", None)
+        shared_kv_layers_raw = getattr(args, "num_kv_shared_layers", None)
+        if type(shared_kv_layers_raw) is int:
+            shared_kv_layers = shared_kv_layers_raw
+        else:
+            shared_kv_layers = -1
+        shared_kv_known = shared_kv_layers >= 0
+        shared_kv = bool(shared_kv_known and shared_kv_layers > 0)
+        prefix_snapshot_safe = bool(shared_kv_known and shared_kv_layers == 0)
         return TargetCapabilities(
             supports_dflash=True,
             supports_recurrent_rollback=False,
             supports_kv_trim=True,
-            supports_prefix_snapshot=False,
-            supports_rotating_cache_snapshot=False,
-            supports_shared_kv=bool(
-                int(getattr(args, "num_kv_shared_layers", 0) or 0) > 0
-            ),
+            supports_prefix_snapshot=prefix_snapshot_safe,
+            supports_rotating_cache_snapshot=prefix_snapshot_safe,
+            supports_shared_kv=shared_kv,
             supports_target_hidden_capture=True,
             supports_verify_linear=True,
             supports_full_context_draft_layers=True,

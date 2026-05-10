@@ -1018,6 +1018,43 @@ class TestContextConfigExposedCorrectly:
         with pytest.raises(RuntimeError, match="chat template marker ids"):
             chat_template_marker_ids(BrokenTokenizer())
 
+    def test_chat_template_marker_ids_falls_back_to_gemma_turn_model(self):
+        from dflash_mlx.server.prefix_cache_manager import (
+            chat_template_marker_ids,
+            chat_template_stable_marker,
+        )
+
+        class GemmaTokenizer:
+            unk_token_id = 3
+
+            def convert_tokens_to_ids(self, tokens):
+                if tokens == ["<|im_start|>", "assistant"]:
+                    return [3, 111457]
+                if tokens == ["<|turn>", "model"]:
+                    return [105, 4368]
+                return [3 for _ in tokens]
+
+            def encode(self, text):
+                if text == "<|turn>model\n":
+                    return [105, 4368, 107]
+                return [3]
+
+        assert chat_template_marker_ids(GemmaTokenizer()) == (105, 4368)
+        assert chat_template_stable_marker(GemmaTokenizer()) == (105, 4368, 3)
+
+    def test_chat_template_stable_marker_keeps_chatml_boundary(self):
+        from dflash_mlx.server.prefix_cache_manager import chat_template_stable_marker
+
+        class QwenTokenizer:
+            unk_token_id = -1
+
+            def convert_tokens_to_ids(self, tokens):
+                if tokens == ["<|im_start|>", "assistant"]:
+                    return [900, 901]
+                return [-1 for _ in tokens]
+
+        assert chat_template_stable_marker(QwenTokenizer()) == (900, 901, 0)
+
     def test_budgets_propagate_to_cache(self, monkeypatch):
         import dflash_mlx.cache.manager as cache_manager_mod
 

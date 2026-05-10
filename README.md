@@ -137,8 +137,23 @@ dflash serve --model mlx-community/Qwen3.6-27B-4bit --enable-thinking
 
 Optimized for Qwen3.5 / Qwen3.6 hybrid GatedDeltaNet + attention targets. Qwen3
 (pure attention) targets work but skip the tape-replay rollback path. Gemma4
-targets use the Gemma4 adapter; prefix snapshots stay disabled for Gemma4 until
-snapshot parity is proven.
+targets use the Gemma4 adapter. Prefix snapshots are enabled only for Gemma4
+configs with known non-shared KV (`num_kv_shared_layers == 0`); shared-KV or
+unknown configs fail closed. Local `dflash serve` diagnostics have verified
+Gemma4 31B and 26B-A4B exact repeated-prompt restore and long-chat continuation
+restore, but those diagnostics are cache-latency evidence, not public benchmark
+throughput claims.
+
+For Gemma4 31B, `--draft-quant w4` is the current measured opt-in when memory
+headroom matters. Keep it explicit and rebenchmark on the target prompt; the
+same option improved 26B-A4B speed in local probes but did not reduce peak
+memory.
+
+For Gemma4 long-context memory pressure, use `--profile low-memory` or keep your
+current profile and set `--prefill-step-size 1024` explicitly. For Gemma4 31B
+under tighter long-context memory limits, `--prefill-step-size 512` reduced peak
+memory and TTFT in local `dflash serve` probes, but it is prompt-sensitive and
+not a public benchmark throughput claim. The balanced default remains `4096`.
 
 | Target | Draft |
 |--------|-------|

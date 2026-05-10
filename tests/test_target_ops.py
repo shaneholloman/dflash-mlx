@@ -271,15 +271,48 @@ def test_qwen_verify_linear_capability_rejects_incomplete_moe_shape():
     else:
         raise AssertionError("incomplete Qwen MoE verify config must fail closed")
 
-def test_gemma4_capabilities_disable_prefix_snapshot_initially():
+def test_gemma4_capabilities_enable_prefix_snapshot_without_shared_kv():
     caps = Gemma4TargetOps().capabilities_for(_FakeGemmaTarget())
 
     assert caps.supports_dflash is True
     assert caps.supports_recurrent_rollback is False
     assert caps.supports_kv_trim is True
-    assert caps.supports_prefix_snapshot is False
+    assert caps.supports_prefix_snapshot is True
+    assert caps.supports_rotating_cache_snapshot is True
+    assert caps.supports_shared_kv is False
     assert caps.supports_target_hidden_capture is True
     assert caps.supports_verify_linear is True
+
+
+def test_gemma4_capabilities_disable_prefix_snapshot_with_shared_kv():
+    target = _FakeGemmaTarget()
+    target.language_model.args.num_kv_shared_layers = 2
+    caps = Gemma4TargetOps().capabilities_for(target)
+
+    assert caps.supports_prefix_snapshot is False
+    assert caps.supports_rotating_cache_snapshot is False
+    assert caps.supports_shared_kv is True
+
+
+def test_gemma4_capabilities_disable_prefix_snapshot_when_shared_kv_unknown():
+    target = _FakeGemmaTarget()
+    delattr(target.language_model.args, "num_kv_shared_layers")
+    caps = Gemma4TargetOps().capabilities_for(target)
+
+    assert caps.supports_prefix_snapshot is False
+    assert caps.supports_rotating_cache_snapshot is False
+    assert caps.supports_shared_kv is False
+
+
+def test_gemma4_capabilities_disable_prefix_snapshot_when_shared_kv_malformed():
+    for raw in ("unknown", "0", 0.0, False):
+        target = _FakeGemmaTarget()
+        target.language_model.args.num_kv_shared_layers = raw
+        caps = Gemma4TargetOps().capabilities_for(target)
+
+        assert caps.supports_prefix_snapshot is False
+        assert caps.supports_rotating_cache_snapshot is False
+        assert caps.supports_shared_kv is False
 
 
 def test_gemma4_make_cache_matches_official_shared_kv_cache_types():

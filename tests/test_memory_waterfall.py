@@ -48,6 +48,19 @@ class BrokenStateKVCache:
     def state(self):
         raise RuntimeError("broken state contract")
 
+class EmptyPropertyStateKVCache:
+    keys = None
+    values = None
+
+    @property
+    def state(self):
+        raise AttributeError("empty cache has no materialized state")
+
+class StateOnlyAttributeErrorCache:
+    @property
+    def state(self):
+        raise AttributeError("broken state accessor")
+
 class FakeRecurrentRollbackCache:
     def __init__(self):
         self.cache = [mx.zeros((1, 2, 3), dtype=mx.float16)]
@@ -70,6 +83,15 @@ def test_draft_cache_bytes_counts_keys_values_and_state():
 def test_draft_cache_bytes_fails_fast_on_broken_state_property():
     with pytest.raises(RuntimeError, match="broken state contract"):
         draft_cache_bytes([BrokenStateKVCache()])
+
+def test_draft_cache_bytes_treats_empty_property_state_as_zero():
+    out = draft_cache_bytes([EmptyPropertyStateKVCache()])
+
+    assert out["draft_kv_bytes"] == 0
+
+def test_draft_cache_bytes_fails_fast_on_state_only_attribute_error():
+    with pytest.raises(AttributeError, match="broken state accessor"):
+        draft_cache_bytes([StateOnlyAttributeErrorCache()])
 
 def test_prefix_cache_memory_bytes_breakdown_and_stats():
     out = prefix_cache_memory_bytes(

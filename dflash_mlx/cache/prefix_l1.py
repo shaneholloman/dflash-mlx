@@ -185,6 +185,35 @@ class DFlashPrefixCache:
                 )
                 return PrefixCacheL1InsertResult(admitted=False)
 
+            if self._incoming_generation_should_yield_to_prefill(snapshot):
+                self._stats["insertions"] += 1
+                self._stats["evictions"] += 1
+                self._stats["byte_budget_evictions"] += 1
+                breakdown = snapshot.nbytes_breakdown()
+                self._log_cache(
+                    op="insert",
+                    kind=snapshot.kind,
+                    prefix_len=int(snapshot.prefix_len),
+                    nbytes=int(snapshot.nbytes),
+                    bytes_fa_kv=int(breakdown.get("fa_kv", 0)),
+                    bytes_gdn_state=int(breakdown.get("gdn_state", 0)),
+                    bytes_target_hidden=int(breakdown.get("target_hidden", 0)),
+                    bytes_last_logits=int(breakdown.get("last_logits", 0)),
+                    entries_before=pre_entries,
+                    entries_after=pre_entries,
+                    pruned=0,
+                    cross_kind_pruned=0,
+                    evicted=1,
+                    byte_budget_evicted=1,
+                    current_bytes=int(self._current_bytes()),
+                    elapsed_us=(time.perf_counter_ns() - t_start) / 1_000.0,
+                )
+                return PrefixCacheL1InsertResult(
+                    admitted=False,
+                    removed_snapshots=(snapshot,),
+                    inserted_evicted_snapshot=snapshot,
+                )
+
             removed_ids = self._prune_dominated_prefixes(snapshot)
             eid = self._next_id
             self._next_id += 1
@@ -246,6 +275,9 @@ class DFlashPrefixCache:
             same_kind = existing.kind == snapshot.kind
             if not same_kind and not self._cross_kind_prune:
                 continue
+            if existing.kind == "prefill" and snapshot.kind == "generation":
+                # Generation snapshots are prefix-only; keep prefill for exact prompt reuse.
+                continue
             n = len(existing.token_ids)
             if n <= len(incoming) and incoming[:n] == existing.token_ids:
                 if same_kind:
@@ -281,6 +313,28 @@ class DFlashPrefixCache:
                     self._stats["byte_budget_evictions"] += 1
                 evicted.append((eid, evicted_snapshot))
         return evicted
+
+    def _incoming_generation_should_yield_to_prefill(
+        self,
+        snapshot: DFlashPrefixSnapshot,
+    ) -> bool:
+        if snapshot.kind != "generation":
+            return False
+        incoming = snapshot.token_ids
+        for existing in self._entries.values():
+            if existing is snapshot:
+                continue
+            if existing.key != snapshot.key or existing.kind != "prefill":
+                continue
+            n = len(existing.token_ids)
+            if (
+                n > 0
+                and n <= len(incoming)
+                and incoming[:n] == existing.token_ids
+                and existing.nbytes + snapshot.nbytes > self._max_bytes
+            ):
+                return True
+        return False
 
     def _current_bytes(self) -> int:
         return sum(s.nbytes for s in self._entries.values())

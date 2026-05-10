@@ -40,6 +40,13 @@ Current profiles:
 
 `clear_cache_boundaries` is currently off in all profiles.
 
+Gemma4 long-context memory-pressure note: use the existing `low-memory` profile,
+or keep another profile and set `--prefill-step-size 1024` explicitly. The
+measured 31B serve probes also showed lower peak memory and TTFT with
+`--prefill-step-size 512` under tighter memory pressure, but validate that on
+your prompt; it is not a balanced-default change or a public benchmark
+throughput claim.
+
 ## `dflash serve`
 
 Core:
@@ -89,6 +96,11 @@ Draft loading:
 | Flag | Meaning |
 | --- | --- |
 | `--draft-quant SPEC` | optional in-memory draft quantization, e.g. `w4:gs64` |
+
+Draft quantization is deliberately explicit. Current Gemma4 probes keep
+`--draft-quant w4` as a 31B memory-headroom option; 26B-A4B should be treated as
+a measured speed tradeoff because its peak memory increased in the local long
+context probe.
 
 Prefix cache:
 
