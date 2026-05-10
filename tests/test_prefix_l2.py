@@ -26,6 +26,7 @@ from dflash_mlx.cache.prefix_l2 import (
     _key_hash,
     _runtime_layout_hash,
     _serialize,
+    _token_hashes_for_lengths,
     _token_hash,
 )
 from dflash_mlx.cache.store import PrefixSnapshotStore
@@ -152,6 +153,17 @@ class TestBfloat16RoundTrip:
         finally:
             l2.shutdown()
 
+class TestTokenHashing:
+    def test_incremental_prefix_hashes_match_existing_token_hash(self):
+        tokens = tuple(range(-5, 25))
+        lengths = {0, 1, 2, 5, 17, len(tokens)}
+
+        hashes = _token_hashes_for_lengths(tokens, lengths)
+
+        assert set(hashes) == lengths
+        for n in lengths:
+            assert hashes[n] == _token_hash(tokens[:n])
+
 class TestSerializationRoundTrip:
     def test_full_snapshot_roundtrip(self, tmp_path):
         snap = _make_synthetic_snapshot([1, 2, 3, 4, 5], _make_key())
@@ -231,8 +243,52 @@ class TestL2Lifecycle:
             key = _make_key()
             cache.insert(_make_synthetic_snapshot([1, 2, 3], key))
             cache.insert(_make_synthetic_snapshot([4, 5, 6], key))
+            _wait_writes(l2, expected=2)
+            assert len(_all_snapshot_files(tmp_path)) == 2
+        finally:
+            l2.shutdown()
+
+    def test_l1_admitted_prefill_writes_through_to_l2(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
+            key = _make_key()
+            cache.insert(_make_synthetic_snapshot([1, 2, 3], key, kind="prefill"))
             _wait_writes(l2, expected=1)
+
+            assert cache.stats()["current_entries"] == 1
             assert len(_all_snapshot_files(tmp_path)) == 1
+        finally:
+            l2.shutdown()
+
+    def test_l1_admitted_generation_does_not_write_through_to_l2(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
+            key = _make_key()
+            cache.insert(_make_synthetic_snapshot([1, 2, 3], key, kind="generation"))
+            time.sleep(0.1)
+
+            assert cache.stats()["current_entries"] == 1
+            assert l2.stats()["writes"] == 0
+            assert _all_snapshot_files(tmp_path) == []
+        finally:
+            l2.shutdown()
+
+    def test_prefill_write_through_takes_priority_over_generation_spill(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            _stop_writer(l2)
+            cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
+            key = _make_key()
+            cache.insert(_make_synthetic_snapshot([1, 2, 3], key, kind="generation"))
+
+            cache.insert(_make_synthetic_snapshot([1, 2, 3, 4], key, kind="prefill"))
+
+            queued = [payload for payload in l2._write_queue.queue if payload is not None]
+            assert len(queued) == 1
+            assert "-prefill-" in queued[0].final_path.name
+            assert l2.stats()["write_drops_queue_full"] >= 1
         finally:
             l2.shutdown()
 
@@ -266,6 +322,105 @@ class TestL2Lifecycle:
             stats = cache.stats()
             assert stats["l2_hits"] == 1
             assert stats["current_entries"] == 1
+        finally:
+            l2.shutdown()
+
+    def test_l2_longer_prefix_wins_over_shorter_l1_prefix(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            key = _make_key()
+            l2._write_one(_make_synthetic_snapshot([1, 2, 3, 4, 5], key))
+            cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
+            cache.insert(_make_synthetic_snapshot([1, 2, 3], key))
+
+            matched, hydrated = cache.lookup([1, 2, 3, 4, 5, 6], key)
+
+            assert matched == 5
+            assert hydrated is not None
+            assert hydrated.token_ids == (1, 2, 3, 4, 5)
+            stats = cache.stats()
+            assert stats["l2_hits"] == 1
+            assert stats["prefix_hits"] == 1
+            assert stats["prefill_tokens_saved"] == 5
+        finally:
+            l2.shutdown()
+
+    def test_l1_prefix_wins_without_l2_load_when_l2_is_not_longer(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            key = _make_key()
+            l2._write_one(_make_synthetic_snapshot([1, 2, 3], key))
+            cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
+            cache.insert(_make_synthetic_snapshot([1, 2, 3, 4], key))
+
+            matched, hydrated = cache.lookup([1, 2, 3, 4, 5], key)
+
+            assert matched == 4
+            assert hydrated is not None
+            assert hydrated.token_ids == (1, 2, 3, 4)
+            stats = cache.stats()
+            assert stats["prefix_hits"] == 1
+            assert stats["l2_hits"] == 0
+            assert stats["l2_misses"] == 1
+            assert stats["l2"]["lookup_loads"] == 0
+        finally:
+            l2.shutdown()
+
+    def test_l1_exact_hit_does_not_probe_l2(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            key = _make_key()
+            l2._write_one(_make_synthetic_snapshot([1, 2, 3], key))
+            cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
+            cache.insert(_make_synthetic_snapshot([1, 2, 3, 4], key))
+
+            matched, hydrated = cache.lookup([1, 2, 3, 4], key)
+
+            assert matched == 4
+            assert hydrated is not None
+            assert hydrated.token_ids == (1, 2, 3, 4)
+            stats = cache.stats()
+            assert stats["exact_hits"] == 1
+            assert stats["l2_hits"] == 0
+            assert stats["l2_misses"] == 0
+            assert stats["l2"]["lookup_loads"] == 0
+        finally:
+            l2.shutdown()
+
+    def test_l2_enabled_cold_miss_records_l1_miss(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            key = _make_key()
+            cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
+
+            matched, hydrated = cache.lookup([1, 2, 3], key)
+
+            assert matched == 0
+            assert hydrated is None
+            stats = cache.stats()
+            assert stats["misses"] == 1
+            assert stats["l2_misses"] == 1
+        finally:
+            l2.shutdown()
+
+    def test_l2_enabled_cold_miss_logs_l1_miss(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path / "l2", max_bytes=10**9)
+        try:
+            trace_dir = tmp_path / "trace"
+            key = _make_key()
+            cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
+            cache.set_trace_config(TraceConfig(log_dir=trace_dir))
+
+            matched, hydrated = cache.lookup([1, 2, 3], key)
+
+            assert matched == 0
+            assert hydrated is None
+            rows = (trace_dir / "cache_events.jsonl").read_text().splitlines()
+            assert rows
+            event = json.loads(rows[-1])
+            assert event["op"] == "lookup"
+            assert event["result"] == "miss"
+            assert event["miss_reason"] == "empty_cache"
         finally:
             l2.shutdown()
 
@@ -316,6 +471,21 @@ class TestL2Lifecycle:
             matched, hydrated = cache.lookup([1, 2, 99, 4, 5], key)
             assert matched == 0
             assert hydrated is None
+        finally:
+            l2.shutdown()
+
+    def test_l2_lookup_hash_filters_many_candidate_lengths_without_load(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            key = _make_key()
+            for n in range(1, 33):
+                l2._write_one(_make_synthetic_snapshot([9000 + n] * n, key))
+
+            assert l2.lookup(tuple([-1] * 33), key) is None
+
+            stats = l2.stats()
+            assert stats["lookup_loads"] == 0
+            assert stats["lookup_hash_filtered"] == 32
         finally:
             l2.shutdown()
 
@@ -434,6 +604,8 @@ class TestFailureModes:
             _set_metadata_field("schema_version", "1"),
             _set_metadata_field("schema_version", 1.0),
             _set_metadata_field("schema_version", True),
+            _set_metadata_field("context_representation", None),
+            _set_metadata_field("context_representation", "raw_target_hidden"),
             _replace_metadata(["not", "a", "dict"]),
             _set_metadata_field("token_ids", None),
             _set_metadata_field("token_ids", ["1", 2]),
@@ -819,6 +991,23 @@ class TestQueueBackpressure:
             )
             stats = l2.stats()
             assert stats["write_drops_queue_full"] >= 1
+        finally:
+            l2.shutdown()
+
+    def test_existing_path_skips_materialization(self, tmp_path, monkeypatch):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            snap = _make_synthetic_snapshot([1, 2, 3], _make_key())
+            l2._write_one(snap)
+            before_files = set(_all_snapshot_files(tmp_path))
+
+            def _fail_serialize(_snapshot):
+                raise AssertionError("duplicate write should not serialize")
+
+            monkeypatch.setattr("dflash_mlx.cache.prefix_l2._serialize", _fail_serialize)
+
+            assert l2.insert_async(snap) is True
+            assert set(_all_snapshot_files(tmp_path)) == before_files
         finally:
             l2.shutdown()
 

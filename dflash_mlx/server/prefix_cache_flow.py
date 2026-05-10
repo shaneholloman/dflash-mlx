@@ -40,11 +40,53 @@ def compute_stable_prefix_len(
             return min(n, i + offset)
     return n
 
+
+def compute_request_stable_prefix_len(
+    tokens: list[int] | tuple[int, ...],
+    *,
+    tokenizer: Any,
+    request: Any = None,
+) -> int:
+    im_start_id, assistant_id, boundary_offset = chat_template_stable_marker(tokenizer)
+    role = _last_chat_role(request)
+    if role is not None and role != "user":
+        return len(tokens)
+    return compute_stable_prefix_len(
+        tokens,
+        im_start_id=im_start_id,
+        assistant_id=assistant_id,
+        boundary_offset=boundary_offset,
+    )
+
+def publish_generation_snapshots_for_request(request: Any = None) -> bool:
+    if getattr(request, "request_type", None) != "chat":
+        return True
+    tools = getattr(request, "tools", None)
+    return not bool(tools)
+
+
+def _last_chat_role(request: Any) -> str | None:
+    if getattr(request, "request_type", None) != "chat":
+        return None
+    messages = getattr(request, "messages", None)
+    if not isinstance(messages, (list, tuple)) or not messages:
+        return None
+    last = messages[-1]
+    role: Any
+    if isinstance(last, dict):
+        role = last.get("role")
+    else:
+        role = getattr(last, "role", None)
+    if role is None:
+        return None
+    return str(role)
+
 @dataclass
 class PrefixCacheFlow:
     cache_manager: Optional[RuntimeCacheManager]
     key: Optional[DFlashPrefixKey] = None
     stable_prefix_len: Optional[int] = None
+    publish_generation_snapshot: bool = True
     snapshot: Optional[DFlashPrefixSnapshot] = None
     lookup_ms: float = 0.0
     hit_tokens: int = 0
@@ -76,6 +118,7 @@ class PrefixCacheFlow:
         draft_model: Any,
         tokenizer: Any,
         prompt: list[int],
+        request: Any = None,
         runtime_context: Optional[Any] = None,
     ) -> "PrefixCacheFlow":
         if runtime_context is None:
@@ -91,12 +134,10 @@ class PrefixCacheFlow:
         if cache_manager is None:
             return cls(cache_manager=None)
 
-        im_start_id, assistant_id, boundary_offset = chat_template_stable_marker(tokenizer)
-        stable_prefix_len = compute_stable_prefix_len(
+        stable_prefix_len = compute_request_stable_prefix_len(
             prompt,
-            im_start_id=im_start_id,
-            assistant_id=assistant_id,
-            boundary_offset=boundary_offset,
+            tokenizer=tokenizer,
+            request=request,
         )
         lookup_tokens = prompt[:stable_prefix_len]
         try:
@@ -118,6 +159,7 @@ class PrefixCacheFlow:
             cache_manager=cache_manager,
             key=key,
             stable_prefix_len=stable_prefix_len,
+            publish_generation_snapshot=publish_generation_snapshots_for_request(request),
             snapshot=lookup.snapshot,
             lookup_ms=lookup.elapsed_ms,
             hit_tokens=hit_tokens,

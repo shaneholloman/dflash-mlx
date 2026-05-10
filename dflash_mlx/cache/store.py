@@ -46,18 +46,48 @@ class PrefixSnapshotStore:
     ) -> tuple[int, DFlashPrefixSnapshot | None]:
         req_tuple = tuple(int(t) for t in req_tokens)
         t_start = time.perf_counter_ns()
-        matched_len, snapshot = self._l1.lookup(req_tuple, key)
-        if snapshot is not None or matched_len > 0:
-            return matched_len, snapshot
         if self._l2 is None:
-            return 0, None
+            return self._l1.lookup(req_tuple, key)
+
+        matched_len, snapshot = self._l1.lookup(req_tuple, key, record=False)
+        if snapshot is not None or matched_len > 0:
+            if matched_len == len(req_tuple):
+                return self._l1.lookup(req_tuple, key)
+            l2_snapshot = self._l2.lookup(
+                req_tuple,
+                key,
+                min_token_len=matched_len,
+            )
+            if l2_snapshot is not None:
+                return self._record_l2_hit(
+                    l2_snapshot,
+                    req_tuple=req_tuple,
+                    t_start=t_start,
+                )
+            else:
+                with self._lock:
+                    self._stats["l2_misses"] += 1
+            return self._l1.lookup(req_tuple, key)
 
         l2_snapshot = self._l2.lookup(req_tuple, key)
         if l2_snapshot is None:
             with self._lock:
                 self._stats["l2_misses"] += 1
-            return 0, None
+            return self._l1.lookup(req_tuple, key)
 
+        return self._record_l2_hit(
+            l2_snapshot,
+            req_tuple=req_tuple,
+            t_start=t_start,
+        )
+
+    def _record_l2_hit(
+        self,
+        l2_snapshot: DFlashPrefixSnapshot,
+        *,
+        req_tuple: tuple[int, ...],
+        t_start: int,
+    ) -> tuple[int, DFlashPrefixSnapshot]:
         l2_len = len(l2_snapshot.token_ids)
         promote = self._l1.insert_with_evictions(l2_snapshot, skip_too_long=False)
         self._write_snapshots_to_l2(promote.removed_snapshots)
@@ -87,6 +117,8 @@ class PrefixSnapshotStore:
             skip_too_long=self._l2 is None,
         )
         if self._l2 is not None:
+            if result.admitted and snapshot.kind == "prefill":
+                self._write_snapshots_to_l2((snapshot,))
             inserted_l2_admitted = self._write_snapshots_to_l2(
                 result.removed_snapshots,
                 inserted_snapshot=result.inserted_evicted_snapshot,

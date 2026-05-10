@@ -153,6 +153,21 @@ def serialize_target_cache(
             )
     return tuple(fa), tuple(gdn)
 
+def _validate_snapshot_cache_prefix_len(
+    fa_states: tuple[Optional[FAState], ...],
+    *,
+    prefix_len: int,
+) -> None:
+    for layer_idx, state in enumerate(fa_states):
+        if state is None:
+            continue
+        offset = int(state[2])
+        if offset != int(prefix_len):
+            raise ValueError(
+                f"Snapshot FA cache offset {offset} at layer {layer_idx} "
+                f"!= token prefix length {int(prefix_len)}"
+            )
+
 def hydrate_target_cache(
     snapshot: DFlashPrefixSnapshot,
     template_cache: list[Any],
@@ -162,6 +177,10 @@ def hydrate_target_cache(
             f"Template cache length {len(template_cache)} != "
             f"snapshot layer count {len(snapshot.fa_states)}"
         )
+    _validate_snapshot_cache_prefix_len(
+        snapshot.fa_states,
+        prefix_len=snapshot.prefix_len,
+    )
 
     result: list[Any] = []
     for i, tmpl in enumerate(template_cache):
@@ -223,7 +242,19 @@ def build_snapshot(
     draft_window_size: int = 1024,
     allow_full_attention_context: bool = False,
 ) -> DFlashPrefixSnapshot:
+    token_tuple = tuple(int(t) for t in token_ids)
+    prefix_len = len(token_tuple)
+    hidden_len = int(target_hidden.shape[1])
+    if hidden_len < prefix_len:
+        raise ValueError(
+            f"Snapshot target_hidden length {hidden_len} "
+            f"< token prefix length {prefix_len}"
+        )
+    if hidden_len > prefix_len:
+        target_hidden = target_hidden[:, :prefix_len, :]
+
     fa, gdn = serialize_target_cache(target_cache)
+    _validate_snapshot_cache_prefix_len(fa, prefix_len=prefix_len)
     chunks, spans, total_len = _build_target_hidden_chunks(
         target_hidden,
         draft_model=draft_model,
@@ -234,7 +265,7 @@ def build_snapshot(
     )
     cloned_logits = _clone_array(last_logits) if last_logits is not None else None
     return DFlashPrefixSnapshot(
-        token_ids=tuple(int(t) for t in token_ids),
+        token_ids=token_tuple,
         fa_states=fa,
         gdn_states=gdn,
         target_hidden_chunks=chunks,

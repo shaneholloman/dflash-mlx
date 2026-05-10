@@ -28,11 +28,12 @@ from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
 
 _LOG = logging.getLogger(__name__)
 
-L2_SCHEMA_VERSION = 2
+L2_SCHEMA_VERSION = 3
 L2_FILE_SUFFIX = ".safetensors"
 L2_TMP_SUFFIX = ".tmp.safetensors"
 L2_LOCK_NAME = ".dflash_l2.lock"
 L2_LAYOUT_ROOT = "v2"
+CONTEXT_REPRESENTATION = "draft_projected"
 
 _VALID_KINDS = ("prefill", "generation")
 _HEX = set("0123456789abcdef")
@@ -99,6 +100,28 @@ def _key_hash(key: DFlashPrefixKey) -> str:
 def _token_hash(tokens: tuple[int, ...] | list[int]) -> str:
     return hashlib.sha256(_canon_tokens_blob(tokens)).hexdigest()[:16]
 
+def _token_hashes_for_lengths(
+    tokens: tuple[int, ...],
+    lengths: set[int],
+) -> dict[int, str]:
+    wanted = sorted(int(n) for n in lengths if int(n) >= 0)
+    if not wanted:
+        return {}
+    out: dict[int, str] = {}
+    if wanted[0] == 0:
+        out[0] = hashlib.sha256(b"").hexdigest()[:16]
+    max_len = wanted[-1]
+    h = hashlib.sha256()
+    next_idx = 0
+    while next_idx < len(wanted) and wanted[next_idx] == 0:
+        next_idx += 1
+    for pos, token in enumerate(tokens[:max_len], start=1):
+        h.update(struct.pack("<q", int(token)))
+        while next_idx < len(wanted) and wanted[next_idx] == pos:
+            out[pos] = h.copy().hexdigest()[:16]
+            next_idx += 1
+    return out
+
 def _runtime_layout_hash() -> str:
     blob = f"schema={L2_SCHEMA_VERSION}|dflash={dflash_mlx.__version__}".encode("utf-8")
     return hashlib.sha256(blob).hexdigest()[:16]
@@ -110,6 +133,7 @@ def _fingerprint(snapshot: DFlashPrefixSnapshot) -> str:
         "tokens": list(snapshot.token_ids),
         "schema": L2_SCHEMA_VERSION,
         "runtime": dflash_mlx.__version__,
+        "context_representation": CONTEXT_REPRESENTATION,
     }
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()
@@ -205,6 +229,7 @@ def _serialize(snapshot: DFlashPrefixSnapshot) -> tuple[dict[str, mx.array], dic
     meta = {
         "schema_version": L2_SCHEMA_VERSION,
         "runtime_version": dflash_mlx.__version__,
+        "context_representation": CONTEXT_REPRESENTATION,
         "key": _key_to_dict(snapshot.key),
         "kind": snapshot.kind,
         "token_ids": list(snapshot.token_ids),
@@ -395,9 +420,12 @@ class DFlashPrefixL2Cache:
         self,
         req_tokens: tuple[int, ...],
         key: DFlashPrefixKey,
+        *,
+        min_token_len: int = 0,
     ) -> Optional[DFlashPrefixSnapshot]:
         t0 = time.perf_counter_ns()
         req_tokens = tuple(int(t) for t in req_tokens)
+        min_token_len = max(0, int(min_token_len))
         bucket = self._bucket_for(key)
         if not bucket.is_dir():
             with self._lock:
@@ -410,7 +438,7 @@ class DFlashPrefixL2Cache:
                 parts = _parse_filename(path.name)
                 if parts is None:
                     continue
-                if parts.token_len > len(req_tokens):
+                if parts.token_len <= min_token_len or parts.token_len > len(req_tokens):
                     continue
                 candidates.append((parts, path))
         except OSError as e:
@@ -421,11 +449,10 @@ class DFlashPrefixL2Cache:
 
         candidates.sort(key=lambda c: (-c[0].token_len, 0 if c[0].kind == "prefill" else 1))
 
-        hashes: dict[int, str] = {}
+        candidate_lengths = {parts.token_len for parts, _path in candidates}
+        hashes = _token_hashes_for_lengths(req_tokens, candidate_lengths)
 
         for parts, path in candidates:
-            if parts.token_len not in hashes:
-                hashes[parts.token_len] = _token_hash(req_tokens[: parts.token_len])
             if hashes[parts.token_len] != parts.token_hash:
                 with self._lock:
                     self._stats["lookup_hash_filtered"] += 1
@@ -455,6 +482,11 @@ class DFlashPrefixL2Cache:
     def insert_async(self, snapshot: DFlashPrefixSnapshot) -> bool:
         if not self.writable:
             return False
+        final_path = self._final_path_for(snapshot)
+        if final_path.exists():
+            with self._lock:
+                self._stats["writes"] += 1
+            return True
         if not self._writer_slots.acquire(blocking=False):
             with self._lock:
                 self._stats["write_drops_queue_full"] += 1
@@ -691,6 +723,11 @@ class DFlashPrefixL2Cache:
             self._unlink_if_writable(path)
             return None
         if schema_version != L2_SCHEMA_VERSION:
+            with self._lock:
+                self._stats["schema_rejects"] += 1
+            self._unlink_if_writable(path)
+            return None
+        if meta.get("context_representation") != CONTEXT_REPRESENTATION:
             with self._lock:
                 self._stats["schema_rejects"] += 1
             self._unlink_if_writable(path)

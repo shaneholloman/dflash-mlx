@@ -13,6 +13,7 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from dflash_mlx.artifacts import create_run_dir, write_manifest
+from tools.benchmarks._agentic_proxy import _parse_sse_event
 from tools.benchmarks._agentic_session import DEFAULT_TASK
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -45,21 +47,69 @@ def _iso_now() -> str:
 def _git(args: list[str]) -> str:
     try:
         return subprocess.check_output(["git", *args], cwd=REPO_ROOT, text=True).strip()
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         return "unknown"
 
 def _wait_health(url: str, timeout_s: float, label: str) -> bool:
     deadline = time.time() + timeout_s
+    last_error: BaseException | None = None
     while time.time() < deadline:
         try:
             with urllib.request.urlopen(url, timeout=2) as resp:
                 if resp.status < 500:
                     return True
-        except Exception:
-            pass
+        except (OSError, TimeoutError, urllib.error.URLError) as e:
+            last_error = e
         time.sleep(2)
-    sys.stderr.write(f"[orch] {label} health timeout on {url}\n")
+    suffix = f" last_error={last_error!r}" if last_error is not None else ""
+    sys.stderr.write(f"[orch] {label} health timeout on {url}{suffix}\n")
     return False
+
+def _ensure_port_available(host: str, port: int, label: str) -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind((host, port))
+        except OSError as e:
+            raise SystemExit(f"{label} port {host}:{port} is already in use") from e
+
+def _server_exited_message(proc: subprocess.Popen, label: str, stderr_path: Path) -> str | None:
+    rc = proc.poll()
+    if rc is None:
+        return None
+    tail = ""
+    try:
+        lines = stderr_path.read_text(errors="replace").splitlines()
+        tail = "\n".join(lines[-20:])
+    except OSError as e:
+        tail = f"<could not read stderr tail: {e!r}>"
+    suffix = f"\nstderr tail:\n{tail}" if tail else ""
+    return f"{label} exited before replay (code {rc}){suffix}"
+
+def _health_model_ids(url: str) -> set[str]:
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except (OSError, TimeoutError, urllib.error.URLError, json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise SystemExit(f"could not read server model identity from {url}: {e!r}") from e
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        return set()
+    ids: set[str] = set()
+    for item in data:
+        if isinstance(item, dict) and isinstance(item.get("id"), str):
+            ids.add(item["id"])
+    return ids
+
+def _verify_ready_model(url: str, expected_model: str) -> None:
+    model_ids = _health_model_ids(url)
+    if model_ids and expected_model not in model_ids:
+        rendered = ", ".join(sorted(model_ids))
+        raise SystemExit(f"server identity mismatch: expected {expected_model!r}, got {rendered!r}")
+
+def _validate_l2_flags(args) -> None:
+    has_l2_options = args.prefix_cache_l2_dir is not None or args.prefix_cache_l2_max_bytes is not None
+    if has_l2_options and not bool(args.prefix_cache_l2):
+        raise SystemExit("--prefix-cache-l2-dir/--prefix-cache-l2-max-bytes require --prefix-cache-l2")
 
 def _patch_opencode_config(target: str, proxy_port: int) -> dict[str, Any]:
     raw = OPENCODE_CONFIG.read_text()
@@ -134,7 +184,7 @@ def _terminate(proc: subprocess.Popen, label: str, term_grace_s: float = 5.0) ->
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
         else:
             proc.terminate()
-    except Exception as e:
+    except OSError as e:
         sys.stderr.write(f"[orch] {label} term err: {e!r}\n")
     try:
         proc.wait(timeout=term_grace_s)
@@ -144,9 +194,26 @@ def _terminate(proc: subprocess.Popen, label: str, term_grace_s: float = 5.0) ->
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             else:
                 proc.kill()
-        except Exception:
-            pass
+        except OSError as e:
+            sys.stderr.write(f"[orch] {label} kill err: {e!r}\n")
         proc.wait(timeout=5)
+
+def _read_jsonl_objects(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for lineno, raw_line in enumerate(path.read_text().splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"malformed JSONL at {path}:{lineno}: {e.msg}") from e
+        if not isinstance(obj, dict):
+            raise RuntimeError(f"malformed JSONL at {path}:{lineno}: expected object")
+        rows.append(obj)
+    return rows
 
 def read_dflash_events(events_dir: Path) -> tuple[list[dict[str, Any]], dict[int, list[dict[str, Any]]], list[dict[str, Any]]]:
     posts: list[dict[str, Any]] = []
@@ -154,40 +221,16 @@ def read_dflash_events(events_dir: Path) -> tuple[list[dict[str, Any]], dict[int
     cache: list[dict[str, Any]] = []
 
     pe = events_dir / "post_events.jsonl"
-    if pe.exists():
-        for line in pe.read_text().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                posts.append(json.loads(line))
-            except Exception:
-                pass
+    posts.extend(_read_jsonl_objects(pe))
 
     ce = events_dir / "cycle_events.jsonl"
-    if ce.exists():
-        for line in ce.read_text().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                ev = json.loads(line)
-                rid = ev.get("request_id")
-                if rid is not None:
-                    cycles_by_req.setdefault(rid, []).append(ev)
-            except Exception:
-                pass
+    for ev in _read_jsonl_objects(ce):
+        rid = ev.get("request_id")
+        if rid is not None:
+            cycles_by_req.setdefault(rid, []).append(ev)
 
     xe = events_dir / "cache_events.jsonl"
-    if xe.exists():
-        for line in xe.read_text().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                cache.append(json.loads(line))
-            except Exception:
-                pass
+    cache.extend(_read_jsonl_objects(xe))
 
     return posts, cycles_by_req, cache
 
@@ -299,6 +342,15 @@ def parse_dflash_stderr(text: str) -> list[dict[str, Any]]:
             })
     return events
 
+def _apply_dflash_stderr_totals(totals: dict[str, Any], server_stderr_text: str) -> None:
+    prefill_saved = [
+        ev["prefill_tokens_saved"]
+        for ev in parse_dflash_stderr(server_stderr_text)
+        if ev.get("kind") == "stats" and isinstance(ev.get("prefill_tokens_saved"), int)
+    ]
+    if prefill_saved:
+        totals["prefill_tokens_saved_cumulative"] = max(prefill_saved)
+
 def attach_dflash_metrics_to_posts(events: list[dict[str, Any]], n_posts: int) -> list[dict[str, Any]]:
     buckets: list[dict[str, Any]] = []
     pending: dict[str, Any] = {"hit": None, "stats": None, "all": []}
@@ -375,11 +427,13 @@ def derive_post_landmarks(sse_path: Path) -> dict[str, Any]:
     in_think = False
 
     with sse_path.open() as f:
-        for raw_line in f:
+        for lineno, raw_line in enumerate(f, start=1):
             try:
                 ev = json.loads(raw_line)
-            except Exception:
-                continue
+            except json.JSONDecodeError as e:
+                raise RuntimeError(f"malformed SSE trace JSONL at {sse_path}:{lineno}: {e.msg}") from e
+            if not isinstance(ev, dict):
+                raise RuntimeError(f"malformed SSE trace JSONL at {sse_path}:{lineno}: expected object")
             if ev.get("type") == "first_byte":
                 out["first_byte_ms"] = ev["t_ms"]
                 continue
@@ -471,8 +525,18 @@ def _build_server_cmd(args) -> tuple[list[str], int, str]:
             "--host",
             "127.0.0.1",
             "--chat-template-args",
-            '{"enable_thinking":true}',
+            args.chat_template_args,
         ]
+        if args.draft_quant:
+            cmd.extend(["--draft-quant", args.draft_quant])
+        if args.profile:
+            cmd.extend(["--profile", args.profile])
+        if args.prefill_step_size is not None:
+            cmd.extend(["--prefill-step-size", str(int(args.prefill_step_size))])
+        if args.fastpath_max_tokens is not None:
+            cmd.extend(["--fastpath-max-tokens", str(int(args.fastpath_max_tokens))])
+        if args.max_snapshot_tokens is not None:
+            cmd.extend(["--max-snapshot-tokens", str(int(args.max_snapshot_tokens))])
         if int(args.target_fa_window) > 0:
             cmd.extend(["--target-fa-window", str(int(args.target_fa_window))])
         return cmd, port, f"http://127.0.0.1:{port}"
@@ -489,7 +553,7 @@ def _build_server_cmd(args) -> tuple[list[str], int, str]:
             "--host",
             "127.0.0.1",
             "--chat-template-args",
-            '{"enable_thinking":true}',
+            args.chat_template_args,
         ]
         return cmd, port, f"http://127.0.0.1:{port}"
     raise SystemExit(f"unknown backend {args.backend}")
@@ -509,6 +573,202 @@ def _build_proxy_cmd(args, run_dir: Path, upstream_url: str) -> list[str]:
         "--out-dir",
         str(run_dir),
     ]
+
+def _write_sse_event(path, event: dict[str, Any]) -> None:
+    path.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+def _replay_body_bytes(request_obj: dict[str, Any], target: str) -> bytes:
+    body = dict(request_obj.get("body") or {})
+    body["model"] = target
+    return json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+def _replay_headers(request_obj: dict[str, Any], body_bytes: bytes) -> dict[str, str]:
+    captured = request_obj.get("headers") or {}
+    headers = {
+        str(k): str(v)
+        for k, v in captured.items()
+        if str(k).lower()
+        not in {
+            "authorization",
+            "connection",
+            "content-length",
+            "host",
+            "x-session-affinity",
+        }
+    }
+    headers.setdefault("Content-Type", "application/json")
+    headers.setdefault("Accept", "text/event-stream")
+    headers["Content-Length"] = str(len(body_bytes))
+    return headers
+
+def _post_replay_request(
+    *,
+    idx: int,
+    request_path: Path,
+    out_dir: Path,
+    upstream_url: str,
+    target: str,
+    timeout_s: float,
+) -> None:
+    request_obj = json.loads(request_path.read_text())
+    body_bytes = _replay_body_bytes(request_obj, target)
+    body = json.loads(body_bytes.decode("utf-8"))
+    path = str(request_obj.get("path") or "/v1/chat/completions")
+    is_stream = bool(body.get("stream"))
+    out_request = out_dir / "requests" / f"{idx:03d}.json"
+    out_sse = out_dir / "sse" / f"{idx:03d}.jsonl"
+    out_request.parent.mkdir(parents=True, exist_ok=True)
+    out_sse.parent.mkdir(parents=True, exist_ok=True)
+    out_request.write_text(
+        json.dumps(
+            {
+                "idx": idx,
+                "method": "POST",
+                "path": path,
+                "wall_ts": time.time(),
+                "stream": is_stream,
+                "headers": _replay_headers(request_obj, body_bytes),
+                "body": body,
+                "body_bytes": len(body_bytes),
+                "source_request": str(request_path),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+    url = upstream_url.rstrip("/") + path
+    req = urllib.request.Request(
+        url,
+        data=body_bytes,
+        headers=_replay_headers(request_obj, body_bytes),
+        method="POST",
+    )
+    t0 = time.perf_counter()
+    status = None
+    first_byte_logged = False
+    with out_sse.open("w", buffering=1) as sse_f:
+        try:
+            resp = urllib.request.urlopen(req, timeout=timeout_s)
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            payload = exc.read()
+            _write_sse_event(
+                sse_f,
+                {
+                    "type": "meta",
+                    "t_ms": 0.0,
+                    "status": status,
+                    "headers": list(exc.headers.items()),
+                },
+            )
+            _write_sse_event(
+                sse_f,
+                {
+                    "type": "non_stream_body",
+                    "t_ms": (time.perf_counter() - t0) * 1000.0,
+                    "payload": {
+                        "bytes": len(payload),
+                        "preview": payload[:512].decode("utf-8", "replace"),
+                    },
+                },
+            )
+            _write_sse_event(sse_f, {"type": "end", "t_ms": (time.perf_counter() - t0) * 1000.0})
+            raise RuntimeError(f"replay request {idx} failed with HTTP {status}") from exc
+
+        with resp:
+            status = resp.status
+            _write_sse_event(
+                sse_f,
+                {
+                    "type": "meta",
+                    "t_ms": 0.0,
+                    "status": status,
+                    "headers": list(resp.headers.items()),
+                },
+            )
+            if is_stream:
+                buf: list[bytes] = []
+                while True:
+                    line = resp.readline()
+                    if not line:
+                        break
+                    if not first_byte_logged:
+                        _write_sse_event(
+                            sse_f,
+                            {"type": "first_byte", "t_ms": (time.perf_counter() - t0) * 1000.0},
+                        )
+                        first_byte_logged = True
+                    if line in (b"\n", b"\r\n"):
+                        if buf:
+                            _write_sse_event(
+                                sse_f,
+                                {
+                                    "type": "event",
+                                    "t_ms": (time.perf_counter() - t0) * 1000.0,
+                                    "payload": _parse_sse_event(b"".join(buf)),
+                                },
+                            )
+                        buf = []
+                    else:
+                        buf.append(line)
+                if buf:
+                    _write_sse_event(
+                        sse_f,
+                        {
+                            "type": "event_tail",
+                            "t_ms": (time.perf_counter() - t0) * 1000.0,
+                            "payload": _parse_sse_event(b"".join(buf)),
+                        },
+                    )
+            else:
+                data = resp.read()
+                if not first_byte_logged and data:
+                    _write_sse_event(
+                        sse_f,
+                        {"type": "first_byte", "t_ms": (time.perf_counter() - t0) * 1000.0},
+                    )
+                _write_sse_event(
+                    sse_f,
+                    {
+                        "type": "non_stream_body",
+                        "t_ms": (time.perf_counter() - t0) * 1000.0,
+                        "payload": {
+                            "bytes": len(data),
+                            "preview": data[:512].decode("utf-8", "replace"),
+                        },
+                    },
+                )
+            _write_sse_event(sse_f, {"type": "end", "t_ms": (time.perf_counter() - t0) * 1000.0})
+    if status is not None and status >= 400:
+        raise RuntimeError(f"replay request {idx} failed with HTTP {status}")
+
+def _run_replay_requests(
+    *,
+    source_trace: Path,
+    run_dir: Path,
+    upstream_url: str,
+    target: str,
+    request_limit: int,
+    request_timeout_s: float,
+) -> tuple[int, float]:
+    source_requests = sorted((source_trace / "requests").glob("*.json"))
+    if request_limit > 0:
+        source_requests = source_requests[:request_limit]
+    if not source_requests:
+        raise SystemExit(f"no captured requests found under {source_trace / 'requests'}")
+    start = time.perf_counter()
+    for idx, request_path in enumerate(source_requests, start=1):
+        sys.stderr.write(f"[replay] POST {idx}/{len(source_requests)} from {request_path.name}\n")
+        _post_replay_request(
+            idx=idx,
+            request_path=request_path,
+            out_dir=run_dir,
+            upstream_url=upstream_url,
+            target=target,
+            timeout_s=request_timeout_s,
+        )
+    return len(source_requests), time.perf_counter() - start
 
 def _build_opencode_cmd(args, workspace: Path, task: str, label: str) -> list[str]:
     cmd = [
@@ -553,6 +813,292 @@ def _build_pi_cmd(args, task: str) -> list[str]:
     cmd.append(task)
     return cmd
 
+def replay_main(argv: Sequence[str] | None = None) -> int:
+    p = argparse.ArgumentParser(
+        description="Replay captured OpenAI chat POST bodies against a fresh server."
+    )
+    p.add_argument("--source-trace", required=True, help="Trace run dir containing requests/*.json.")
+    p.add_argument("--backend", choices=["dflash", "mlxlm"], required=True)
+    p.add_argument("--target", required=True)
+    p.add_argument("--draft", default=None, help="required for --backend dflash")
+    p.add_argument("--label", default=None)
+    p.add_argument("--out-root", default=None)
+    p.add_argument("--dflash-port", type=int, default=DEFAULT_DFLASH_PORT)
+    p.add_argument("--mlxlm-port", type=int, default=DEFAULT_MLXLM_PORT)
+    p.add_argument("--server-ready-timeout-s", type=float, default=300.0)
+    p.add_argument("--request-timeout-s", type=float, default=900.0)
+    p.add_argument("--request-limit", type=int, default=0, help="0 means replay all captured POSTs.")
+    p.add_argument("--prefix-cache", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--prefix-cache-l2", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--prefix-cache-l2-max-bytes", type=int, default=None)
+    p.add_argument("--prefix-cache-l2-dir", default=None)
+    p.add_argument("--diagnostics", choices=("off", "basic", "full"), default=None)
+    p.add_argument("--draft-quant", default=None)
+    p.add_argument("--profile", default=None)
+    p.add_argument("--prefill-step-size", type=int, default=None)
+    p.add_argument("--fastpath-max-tokens", type=int, default=None)
+    p.add_argument("--max-snapshot-tokens", type=int, default=None)
+    p.add_argument("--target-fa-window", type=int, default=None)
+    p.add_argument("--chat-template-args", default='{"enable_thinking":true}')
+    p.add_argument("--compare-to", default=None)
+    args = p.parse_args(list(argv) if argv is not None else None)
+
+    source_trace = Path(args.source_trace)
+    if not (source_trace / "requests").is_dir():
+        raise SystemExit(f"--source-trace must contain requests/*.json: {source_trace}")
+    if args.backend == "dflash" and not args.draft:
+        raise SystemExit("--draft is required when --backend=dflash")
+    if args.backend != "dflash":
+        dflash_only = {
+            "--prefix-cache": args.prefix_cache,
+            "--prefix-cache-l2": args.prefix_cache_l2,
+            "--prefix-cache-l2-max-bytes": args.prefix_cache_l2_max_bytes,
+            "--prefix-cache-l2-dir": args.prefix_cache_l2_dir,
+            "--diagnostics": args.diagnostics,
+            "--draft-quant": args.draft_quant,
+            "--profile": args.profile,
+            "--prefill-step-size": args.prefill_step_size,
+            "--fastpath-max-tokens": args.fastpath_max_tokens,
+            "--max-snapshot-tokens": args.max_snapshot_tokens,
+            "--target-fa-window": args.target_fa_window,
+        }
+        used = [flag for flag, value in dflash_only.items() if value is not None]
+        if used:
+            raise SystemExit(f"{', '.join(used)} require --backend dflash")
+    for flag_name in (
+        "prefill_step_size",
+        "fastpath_max_tokens",
+        "max_snapshot_tokens",
+        "request_limit",
+    ):
+        value = getattr(args, flag_name)
+        if value is not None and int(value) < 0:
+            raise SystemExit(f"--{flag_name.replace('_', '-')} must be >= 0")
+    if args.target_fa_window is not None and args.target_fa_window < 0:
+        raise SystemExit("--target-fa-window must be >= 0")
+    if args.prefix_cache_l2_max_bytes is not None and int(args.prefix_cache_l2_max_bytes) < 0:
+        raise SystemExit("--prefix-cache-l2-max-bytes must be >= 0")
+    if args.backend == "dflash":
+        _validate_l2_flags(args)
+    if args.backend == "dflash":
+        args.prefix_cache = True if args.prefix_cache is None else bool(args.prefix_cache)
+        args.prefix_cache_l2 = False if args.prefix_cache_l2 is None else bool(args.prefix_cache_l2)
+        args.prefix_cache_l2_max_bytes = (
+            50 * 1024**3
+            if args.prefix_cache_l2_max_bytes is None
+            else int(args.prefix_cache_l2_max_bytes)
+        )
+        args.diagnostics = "basic" if args.diagnostics is None else args.diagnostics
+        args.target_fa_window = 0 if args.target_fa_window is None else int(args.target_fa_window)
+
+    label = args.label or f"{args.backend}-{source_trace.name}"
+    stamp = _now_stamp()
+    if args.out_root is None:
+        run_dir = create_run_dir("trace", f"replay-{label}")
+    else:
+        run_dir = Path(args.out_root) / f"{stamp}-replay-{label}"
+        run_dir.mkdir(parents=True, exist_ok=False)
+    (run_dir / "server").mkdir()
+    (run_dir / "requests").mkdir()
+    (run_dir / "sse").mkdir()
+
+    server_cmd, server_port, upstream_url = _build_server_cmd(args)
+    _ensure_port_available("127.0.0.1", server_port, "server")
+    if args.backend == "dflash":
+        if args.diagnostics != "off":
+            events_dir = run_dir / "events"
+            events_dir.mkdir(exist_ok=True)
+            server_cmd.extend(
+                [
+                    "--diagnostics",
+                    args.diagnostics,
+                    "--diagnostics-dir",
+                    str(events_dir),
+                ]
+            )
+        if args.prefix_cache:
+            server_cmd.extend(
+                [
+                    "--prefix-cache",
+                    "--prefix-cache-max-entries",
+                    "8",
+                    "--prefix-cache-max-bytes",
+                    "10737418240",
+                ]
+            )
+        else:
+            server_cmd.append("--no-prefix-cache")
+        if args.prefix_cache_l2:
+            l2_dir = (
+                Path(args.prefix_cache_l2_dir)
+                if args.prefix_cache_l2_dir
+                else run_dir / "l2_cache"
+            )
+            l2_dir.mkdir(parents=True, exist_ok=True)
+            server_cmd.extend(
+                [
+                    "--prefix-cache-l2",
+                    "--prefix-cache-l2-dir",
+                    str(l2_dir),
+                    "--prefix-cache-l2-max-bytes",
+                    str(int(args.prefix_cache_l2_max_bytes)),
+                ]
+            )
+
+    metadata = {
+        "started_at": _iso_now(),
+        "label": label,
+        "backend": args.backend,
+        "client": "replay",
+        "source_trace": str(source_trace),
+        "target": args.target,
+        "draft": args.draft,
+        "prompt_regime": {
+            "harness": "replay",
+            "protocol": "openai_chat_completions",
+            "streaming": True,
+            "dflash_runtime_input": "prompt_tokens_override"
+            if args.backend == "dflash"
+            else None,
+        },
+        "git": {
+            "branch": _git(["rev-parse", "--abbrev-ref", "HEAD"]),
+            "commit": _git(["rev-parse", "HEAD"]),
+        },
+        "host": platform.platform(),
+        "python": sys.version,
+        "server_cmd": server_cmd,
+        "server_port": server_port,
+        "request_limit": args.request_limit,
+    }
+    if args.backend == "dflash":
+        metadata["dflash_runtime_overrides"] = {
+            "draft_quant": args.draft_quant,
+            "profile": args.profile,
+            "prefill_step_size": args.prefill_step_size,
+            "fastpath_max_tokens": args.fastpath_max_tokens,
+            "max_snapshot_tokens": args.max_snapshot_tokens,
+            "target_fa_window": args.target_fa_window,
+            "prefix_cache": args.prefix_cache,
+            "prefix_cache_l2": args.prefix_cache_l2,
+            "prefix_cache_l2_dir": args.prefix_cache_l2_dir,
+            "prefix_cache_l2_max_bytes": args.prefix_cache_l2_max_bytes,
+            "diagnostics": args.diagnostics,
+            "chat_template_args": args.chat_template_args,
+        }
+    write_manifest(
+        run_dir,
+        kind="trace",
+        label=f"replay-{label}",
+        argv=list(sys.argv),
+        model=args.target,
+        draft=args.draft,
+        effective_config=metadata,
+    )
+    (run_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
+    (run_dir / "server" / "cmd.txt").write_text(shlex.join(server_cmd) + "\n")
+
+    server_proc = None
+    request_count = 0
+    replay_wall_s = None
+    try:
+        sys.stderr.write(f"[replay] starting server: {' '.join(server_cmd)}\n")
+        stderr_path = run_dir / "server" / "stderr.log"
+        server_proc = _spawn(server_cmd, run_dir / "server" / "stdout.log", stderr_path)
+        exited = _server_exited_message(server_proc, "server", stderr_path)
+        if exited:
+            raise SystemExit(exited)
+        if not _wait_health(f"{upstream_url}/v1/models", args.server_ready_timeout_s, "server"):
+            raise SystemExit("server not ready")
+        exited = _server_exited_message(server_proc, "server", stderr_path)
+        if exited:
+            raise SystemExit(exited)
+        _verify_ready_model(f"{upstream_url}/v1/models", args.target)
+        request_count, replay_wall_s = _run_replay_requests(
+            source_trace=source_trace,
+            run_dir=run_dir,
+            upstream_url=upstream_url,
+            target=args.target,
+            request_limit=int(args.request_limit),
+            request_timeout_s=float(args.request_timeout_s),
+        )
+    finally:
+        if server_proc is not None:
+            _terminate(server_proc, "server")
+
+    cache_summary: dict[str, Any] = {}
+    per_post_metrics: list[dict[str, Any]] = []
+    if args.backend == "dflash":
+        events_dir = run_dir / "events"
+        post_evts, cycles_by_req, cache_evts = read_dflash_events(events_dir)
+        for pe in sorted(post_evts, key=lambda e: e.get("request_id", 0)):
+            rid = pe.get("request_id")
+            cycles_summary = summarize_cycles(cycles_by_req.get(rid, []))
+            per_post_metrics.append(post_event_to_server_metric(pe, cycles_summary))
+        cache_summary = summarize_cache_events(cache_evts)
+        (run_dir / "server" / "metrics.jsonl").write_text(
+            "\n".join(json.dumps(m) for m in per_post_metrics)
+            + ("\n" if per_post_metrics else "")
+        )
+    else:
+        (run_dir / "server" / "metrics.jsonl").write_text("")
+
+    request_files = sorted((run_dir / "requests").glob("*.json"))
+    posts: list[dict[str, Any]] = []
+    for i, req_path in enumerate(request_files, start=1):
+        sse_path = run_dir / "sse" / req_path.name.replace(".json", ".jsonl")
+        req_summary = derive_request_summary(req_path)
+        landmarks = derive_post_landmarks(sse_path) if sse_path.exists() else {}
+        server_metric = per_post_metrics[i - 1] if (i - 1) < len(per_post_metrics) else None
+        effective_finish_reason = landmarks.get("finish_reason")
+        if effective_finish_reason is None and server_metric:
+            effective_finish_reason = server_metric.get("finish_reason_server")
+        posts.append(
+            {
+                "idx": i,
+                "request": req_summary,
+                "landmarks": landmarks,
+                "server_metric": server_metric,
+                "effective_finish_reason": effective_finish_reason,
+            }
+        )
+
+    _ensure_replay_outputs(posts)
+    totals = _aggregate(posts, replay_wall_s)
+    if args.backend == "dflash":
+        _apply_dflash_stderr_totals(totals, (run_dir / "server" / "stderr.log").read_text())
+    summary = {
+        "metadata": metadata,
+        "finished_at": _iso_now(),
+        "client": "replay",
+        "client_exit_code": 0,
+        "client_wall_s": replay_wall_s,
+        "post_count": request_count,
+        "posts": posts,
+        "workspace_files": [],
+        "totals": totals,
+        "cache_summary": cache_summary if args.backend == "dflash" else None,
+    }
+    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False))
+
+    peer_summary = None
+    if args.compare_to:
+        peer_path = Path(args.compare_to)
+        peer_json = peer_path / "summary.json" if peer_path.is_dir() else peer_path
+        try:
+            peer_summary = json.loads(peer_json.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            sys.stderr.write(f"[replay] could not load peer summary {peer_json}: {e!r}\n")
+    (run_dir / "compare.md").write_text(_render_compare(summary, peer=peer_summary))
+
+    print(f"Run directory: {run_dir}")
+    print("replay exit: 0")
+    print(f"Wall       : {replay_wall_s:.2f}s" if replay_wall_s is not None else "Wall       : —")
+    print(f"POSTs      : {request_count}")
+    print(f"Summary    : {run_dir / 'summary.json'}")
+    print(f"Compare    : {run_dir / 'compare.md'}")
+    return 0
+
 def main(argv: Sequence[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--backend", choices=["dflash", "mlxlm"], required=True)
@@ -584,18 +1130,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
-    p.add_argument("--prefix-cache", action=argparse.BooleanOptionalAction, default=True,
+    p.add_argument("--prefix-cache", action=argparse.BooleanOptionalAction, default=None,
                    help="dflash only: pass --prefix-cache/--no-prefix-cache to dflash serve")
     p.add_argument(
         "--prefix-cache-l2",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=None,
         help="dflash only: also pass --prefix-cache-l2 to dflash serve.",
     )
     p.add_argument(
         "--prefix-cache-l2-max-bytes",
         type=int,
-        default=50 * 1024 ** 3,
+        default=None,
         help="L2 cache budget in bytes (default 50 GiB).",
     )
     p.add_argument(
@@ -606,14 +1152,47 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument(
         "--diagnostics",
         choices=("off", "basic", "full"),
-        default="basic",
+        default=None,
         help="dflash only: pass --diagnostics to dflash serve (default: basic).",
+    )
+    p.add_argument(
+        "--draft-quant",
+        default=None,
+        help="dflash only: pass --draft-quant to dflash serve.",
+    )
+    p.add_argument(
+        "--profile",
+        default=None,
+        help="dflash only: pass --profile to dflash serve.",
+    )
+    p.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=None,
+        help="dflash only: pass --prefill-step-size to dflash serve.",
+    )
+    p.add_argument(
+        "--fastpath-max-tokens",
+        type=int,
+        default=None,
+        help="dflash only: pass --fastpath-max-tokens to dflash serve.",
+    )
+    p.add_argument(
+        "--max-snapshot-tokens",
+        type=int,
+        default=None,
+        help="dflash only: pass --max-snapshot-tokens to dflash serve.",
     )
     p.add_argument(
         "--target-fa-window",
         type=int,
-        default=0,
+        default=None,
         help="dflash only: pass --target-fa-window to dflash_mlx.serve",
+    )
+    p.add_argument(
+        "--chat-template-args",
+        default='{"enable_thinking":true}',
+        help="dflash/mlxlm: JSON passed to server --chat-template-args.",
     )
     p.add_argument(
         "--compare-to",
@@ -629,8 +1208,43 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("--draft is required when --backend=dflash")
     if args.prefix_cache_l2 and args.backend != "dflash":
         raise SystemExit("--prefix-cache-l2 requires --backend dflash")
-    if args.target_fa_window < 0:
+    if args.backend != "dflash":
+        dflash_only = {
+            "--prefix-cache": args.prefix_cache,
+            "--prefix-cache-l2": args.prefix_cache_l2,
+            "--prefix-cache-l2-max-bytes": args.prefix_cache_l2_max_bytes,
+            "--prefix-cache-l2-dir": args.prefix_cache_l2_dir,
+            "--diagnostics": args.diagnostics,
+            "--draft-quant": args.draft_quant,
+            "--profile": args.profile,
+            "--prefill-step-size": args.prefill_step_size,
+            "--fastpath-max-tokens": args.fastpath_max_tokens,
+            "--max-snapshot-tokens": args.max_snapshot_tokens,
+            "--target-fa-window": args.target_fa_window,
+        }
+        used = [flag for flag, value in dflash_only.items() if value is not None]
+        if used:
+            raise SystemExit(f"{', '.join(used)} require --backend dflash")
+    for flag_name in ("prefill_step_size", "fastpath_max_tokens", "max_snapshot_tokens"):
+        value = getattr(args, flag_name)
+        if value is not None and int(value) < 0:
+            raise SystemExit(f"--{flag_name.replace('_', '-')} must be >= 0")
+    if args.target_fa_window is not None and args.target_fa_window < 0:
         raise SystemExit("--target-fa-window must be >= 0")
+    if args.prefix_cache_l2_max_bytes is not None and int(args.prefix_cache_l2_max_bytes) < 0:
+        raise SystemExit("--prefix-cache-l2-max-bytes must be >= 0")
+    if args.backend == "dflash":
+        _validate_l2_flags(args)
+    if args.backend == "dflash":
+        args.prefix_cache = True if args.prefix_cache is None else bool(args.prefix_cache)
+        args.prefix_cache_l2 = False if args.prefix_cache_l2 is None else bool(args.prefix_cache_l2)
+        args.prefix_cache_l2_max_bytes = (
+            50 * 1024**3
+            if args.prefix_cache_l2_max_bytes is None
+            else int(args.prefix_cache_l2_max_bytes)
+        )
+        args.diagnostics = "basic" if args.diagnostics is None else args.diagnostics
+        args.target_fa_window = 0 if args.target_fa_window is None else int(args.target_fa_window)
 
     client_timeout_s = args.client_timeout_s
     client_subdir = args.client
@@ -730,6 +1344,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         "proxy_port": args.proxy_port,
         "server_port": server_port,
     }
+    if args.backend == "dflash":
+        metadata["dflash_runtime_overrides"] = {
+            "draft_quant": args.draft_quant,
+            "profile": args.profile,
+            "prefill_step_size": args.prefill_step_size,
+            "fastpath_max_tokens": args.fastpath_max_tokens,
+            "max_snapshot_tokens": args.max_snapshot_tokens,
+            "target_fa_window": args.target_fa_window,
+            "prefix_cache": args.prefix_cache,
+            "prefix_cache_l2": args.prefix_cache_l2,
+            "prefix_cache_l2_dir": args.prefix_cache_l2_dir,
+            "prefix_cache_l2_max_bytes": args.prefix_cache_l2_max_bytes,
+            "diagnostics": args.diagnostics,
+            "chat_template_args": args.chat_template_args,
+        }
     write_manifest(
         run_dir,
         kind="trace",
@@ -787,7 +1416,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _restore_opencode_config(config_text_before)
             else:
                 _restore_pi_config(config_text_before)
-        except Exception as e:
+        except OSError as e:
             sys.stderr.write(f"[orch] restore config err: {e!r}\n")
         if proxy_proc is not None:
             _terminate(proxy_proc, "proxy")
@@ -841,13 +1470,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     ], key=lambda d: d["path"])
 
     totals = _aggregate(posts, client_wall_s)
-    stderr_prefill_saved = [
-        ev["prefill_tokens_saved"]
-        for ev in parse_dflash_stderr(server_stderr_text)
-        if ev.get("kind") == "stats" and isinstance(ev.get("prefill_tokens_saved"), int)
-    ]
-    if stderr_prefill_saved:
-        totals["prefill_tokens_saved_cumulative"] = max(stderr_prefill_saved)
+    _apply_dflash_stderr_totals(totals, server_stderr_text)
 
     summary = {
         "metadata": metadata,
@@ -869,7 +1492,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         peer_json = peer_path / "summary.json" if peer_path.is_dir() else peer_path
         try:
             peer_summary = json.loads(peer_json.read_text())
-        except Exception as e:
+        except (OSError, json.JSONDecodeError) as e:
             sys.stderr.write(f"[orch] could not load peer summary {peer_json}: {e!r}\n")
     (run_dir / "compare.md").write_text(_render_compare(summary, peer=peer_summary))
 
@@ -890,6 +1513,10 @@ def _post_view(p: dict[str, Any]) -> dict[str, Any]:
     decode_wall_s_est = ((end - fb) / 1000.0) if (fb is not None and end is not None and end > fb) else None
     prompt_tokens = sm.get("prompt_tokens") if sm.get("prompt_tokens") is not None else usage.get("prompt_tokens")
     decode_tokens = sm.get("tokens") if sm.get("tokens") is not None else usage.get("completion_tokens")
+    usage_cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+    cache_hit_tokens = sm.get("cache_hit_tokens")
+    if cache_hit_tokens is None and isinstance(usage_cached, int):
+        cache_hit_tokens = usage_cached
     wall_s = sm.get("wall_s") if sm.get("wall_s") is not None else decode_wall_s_est
     tps = sm.get("tps")
     if tps is None and decode_tokens and wall_s and wall_s > 0:
@@ -901,7 +1528,7 @@ def _post_view(p: dict[str, Any]) -> dict[str, Any]:
         "tps": tps,
         "accept": sm.get("accept"),
         "tokens_per_cycle": sm.get("tokens_per_cycle"),
-        "cache_hit_tokens": sm.get("cache_hit_tokens"),
+        "cache_hit_tokens": cache_hit_tokens,
         "prefill_tokens_saved_cumulative": sm.get("prefill_tokens_saved_cumulative"),
         "tool_call_count": lm.get("tool_call_count"),
         "finish_reason": p.get("effective_finish_reason")
@@ -936,10 +1563,15 @@ def _aggregate(posts: list[dict[str, Any]], wall_s: float | None) -> dict[str, A
             total_tool_calls += v["tool_call_count"]
         if isinstance(v.get("prefill_tokens_saved_cumulative"), int):
             prefill_saved_values.append(v["prefill_tokens_saved_cumulative"])
-        cyc = ((p.get("server_metric") or {}).get("cycles_summary") or {})
+        sm = p.get("server_metric") or {}
+        cyc = sm.get("cycles_summary") or {}
         if cyc:
             total_cycles += int(cyc.get("n_cycles") or 0)
             total_commits += int(cyc.get("total_commits") or 0)
+        elif isinstance(sm.get("cycles_completed"), int):
+            total_cycles += int(sm.get("cycles_completed") or 0)
+            if isinstance(sm.get("tokens"), int):
+                total_commits += int(sm.get("tokens") or 0)
         if v["accept"] is not None and v["decode_tokens"]:
             accept_weighted_num += v["accept"] * v["decode_tokens"]
             accept_weighted_den += v["decode_tokens"]
@@ -964,6 +1596,27 @@ def _aggregate(posts: list[dict[str, Any]], wall_s: float | None) -> dict[str, A
         "first_tool_call_ms_sum": sum(first_tool_call_ms_list) if first_tool_call_ms_list else None,
         "first_tool_call_ms_avg": (sum(first_tool_call_ms_list) / len(first_tool_call_ms_list)) if first_tool_call_ms_list else None,
     }
+
+def _post_has_model_output(post: dict[str, Any]) -> bool:
+    landmarks = post.get("landmarks") or {}
+    server_metric = post.get("server_metric") or {}
+    if int(server_metric.get("tokens") or 0) > 0:
+        return True
+    usage = landmarks.get("usage") or {}
+    if isinstance(usage, dict) and int(usage.get("completion_tokens") or 0) > 0:
+        return True
+    return bool(
+        landmarks.get("first_content_token_ms") is not None
+        or landmarks.get("first_tool_call_sent_ms") is not None
+        or int(landmarks.get("tool_call_count") or 0) > 0
+        or int(landmarks.get("tool_call_delta_count") or 0) > 0
+    )
+
+def _ensure_replay_outputs(posts: list[dict[str, Any]]) -> None:
+    if posts and not any(_post_has_model_output(post) for post in posts):
+        raise SystemExit(
+            "replay completed without model output; inspect server/stderr.log for handler errors"
+        )
 
 def _ms(v):
     return f"{v:.0f}" if isinstance(v, (int, float)) else "—"
@@ -1097,7 +1750,7 @@ def _fmt_ratio(a: Any, b: Any) -> str:
         return f"{float(a) / float(b):.3f}"
     return "—"
 
-def _post_prefill_ms_per_token(totals: dict[str, Any]) -> float | None:
+def _observed_response_ms_per_output_token(totals: dict[str, Any]) -> float | None:
     tokens = totals.get("total_decode_tokens")
     wall_s = totals.get("total_decode_wall_s")
     if isinstance(tokens, int) and tokens > 0 and isinstance(wall_s, (int, float)):
@@ -1133,8 +1786,8 @@ def _render_peer_comparison(this: dict[str, Any], peer: dict[str, Any]) -> str:
     tools_this = int(this_tot.get("total_tool_calls") or 0)
     tools_peer = int(peer_tot.get("total_tool_calls") or 0)
     trajectories_aligned = n_this == n_peer and _decode_tokens_aligned(decode_this, decode_peer)
-    this_ms_per_token = _post_prefill_ms_per_token(this_tot)
-    peer_ms_per_token = _post_prefill_ms_per_token(peer_tot)
+    this_ms_per_token = _observed_response_ms_per_output_token(this_tot)
+    peer_ms_per_token = _observed_response_ms_per_output_token(peer_tot)
     this_prefill_saved = this_tot.get("prefill_tokens_saved_cumulative")
     peer_prefill_saved = peer_tot.get("prefill_tokens_saved_cumulative")
 
@@ -1151,9 +1804,9 @@ def _render_peer_comparison(this: dict[str, Any], peer: dict[str, Any]) -> str:
         md.append("⚠️  **TRAJECTORY DIVERGED** — per-POST timing comparison is invalid.")
         md.append("")
         md.append("Trajectories diverged; per-POST timing comparison is invalid.")
-        md.append("Use trajectory-invariant metrics for cross-runtime comparison.")
+        md.append("Use trajectory-robust aggregate metrics for cross-runtime comparison.")
     md.append("")
-    md.append("### Trajectory-invariant metrics (valid for cross-runtime comparison)")
+    md.append("### Trajectory-robust aggregate metrics")
     md.append("")
     md.append(f"| Metric | {this_label} | {peer_label} | delta |")
     md.append("|---|---|---|---|")
@@ -1163,7 +1816,7 @@ def _render_peer_comparison(this: dict[str, Any], peer: dict[str, Any]) -> str:
         f"{_fmt_pct_delta(this_tot.get('decode_tps_avg'), peer_tot.get('decode_tps_avg'))} |"
     )
     md.append(
-        f"| post_prefill_ms_per_token | {_fmt_num(this_ms_per_token, 1)} | "
+        f"| observed_response_ms_per_output_token | {_fmt_num(this_ms_per_token, 1)} | "
         f"{_fmt_num(peer_ms_per_token, 1)} | {_fmt_ms_delta(this_ms_per_token, peer_ms_per_token)} |"
     )
     md.append(

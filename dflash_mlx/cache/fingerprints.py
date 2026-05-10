@@ -14,4 +14,4 @@ class DFlashPrefixKey:
     draft_sink_size: int
     draft_window_size: int
     target_fa_window: int = 0
-    format_version: int = 1
+    format_version: int = 2

@@ -120,6 +120,48 @@ def test_real_gemma4_target_ops_load_cache_and_logits_parity():
     assert int(mx.argmax(native[:, -1, :], axis=-1).item()) == int(
         mx.argmax(custom[:, -1, :], axis=-1).item()
     )
+    last_only, last_only_captured = ops.forward_with_hidden_capture(
+        model,
+        input_ids=tokens,
+        cache=None,
+        capture_layer_ids=capture_keys,
+        logits_last_only=True,
+    )
+    mx.eval(last_only, *last_only_captured.values())
+    assert tuple(last_only.shape[:2]) == (1, 1)
+    assert -1 in last_only_captured
+    assert float(mx.max(mx.abs(native[:, -1:, :] - last_only)).item()) <= 1e-6
+
+    native_last_cache = model.make_cache()
+    ops_last_cache = ops.make_cache(
+        model,
+        enable_speculative_linear_cache=True,
+        quantize_kv_cache=False,
+        target_fa_window=0,
+    )
+    native_last_cached = model(tokens, cache=native_last_cache)
+    ops_last_cached, ops_last_captured = ops.forward_with_hidden_capture(
+        model,
+        input_ids=tokens,
+        cache=ops_last_cache,
+        capture_layer_ids=capture_keys,
+        logits_last_only=True,
+    )
+    mx.eval(native_last_cached, ops_last_cached, *ops_last_captured.values())
+    assert tuple(ops_last_cached.shape[:2]) == (1, 1)
+    assert -1 in ops_last_captured
+    assert float(mx.max(mx.abs(native_last_cached[:, -1:, :] - ops_last_cached)).item()) <= 1e-6
+    native_next = mx.argmax(native_last_cached[:, -1, :], axis=-1).astype(mx.uint32)
+    ops_next = mx.argmax(ops_last_cached[:, -1, :], axis=-1).astype(mx.uint32)
+    native_after = model(native_next[:, None], cache=native_last_cache)
+    ops_after, _ = ops.forward_with_hidden_capture(
+        model,
+        input_ids=ops_next[:, None],
+        cache=ops_last_cache,
+    )
+    mx.eval(native_after, ops_after)
+    assert int(native_next.item()) == int(ops_next.item())
+    assert float(mx.max(mx.abs(native_after - ops_after)).item()) <= 1e-6
 
     native_cache = model.make_cache()
     ops_cache = ops.make_cache(

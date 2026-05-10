@@ -37,7 +37,7 @@ class DFlashPrefixSnapshot:
         return sum(self.nbytes_breakdown().values())
 
     def nbytes_breakdown(self) -> dict[str, int]:
-        target_hidden_bytes = sum(int(c.nbytes) for c in self.target_hidden_chunks)
+        draft_context_bytes = sum(int(c.nbytes) for c in self.target_hidden_chunks)
         last_logits_bytes = int(self.last_logits.nbytes) if self.last_logits is not None else 0
         fa_bytes = 0
         for fa in self.fa_states:
@@ -53,7 +53,7 @@ class DFlashPrefixSnapshot:
         return {
             "fa_kv": fa_bytes,
             "gdn_state": gdn_bytes,
-            "target_hidden": target_hidden_bytes,
+            "draft_context": draft_context_bytes,
             "last_logits": last_logits_bytes,
         }
 

@@ -34,14 +34,15 @@ def collect_memory_waterfall(
     draft = draft_cache_bytes(draft_cache)
     prefix = prefix_cache_memory_fields(prefix_cache_memory)
     hidden_seen: set[int] = set()
-    target_hidden_bytes = tree_nbytes(target_hidden, hidden_seen)
+    draft_context_bytes = tree_nbytes(target_hidden, hidden_seen)
     gen_hidden_chunks_bytes = tree_nbytes(gen_hidden_chunks, hidden_seen)
     out: dict[str, Any] = {
         "memory_phase": str(phase),
         **process,
         **target,
         **draft,
-        "target_hidden_active_bytes": int(target_hidden_bytes),
+        "draft_context_active_bytes": int(draft_context_bytes),
+        "target_hidden_active_bytes": int(draft_context_bytes),
         "gen_hidden_chunks_bytes": int(gen_hidden_chunks_bytes),
         **prefix,
     }
@@ -53,6 +54,7 @@ def collect_memory_waterfall(
         "target_gdn_state_bytes",
         "rollback_tape_bytes",
         "draft_kv_bytes",
+        "draft_context_active_bytes",
         "target_hidden_active_bytes",
         "gen_hidden_chunks_bytes",
         "l1_snapshot_bytes",
@@ -98,6 +100,7 @@ def prefix_cache_memory_bytes(prefix_cache_memory: Optional[dict[str, Any]]) -> 
         "l1_snapshot_bytes": 0,
         "l1_snapshot_fa_kv_bytes": 0,
         "l1_snapshot_gdn_state_bytes": 0,
+        "l1_snapshot_draft_context_bytes": 0,
         "l1_snapshot_target_hidden_bytes": 0,
         "l1_snapshot_last_logits_bytes": 0,
         "l2_disk_bytes": 0,
@@ -157,6 +160,7 @@ def format_memory_waterfall_summary(payload: dict[str, Any]) -> str:
         "target_gdn_state": "target_gdn_state_gb",
         "rollback_tape": "rollback_tape_gb",
         "draft_kv": "draft_kv_gb",
+        "draft_context": "draft_context_active_gb",
         "target_hidden": "target_hidden_active_gb",
         "gen_hidden_chunks": "gen_hidden_chunks_gb",
         "l1_snapshots": "l1_snapshot_gb",

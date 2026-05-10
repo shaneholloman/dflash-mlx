@@ -66,6 +66,7 @@ class TargetOps(Protocol):
         cache: Optional[list[Any]] = None,
         input_embeddings: Optional[mx.array] = None,
         capture_layer_ids: Optional[set[int]] = None,
+        logits_last_only: bool = False,
     ) -> tuple[mx.array, list[mx.array] | dict[int, mx.array]]: ...
 
     def verify_block(

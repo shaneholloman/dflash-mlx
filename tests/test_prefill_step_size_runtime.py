@@ -36,6 +36,7 @@ from dflash_mlx.runtime.context import (
 class _FakeTargetOps:
     def __init__(self) -> None:
         self.forward_lengths: list[int] = []
+        self.logits_last_only_flags: list[bool] = []
         self.cleanup_calls = 0
 
     def capabilities_for(self, _target_model):
@@ -51,11 +52,14 @@ class _FakeTargetOps:
         input_ids,
         cache,
         capture_layer_ids,
+        logits_last_only=False,
     ):
         del cache, capture_layer_ids
         batch, seq_len = input_ids.shape
         self.forward_lengths.append(int(seq_len))
-        logits = mx.zeros((batch, seq_len, 8), dtype=mx.float32)
+        self.logits_last_only_flags.append(bool(logits_last_only))
+        logits_len = 1 if logits_last_only else seq_len
+        logits = mx.zeros((batch, logits_len, 8), dtype=mx.float32)
         hidden = {1: mx.zeros((batch, seq_len, 2), dtype=mx.float32)}
         return logits, hidden
 
@@ -115,6 +119,7 @@ def _draft_model():
         target_layer_ids=[0],
         block_size=4,
         mask_token_id=0,
+        project_target_hidden=lambda value: value,
     )
 
 
@@ -342,6 +347,7 @@ def test_runtime_prefill_chunks_use_configured_step_size():
         target_layer_ids=[0],
         block_size=4,
         mask_token_id=0,
+        project_target_hidden=lambda value: value,
     )
 
     events = list(
@@ -359,6 +365,7 @@ def test_runtime_prefill_chunks_use_configured_step_size():
     )
 
     assert target_ops.forward_lengths == [4, 4, 1, 1]
+    assert target_ops.logits_last_only_flags == [True, True, True, True]
     assert [
         event.tokens_processed
         for event in events
@@ -370,6 +377,86 @@ def test_runtime_prefill_chunks_use_configured_step_size():
     assert prefill_event.prefill_tokens_restored == 0
     assert prefill_event.prefill_tokens_computed == 10
     assert isinstance(events[-1], SummaryEvent)
+
+
+def test_clear_cache_boundaries_false_skips_mlx_clear_cache(monkeypatch):
+    target_ops = _FakeTargetOps()
+    draft_backend = _FakeDraftBackend()
+    calls = []
+    monkeypatch.setattr(
+        spec_epoch.mx,
+        "clear_cache",
+        lambda: calls.append("clear"),
+        raising=False,
+    )
+
+    context = build_runtime_context(
+        runtime_config_from_profile(
+            profile="balanced",
+            prefill_step_size=4,
+            clear_cache_boundaries=False,
+            prefix_cache=False,
+            prefix_cache_l2=False,
+        )
+    )
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=_draft_model(),
+            draft_backend=draft_backend,
+            prompt="unused",
+            max_new_tokens=0,
+            prompt_tokens_override=list(range(6)),
+            runtime_context=context,
+        )
+    )
+
+    summary = next(event for event in events if isinstance(event, SummaryEvent))
+    assert summary.clear_cache_boundaries is False
+    assert calls == []
+
+
+def test_clear_cache_boundaries_true_clears_safe_boundaries(monkeypatch):
+    target_ops = _FakeTargetOps()
+    draft_backend = _FakeDraftBackend()
+    calls = []
+    monkeypatch.setattr(
+        spec_epoch.mx,
+        "clear_cache",
+        lambda: calls.append("clear"),
+        raising=False,
+    )
+
+    context = build_runtime_context(
+        runtime_config_from_profile(
+            profile="balanced",
+            prefill_step_size=4,
+            clear_cache_boundaries=True,
+            prefix_cache=False,
+            prefix_cache_l2=False,
+        )
+    )
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=_draft_model(),
+            draft_backend=draft_backend,
+            prompt="unused",
+            max_new_tokens=0,
+            prompt_tokens_override=list(range(6)),
+            runtime_context=context,
+        )
+    )
+
+    summary = next(event for event in events if isinstance(event, SummaryEvent))
+    assert summary.clear_cache_boundaries is True
+    assert calls == ["clear", "clear", "clear", "clear"]
 
 
 def test_runtime_prefill_accounting_reports_warm_restore():
@@ -388,6 +475,7 @@ def test_runtime_prefill_accounting_reports_warm_restore():
         target_layer_ids=[0],
         block_size=4,
         mask_token_id=0,
+        project_target_hidden=lambda value: value,
     )
     prefix_snapshot = DFlashPrefixSnapshot(
         token_ids=tuple(range(6)),
@@ -424,6 +512,7 @@ def test_runtime_prefill_accounting_reports_warm_restore():
     )
 
     assert target_ops.forward_lengths == [4]
+    assert target_ops.logits_last_only_flags == [True]
     prefill_event = next(event for event in events if isinstance(event, PrefillCompleteEvent))
     assert prefill_event.logical_ctx_tokens == 10
     assert prefill_event.physical_prefill_tokens == 4
@@ -524,6 +613,7 @@ def test_prefill_snapshot_event_carries_snapshot_not_live_arrays():
         target_layer_ids=[0],
         block_size=4,
         mask_token_id=0,
+        project_target_hidden=lambda value: value,
     )
     key = DFlashPrefixKey(
         target_model_id="target",
@@ -745,6 +835,104 @@ def test_request_state_preserves_decode_summary_and_generation_snapshot():
     assert snapshot.token_ids == (1, 2, 0, 0, 0)
 
 
+def test_generation_snapshot_skipped_for_truncated_stable_prefix():
+    target_ops = _FakeTargetOps()
+    draft_backend = _FakeDraftBackend()
+    draft_model = _draft_model()
+    cache = DFlashPrefixCache(max_entries=4)
+    key = _prefix_key()
+    snapshot_service = _snapshot_service(
+        draft_model,
+        cache=cache,
+        builder=PrefixSnapshotBuilder(
+            key=key,
+            draft_model=draft_model,
+            draft_sink_size=64,
+            draft_window_size=1024,
+        ),
+    )
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=draft_model,
+            draft_backend=draft_backend,
+            prompt="unused",
+            max_new_tokens=3,
+            prompt_tokens_override=[1, 2, 3],
+            snapshot_service=snapshot_service,
+            stable_prefix_len=2,
+            runtime_context=_runtime_context(),
+        )
+    )
+
+    prefill_snapshot = next(
+        event
+        for event in events
+        if isinstance(event, SnapshotPublishedEvent) and event.kind == "prefill"
+    )
+    generation_snapshots = [
+        event
+        for event in events
+        if isinstance(event, SnapshotPublishedEvent) and event.kind == "generation"
+    ]
+    matched, snapshot = cache.lookup([1, 2, 3, 0, 0, 0, 99], key)
+
+    assert prefill_snapshot.prefix_len == 2
+    assert generation_snapshots == []
+    assert matched == 2
+    assert snapshot is not None
+    assert snapshot.kind == "prefill"
+
+
+def test_generation_snapshot_skipped_when_request_policy_disallows_it():
+    target_ops = _FakeTargetOps()
+    draft_backend = _FakeDraftBackend()
+    draft_model = _draft_model()
+    cache = DFlashPrefixCache(max_entries=4)
+    key = _prefix_key()
+    snapshot_service = _snapshot_service(
+        draft_model,
+        cache=cache,
+        builder=PrefixSnapshotBuilder(
+            key=key,
+            draft_model=draft_model,
+            draft_sink_size=64,
+            draft_window_size=1024,
+        ),
+    )
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=draft_model,
+            draft_backend=draft_backend,
+            prompt="unused",
+            max_new_tokens=3,
+            prompt_tokens_override=[1, 2],
+            snapshot_service=snapshot_service,
+            publish_generation_snapshot=False,
+            runtime_context=_runtime_context(),
+        )
+    )
+
+    generation_snapshots = [
+        event
+        for event in events
+        if isinstance(event, SnapshotPublishedEvent) and event.kind == "generation"
+    ]
+    matched, snapshot = cache.lookup([1, 2, 0, 0, 0, 99], key)
+
+    assert generation_snapshots == []
+    assert matched == 2
+    assert snapshot is not None
+    assert snapshot.kind == "prefill"
+
+
 def test_request_state_preserves_async_prefetched_draft_reuse():
     target_ops = _FakeTargetOps()
     draft_model = _draft_model()
@@ -949,6 +1137,7 @@ def test_prefill_snapshot_publication_skips_without_snapshot_service():
         target_layer_ids=[0],
         block_size=4,
         mask_token_id=0,
+        project_target_hidden=lambda value: value,
     )
 
     events = list(
@@ -984,6 +1173,7 @@ def test_active_prefix_cache_requires_snapshot_service():
         target_layer_ids=[0],
         block_size=4,
         mask_token_id=0,
+        project_target_hidden=lambda value: value,
     )
 
     try:

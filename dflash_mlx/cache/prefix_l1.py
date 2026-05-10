@@ -59,6 +59,8 @@ class DFlashPrefixCache:
         self,
         req_tokens: list[int] | tuple[int, ...],
         key: DFlashPrefixKey,
+        *,
+        record: bool = True,
     ) -> tuple[int, Optional[DFlashPrefixSnapshot]]:
         req_tuple = tuple(int(t) for t in req_tokens)
         t_start = time.perf_counter_ns()
@@ -102,24 +104,28 @@ class DFlashPrefixCache:
                     best_snapshot = None
                 else:
 
-                    if best_id in self._lru_order:
-                        self._lru_order.remove(best_id)
-                    self._lru_order.append(best_id)
-                    if exact:
-                        self._stats["exact_hits"] += 1
-                    else:
-                        self._stats["prefix_hits"] += 1
-                    self._stats["prefill_tokens_saved"] += best_len
-                    entries_count_log = len(self._entries)
-                    self._log_cache(
-                        op="lookup",
-                        result="exact_hit" if exact else "prefix_hit",
-                        req_tokens=len(req_tuple),
-                        matched_len=int(best_len),
-                        entries=entries_count_log,
-                        elapsed_us=(time.perf_counter_ns() - t_start) / 1_000.0,
-                    )
+                    if record:
+                        if best_id in self._lru_order:
+                            self._lru_order.remove(best_id)
+                        self._lru_order.append(best_id)
+                        if exact:
+                            self._stats["exact_hits"] += 1
+                        else:
+                            self._stats["prefix_hits"] += 1
+                        self._stats["prefill_tokens_saved"] += best_len
+                        entries_count_log = len(self._entries)
+                        self._log_cache(
+                            op="lookup",
+                            result="exact_hit" if exact else "prefix_hit",
+                            req_tokens=len(req_tuple),
+                            matched_len=int(best_len),
+                            entries=entries_count_log,
+                            elapsed_us=(time.perf_counter_ns() - t_start) / 1_000.0,
+                        )
                     return (best_len, best_snapshot)
+
+            if not record:
+                return (0, None)
 
             self._stats["misses"] += 1
             miss_reason = "empty_cache"
@@ -190,6 +196,9 @@ class DFlashPrefixCache:
                 self._stats["evictions"] += 1
                 self._stats["byte_budget_evictions"] += 1
                 breakdown = snapshot.nbytes_breakdown()
+                draft_context_bytes = int(
+                    breakdown.get("draft_context", breakdown.get("target_hidden", 0))
+                )
                 self._log_cache(
                     op="insert",
                     kind=snapshot.kind,
@@ -197,7 +206,8 @@ class DFlashPrefixCache:
                     nbytes=int(snapshot.nbytes),
                     bytes_fa_kv=int(breakdown.get("fa_kv", 0)),
                     bytes_gdn_state=int(breakdown.get("gdn_state", 0)),
-                    bytes_target_hidden=int(breakdown.get("target_hidden", 0)),
+                    bytes_draft_context=draft_context_bytes,
+                    bytes_target_hidden=draft_context_bytes,
                     bytes_last_logits=int(breakdown.get("last_logits", 0)),
                     entries_before=pre_entries,
                     entries_after=pre_entries,
@@ -231,6 +241,9 @@ class DFlashPrefixCache:
                 None,
             )
             breakdown = snapshot.nbytes_breakdown()
+            draft_context_bytes = int(
+                breakdown.get("draft_context", breakdown.get("target_hidden", 0))
+            )
             self._log_cache(
                 op="insert",
                 kind=snapshot.kind,
@@ -238,7 +251,8 @@ class DFlashPrefixCache:
                 nbytes=int(snapshot.nbytes),
                 bytes_fa_kv=int(breakdown.get("fa_kv", 0)),
                 bytes_gdn_state=int(breakdown.get("gdn_state", 0)),
-                bytes_target_hidden=int(breakdown.get("target_hidden", 0)),
+                bytes_draft_context=draft_context_bytes,
+                bytes_target_hidden=draft_context_bytes,
                 bytes_last_logits=int(breakdown.get("last_logits", 0)),
                 entries_before=pre_entries,
                 entries_after=len(self._entries),
@@ -353,6 +367,7 @@ class DFlashPrefixCache:
             "l1_snapshot_bytes": 0,
             "l1_snapshot_fa_kv_bytes": 0,
             "l1_snapshot_gdn_state_bytes": 0,
+            "l1_snapshot_draft_context_bytes": 0,
             "l1_snapshot_target_hidden_bytes": 0,
             "l1_snapshot_last_logits_bytes": 0,
             "prefix_prunes": 0,
@@ -368,18 +383,21 @@ class DFlashPrefixCache:
         out["cross_kind_prunes"] = int(stats.get("cross_kind_prunes", 0))
         out["byte_budget_evictions"] = int(stats.get("byte_budget_evictions", 0))
         if entries:
-            fa = gdn = hidden = logits = total = 0
+            fa = gdn = draft_context = logits = total = 0
             for snapshot in entries:
                 breakdown = snapshot.nbytes_breakdown()
                 fa += int(breakdown.get("fa_kv", 0) or 0)
                 gdn += int(breakdown.get("gdn_state", 0) or 0)
-                hidden += int(breakdown.get("target_hidden", 0) or 0)
+                draft_context += int(
+                    breakdown.get("draft_context", breakdown.get("target_hidden", 0)) or 0
+                )
                 logits += int(breakdown.get("last_logits", 0) or 0)
                 total += int(snapshot.nbytes)
             out["l1_snapshot_bytes"] = total
             out["l1_snapshot_fa_kv_bytes"] = fa
             out["l1_snapshot_gdn_state_bytes"] = gdn
-            out["l1_snapshot_target_hidden_bytes"] = hidden
+            out["l1_snapshot_draft_context_bytes"] = draft_context
+            out["l1_snapshot_target_hidden_bytes"] = draft_context
             out["l1_snapshot_last_logits_bytes"] = logits
         return out
 

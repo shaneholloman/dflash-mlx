@@ -338,6 +338,50 @@ def test_bind_target_model_propagates_non_default_embed_scale():
     assert bool(mx.all(out == expected).item())
 
 
+def test_projected_context_forward_matches_raw_wrapper():
+    draft_model = DFlashDraftModel(_args())
+    noise_embedding = mx.zeros((1, 3, 32), dtype=mx.float32)
+    raw_features = mx.arange(
+        1 * 5 * len(draft_model.target_layer_ids) * 32,
+        dtype=mx.float32,
+    ).reshape(1, 5, len(draft_model.target_layer_ids) * 32)
+
+    projected = draft_model.project_target_hidden(raw_features)
+    raw_out = draft_model(
+        noise_embedding=noise_embedding,
+        target_hidden=raw_features,
+        cache=None,
+    )
+    projected_out = draft_model.forward_projected_context(
+        noise_embedding=noise_embedding,
+        draft_context=projected,
+        cache=None,
+    )
+    mx.eval(raw_out, projected_out)
+
+    assert bool(mx.allclose(raw_out, projected_out, rtol=1e-5, atol=1e-5).item())
+
+
+def test_project_target_hidden_is_chunk_equivalent():
+    draft_model = DFlashDraftModel(_args())
+    raw_features = mx.arange(
+        1 * 5 * len(draft_model.target_layer_ids) * 32,
+        dtype=mx.float32,
+    ).reshape(1, 5, len(draft_model.target_layer_ids) * 32)
+
+    full = draft_model.project_target_hidden(raw_features)
+    chunked = mx.concatenate(
+        [
+            draft_model.project_target_hidden(raw_features[:, :2, :]),
+            draft_model.project_target_hidden(raw_features[:, 2:, :]),
+        ],
+        axis=1,
+    )
+    mx.eval(full, chunked)
+
+    assert bool(mx.allclose(full, chunked, rtol=1e-5, atol=1e-5).item())
+
+
 def test_load_draft_bundle_rejects_future_draft_owned_lm_head(tmp_path):
     mx.save_safetensors(
         str(tmp_path / "model.safetensors"),
@@ -482,10 +526,12 @@ def test_mask_token_id_can_be_generated():
             input_ids,
             cache,
             capture_layer_ids,
+            logits_last_only=False,
         ):
             del cache, capture_layer_ids
             batch, seq_len = input_ids.shape
-            logits = mx.zeros((batch, seq_len, 8), dtype=mx.float32)
+            logits_len = 1 if logits_last_only else seq_len
+            logits = mx.zeros((batch, logits_len, 8), dtype=mx.float32)
             logits[:, :, mask_token_id] = 1.0
             hidden = {1: mx.zeros((batch, seq_len, 2), dtype=mx.float32)}
             return logits, hidden
@@ -534,6 +580,7 @@ def test_mask_token_id_can_be_generated():
     class _DraftModel:
         target_layer_ids = [0]
         block_size = 1
+        project_target_hidden = staticmethod(lambda value: value)
 
     draft_model = _DraftModel()
     draft_model.mask_token_id = mask_token_id
@@ -588,10 +635,12 @@ def test_prefix_snapshot_capability_disables_snapshot_events(monkeypatch):
             input_ids,
             cache,
             capture_layer_ids,
+            logits_last_only=False,
         ):
             del cache, capture_layer_ids
             batch, seq_len = input_ids.shape
-            logits = mx.zeros((batch, seq_len, 8), dtype=mx.float32)
+            logits_len = 1 if logits_last_only else seq_len
+            logits = mx.zeros((batch, logits_len, 8), dtype=mx.float32)
             logits[:, :, 2] = 1.0
             hidden = {1: mx.zeros((batch, seq_len, 2), dtype=mx.float32)}
             return logits, hidden
@@ -642,6 +691,7 @@ def test_prefix_snapshot_capability_disables_snapshot_events(monkeypatch):
         target_layer_ids = [0]
         block_size = 1
         mask_token_id = 5
+        project_target_hidden = staticmethod(lambda value: value)
 
     events = list(
         spec_epoch.stream_dflash_generate_impl(

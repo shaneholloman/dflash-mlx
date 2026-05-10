@@ -36,9 +36,12 @@ starts the recording proxy, drives a real OpenCode or pi session, and writes
 the observed requests, SSE stream, server diagnostics, and workspace output.
 By default it writes one run directory under `.artifacts/dflash/traces/...`.
 
-It is not an exact replay engine. It does not force two runtimes to take the
-same token trajectory, and it does not validate output quality. A future replay
-mode must either replay deterministically or fail explicitly as not implemented.
+`agentic_trace replay` is a fixed-body replay harness. It starts a fresh
+DFlash or `mlx_lm.server`, replays captured `requests/*.json` bodies directly,
+and writes a fresh `summary.json` / `compare.md`. Use replay when a live
+OpenCode/pi trajectory would add noise to a runtime or cache A/B. Replay fixes
+the request bodies, not the model's generated token stream, so decode length can
+still vary.
 
 ## Cross-runtime opencode comparison (dflash vs mlxlm)
 
@@ -49,16 +52,20 @@ python -m tools.benchmarks.agentic_trace run --backend mlxlm --target <model> \
     --task-file <task.txt> --label mlx_baseline
 python -m tools.benchmarks.agentic_trace run --backend dflash --target <model> \
     --draft <draft> --task-file <task.txt> --label dflash_run \
-    --prefix-cache --prefix-cache-l2 --diagnostics basic \
+    --draft-quant w4 --profile long-session --prefill-step-size 1024 \
+    --fastpath-max-tokens 0 --prefix-cache --prefix-cache-l2 \
+    --diagnostics basic \
     --compare-to .artifacts/dflash/traces/<mlx_baseline_dir>
 ```
 
 The dflash run emits `compare.md` with:
 
-- **Trajectory-invariant metrics** (`decode_tps_avg`,
-  `prefix_tokens_saved`, `weighted_acceptance`,
-  `post_prefill_ms_per_token`) — the only metrics that are mathematically
-  valid for cross-runtime comparison.
+- **Trajectory-robust aggregate metrics** (`decode_tps_avg`,
+  `prefill_tokens_saved`, `weighted_acceptance`,
+  `observed_response_ms_per_output_token`) — aggregate rates that remain
+  readable when trajectories diverge. `observed_response_ms_per_output_token`
+  is response wall time divided by streamed output tokens; it is not a prefill
+  metric.
 - **Trajectory-dependent metrics** (`wall_s`, POST count) shown for reference
   with caveats — if trajectories diverge, these metrics describe the captured
   sessions, not a direct runtime-speed comparison.
@@ -69,6 +76,22 @@ The dflash run emits `compare.md` with:
 For deterministic per-token A/B with no trajectory divergence by construction,
 use `dflash benchmark` on a fixed prompt. That benchmark runs both runtimes
 in-process on identical input.
+
+For real captured POST bodies with fixed prompt shape:
+
+```bash
+python -m tools.benchmarks.agentic_trace replay \
+    --source-trace .artifacts/dflash/traces/<captured_dir> \
+    --backend mlxlm --target <model> --label mlx_replay
+
+python -m tools.benchmarks.agentic_trace replay \
+    --source-trace .artifacts/dflash/traces/<captured_dir> \
+    --backend dflash --target <model> --draft <draft> \
+    --draft-quant w4 --profile long-session --prefill-step-size 1024 \
+    --fastpath-max-tokens 0 --prefix-cache --prefix-cache-l2 \
+    --diagnostics basic --label dflash_replay \
+    --compare-to .artifacts/dflash/traces/<mlx_replay_dir>
+```
 
 Private `_*.py` files are implementation modules for these wrappers.
 

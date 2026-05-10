@@ -35,7 +35,7 @@ class DraftBackend(Protocol):
         draft_model: DFlashDraftModel,
         draft_cache: list[Any],
         staged_first: mx.array,
-        target_hidden: mx.array,
+        draft_context: mx.array,
         block_len: int,
         mask_token_tail: mx.array,
         suppress_token_mask: Optional[mx.array],
@@ -76,7 +76,7 @@ class EagerDraftBackend:
         draft_model: DFlashDraftModel,
         draft_cache: list[Any],
         staged_first: mx.array,
-        target_hidden: mx.array,
+        draft_context: mx.array,
         block_len: int,
         mask_token_tail: mx.array,
         suppress_token_mask: Optional[mx.array],
@@ -92,9 +92,9 @@ class EagerDraftBackend:
         noise_embedding = target_ops.embed_tokens(target_model)(
             block_token_ids[None]
         )
-        draft_hidden = draft_model(
+        draft_hidden = draft_model.forward_projected_context(
             noise_embedding=noise_embedding,
-            target_hidden=target_hidden,
+            draft_context=draft_context,
             cache=draft_cache,
         )
         draft_logits = target_ops.logits_from_hidden(

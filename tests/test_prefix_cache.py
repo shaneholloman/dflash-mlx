@@ -24,7 +24,11 @@ from dflash_mlx.cache.prefix_l1 import DFlashPrefixCache
 from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
 from dflash_mlx.cache.store import PrefixSnapshotStore
 from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
-from dflash_mlx.server.prefix_cache_flow import compute_stable_prefix_len
+from dflash_mlx.server.prefix_cache_flow import (
+    compute_request_stable_prefix_len,
+    compute_stable_prefix_len,
+    publish_generation_snapshots_for_request,
+)
 
 def _make_kv_cache_populated(n_tokens: int = 4, hkv: int = 2, d: int = 8) -> KVCache:
     cache = KVCache()
@@ -449,6 +453,45 @@ class TestSerializeHydrate:
         assert snapshot.target_hidden_chunk_spans == ((0, 4), (84, 100))
         assert snapshot.target_hidden_total_len == 100
 
+    def test_snapshot_target_hidden_is_clamped_to_token_prefix(self):
+        target_hidden = mx.zeros((1, 8, 4), dtype=mx.float32)
+
+        snapshot = build_snapshot(
+            token_ids=list(range(5)),
+            target_cache=[_make_kv_cache_populated(n_tokens=5)],
+            target_hidden=target_hidden,
+            last_logits=mx.zeros((1, 10), dtype=mx.float32),
+            key=_make_key(),
+            trim_target_hidden=False,
+        )
+
+        assert snapshot.target_hidden_total_len == 5
+        assert snapshot.target_hidden_chunk_spans == ((0, 5),)
+        assert snapshot.target_hidden_chunks[0].shape[1] == 5
+
+    def test_build_snapshot_rejects_short_target_hidden(self):
+        with pytest.raises(
+            ValueError,
+            match="target_hidden length 3 < token prefix length 5",
+        ):
+            build_snapshot(
+                token_ids=list(range(5)),
+                target_cache=[_make_kv_cache_populated(n_tokens=5)],
+                target_hidden=mx.zeros((1, 3, 4), dtype=mx.float32),
+                last_logits=mx.zeros((1, 10), dtype=mx.float32),
+                key=_make_key(),
+            )
+
+    def test_build_snapshot_rejects_fa_cache_offset_mismatch(self):
+        with pytest.raises(ValueError, match="FA cache offset 8 at layer 0"):
+            build_snapshot(
+                token_ids=list(range(5)),
+                target_cache=[_make_kv_cache_populated(n_tokens=8)],
+                target_hidden=mx.zeros((1, 5, 4), dtype=mx.float32),
+                last_logits=mx.zeros((1, 10), dtype=mx.float32),
+                key=_make_key(),
+            )
+
     def test_gdn_only_round_trip(self):
         src = [_make_gdn_cache_populated(size=3, conv_k=4)]
         assert target_cache_is_serializable(src)
@@ -488,10 +531,10 @@ class TestSerializeHydrate:
                     RecurrentRollbackCache(size=3, conv_kernel_size=4),
                     RecurrentRollbackCache(size=3, conv_kernel_size=4)]
         snapshot = _make_full_hidden_snapshot(
-            token_ids=(1, 2),
+            token_ids=(1, 2, 3, 4),
             fa_states=fa,
             gdn_states=gdn,
-            target_hidden=mx.zeros((1, 2, 4)),
+            target_hidden=mx.zeros((1, 4, 4)),
             last_logits=mx.zeros((1, 10)),
             key=_make_key(),
         )
@@ -509,7 +552,7 @@ class TestSerializeHydrate:
             serialize_target_cache(src)
 
     def test_hydrate_size_mismatch_raises(self):
-        src = [_make_kv_cache_populated()]
+        src = [_make_kv_cache_populated(n_tokens=1)]
         fa, gdn = serialize_target_cache(src)
         snapshot = _make_full_hidden_snapshot(
             token_ids=(1,),
@@ -523,8 +566,22 @@ class TestSerializeHydrate:
         with pytest.raises(ValueError, match="Template cache length"):
             hydrate_target_cache(snapshot, template)
 
+    def test_hydrate_rejects_fa_cache_offset_mismatch(self):
+        src = [_make_kv_cache_populated(n_tokens=4)]
+        fa, gdn = serialize_target_cache(src)
+        snapshot = _make_full_hidden_snapshot(
+            token_ids=(1, 2),
+            fa_states=fa,
+            gdn_states=gdn,
+            target_hidden=mx.zeros((1, 2, 4)),
+            last_logits=mx.zeros((1, 10)),
+            key=_make_key(),
+        )
+        with pytest.raises(ValueError, match="FA cache offset 4 at layer 0"):
+            hydrate_target_cache(snapshot, [KVCache()])
+
     def test_hydrate_type_mismatch_raises(self):
-        src = [_make_kv_cache_populated()]
+        src = [_make_kv_cache_populated(n_tokens=1)]
         fa, gdn = serialize_target_cache(src)
         snapshot = _make_full_hidden_snapshot(
             token_ids=(1,),
@@ -786,6 +843,31 @@ class TestStablePrefixLen:
 
     IM_START = 900
     ASST = 901
+    GEMMA_TURN = 105
+    GEMMA_MODEL = 4368
+    GEMMA_NEWLINE = 107
+
+    class GemmaTokenizer:
+        unk_token_id = 3
+
+        def convert_tokens_to_ids(self, tokens):
+            if tokens == ["<|im_start|>", "assistant"]:
+                return [3, 111457]
+            if tokens == ["<|turn>", "model"]:
+                return [
+                    TestStablePrefixLen.GEMMA_TURN,
+                    TestStablePrefixLen.GEMMA_MODEL,
+                ]
+            return [3 for _ in tokens]
+
+        def encode(self, text):
+            if text == "<|turn>model\n":
+                return [
+                    TestStablePrefixLen.GEMMA_TURN,
+                    TestStablePrefixLen.GEMMA_MODEL,
+                    TestStablePrefixLen.GEMMA_NEWLINE,
+                ]
+            return [3]
 
     def test_no_markers_returns_full_length(self):
 
@@ -899,6 +981,98 @@ class TestStablePrefixLen:
 
         assert compute_stable_prefix_len([], im_start_id=1, assistant_id=2) == 0
         assert compute_stable_prefix_len([5], im_start_id=1, assistant_id=2) == 1
+
+    def test_request_stable_prefix_keeps_tool_tail(self):
+        tokens = [
+            10,
+            11,
+            self.GEMMA_TURN,
+            self.GEMMA_MODEL,
+            self.GEMMA_NEWLINE,
+            100,
+            200,
+            300,
+            400,
+        ]
+        request = SimpleNamespace(
+            request_type="chat",
+            messages=[
+                {"role": "system", "content": "s"},
+                {"role": "user", "content": "u"},
+                {"role": "assistant", "tool_calls": []},
+                {"role": "tool", "content": "ok"},
+            ],
+        )
+
+        assert (
+            compute_request_stable_prefix_len(
+                tokens,
+                tokenizer=self.GemmaTokenizer(),
+                request=request,
+            )
+            == len(tokens)
+        )
+
+    def test_request_stable_prefix_user_turn_uses_marker_boundary(self):
+        tokens = [
+            10,
+            11,
+            self.GEMMA_TURN,
+            self.GEMMA_MODEL,
+            self.GEMMA_NEWLINE,
+            100,
+            200,
+            300,
+            400,
+        ]
+        request = SimpleNamespace(
+            request_type="chat",
+            messages=[
+                {"role": "system", "content": "s"},
+                {"role": "user", "content": "u"},
+            ],
+        )
+
+        assert (
+            compute_request_stable_prefix_len(
+                tokens,
+                tokenizer=self.GemmaTokenizer(),
+                request=request,
+            )
+            == 5
+        )
+
+    def test_request_stable_prefix_non_chat_uses_marker_boundary(self):
+        tokens = [
+            10,
+            11,
+            self.GEMMA_TURN,
+            self.GEMMA_MODEL,
+            self.GEMMA_NEWLINE,
+            100,
+            200,
+        ]
+        request = SimpleNamespace(request_type="completion")
+
+        assert (
+            compute_request_stable_prefix_len(
+                tokens,
+                tokenizer=self.GemmaTokenizer(),
+                request=request,
+            )
+            == 5
+        )
+
+    def test_tool_enabled_chat_disables_generation_snapshots(self):
+        assert not publish_generation_snapshots_for_request(
+            SimpleNamespace(request_type="chat", tools=[{"type": "function"}])
+        )
+        assert publish_generation_snapshots_for_request(
+            SimpleNamespace(request_type="chat", tools=[])
+        )
+        assert publish_generation_snapshots_for_request(
+            SimpleNamespace(request_type="completion", tools=[{"type": "function"}])
+        )
 
 class TestPrefixPruning:
     def test_strict_prefix_pruned_on_insert(self):

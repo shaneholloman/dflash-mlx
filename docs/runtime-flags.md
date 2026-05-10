@@ -111,7 +111,7 @@ Prefix cache:
 | `--prefix-cache-max-entries INT` | L1 snapshot entry budget |
 | `--prefix-cache-max-bytes BYTES` | L1 snapshot byte budget |
 | `--max-snapshot-tokens INT` | snapshot insert token cap; `0` disables the cap |
-| `--prefix-cache-l2`, `--no-prefix-cache-l2` | enable/disable SSD L2 for evicted snapshots |
+| `--prefix-cache-l2`, `--no-prefix-cache-l2` | enable/disable SSD L2 for persisted/spilled snapshots |
 | `--prefix-cache-l2-dir PATH` | L2 root directory |
 | `--prefix-cache-l2-max-bytes BYTES` | L2 disk budget |
 <!-- dflash-runtime-config:prefix-cache:end -->
@@ -122,8 +122,12 @@ Notes:
   differs from full-KV verification.
 - `max_snapshot_tokens` skips oversized inserts when L2 is absent. With L2
   enabled, oversized snapshots may still be accepted and later spilled by budget.
-- L2 helps revisits after L1 eviction. It does not reduce the active request KV
-  bucket.
+- For chat-template requests with a stable assistant/model boundary, DFlash
+  stores the reusable prefill boundary and skips raw end-of-generation snapshots
+  because the next request retokenizes assistant text through the chat template.
+- L2 persists admitted prefill snapshots and stores snapshots spilled from L1.
+  It helps revisits after process restart or L1 eviction. It does not reduce the
+  active request KV bucket.
 
 Upstream prompt cache:
 

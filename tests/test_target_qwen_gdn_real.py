@@ -72,6 +72,33 @@ def test_real_qwen_gdn_target_ops_forward_cache_and_rollback_parity():
     assert captured
     _assert_close(ops_logits, native_logits)
 
+    native_last_cache = model.make_cache()
+    ops_last_cache = ops.make_cache(
+        model,
+        enable_speculative_linear_cache=False,
+        quantize_kv_cache=False,
+        target_fa_window=0,
+    )
+    native_last_cached = model(prompt, cache=native_last_cache)
+    ops_last_cached, ops_last_captured = ops.forward_with_hidden_capture(
+        model,
+        input_ids=prompt,
+        cache=ops_last_cache,
+        capture_layer_ids={1},
+        logits_last_only=True,
+    )
+    mx.eval(native_last_cached, ops_last_cached, *ops_last_captured.values())
+    assert tuple(ops_last_cached.shape[:2]) == (1, 1)
+    assert -1 in ops_last_captured
+    _assert_close(ops_last_cached, native_last_cached[:, -1:, :])
+    native_after_last = model(verify[:, :1], cache=native_last_cache)
+    ops_after_last, _ = ops.forward_with_hidden_capture(
+        model,
+        input_ids=verify[:, :1],
+        cache=ops_last_cache,
+    )
+    _assert_close(ops_after_last, native_after_last)
+
     native_cache = model.make_cache()
     ops_cache = ops.make_cache(
         model,

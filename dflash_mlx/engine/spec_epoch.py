@@ -65,6 +65,7 @@ class _SessionRequest:
     snapshot_service: Optional[SnapshotService] = None
     stable_prefix_len: Optional[int] = None
     prefix_cache_active: bool = False
+    publish_generation_snapshot: bool = True
     prompt_array: mx.array = field(init=False, repr=False)
     prompt_len: int = field(init=False)
     stop_token_array: Optional[mx.array] = field(init=False, repr=False)
@@ -82,6 +83,7 @@ class _SessionRequest:
         snapshot_service: Optional[SnapshotService],
         stable_prefix_len: Optional[int],
         prefix_cache_active: bool,
+        publish_generation_snapshot: bool = True,
     ) -> "_SessionRequest":
         return cls(
             prompt_tokens=tuple(int(token) for token in prompt_tokens),
@@ -97,6 +99,7 @@ class _SessionRequest:
             snapshot_service=snapshot_service,
             stable_prefix_len=stable_prefix_len,
             prefix_cache_active=bool(prefix_cache_active),
+            publish_generation_snapshot=bool(publish_generation_snapshot),
         )
 
     def __post_init__(self) -> None:
@@ -279,6 +282,7 @@ class SpeculativeSession:
         target_cache = self.target_cache
         target_ops = self.target_ops
         target_model = self.target_model
+        draft_model = self.draft_model
         runtime_config = self.runtime_config
         snap_prefix_len = self.snap_prefix_len
         supports_prefix_snapshot = self.supports_prefix_snapshot
@@ -295,7 +299,10 @@ class SpeculativeSession:
         stable_prefix_len = request.stable_prefix_len
         prefix_cache_active = request.prefix_cache_active
 
-        feature_store = TargetFeatureStore(prompt_len=prompt_len)
+        feature_store = TargetFeatureStore(
+            prompt_len=prompt_len,
+            project_context=draft_model.project_target_hidden,
+        )
         if supports_prefix_snapshot and snapshot_service is None:
             if prefix_cache_active:
                 raise ValueError("snapshot_service is required when prefix cache is active")
@@ -349,6 +356,7 @@ class SpeculativeSession:
                     input_ids=chunk_ids,
                     cache=target_cache,
                     capture_layer_ids=capture_layer_ids,
+                    logits_last_only=True,
                 )
             )
             eval_logits_and_captured(state.prefill_logits, prefill_hidden_states)
@@ -407,6 +415,7 @@ class SpeculativeSession:
                     input_ids=prompt_array[:, final_prompt_start:snapshot_boundary],
                     cache=target_cache,
                     capture_layer_ids=capture_layer_ids,
+                    logits_last_only=True,
                 )
             )
             eval_logits_and_captured(state.prefill_logits, prefill_hidden_states)
@@ -428,8 +437,7 @@ class SpeculativeSession:
             tokens_total=int(prompt_len),
         )
         yield_pause.done(_pre_yield)
-        if hasattr(mx, "clear_cache"):
-            mx.clear_cache()
+        self.clear_cache_boundary()
 
         exact_snapshot_restore = bool(
             snap_prefix_len > 0 and snap_prefix_len == snapshot_boundary
@@ -483,6 +491,7 @@ class SpeculativeSession:
                 input_ids=prompt_array[:, snapshot_boundary:prompt_len],
                 cache=target_cache,
                 capture_layer_ids=capture_layer_ids,
+                logits_last_only=True,
             )
             eval_logits_and_captured(tail_logits, tail_hidden_states)
             tail_feat = target_ops.extract_context_feature(
@@ -570,6 +579,13 @@ class SpeculativeSession:
         yield_pause: "_YieldPauseTracker",
     ) -> Iterator[EngineEvent]:
         if not supports_prefix_snapshot or not state.generated_token_ids:
+            return
+        if not request.publish_generation_snapshot:
+            return
+        if (
+            request.stable_prefix_len is not None
+            and 0 < int(request.stable_prefix_len) < int(request.prompt_len)
+        ):
             return
 
         end_target_hidden = feature_store.generation_snapshot_hidden()
@@ -725,7 +741,7 @@ class SpeculativeSession:
                         draft_model=draft_model,
                         draft_cache=draft_cache,
                         staged_first=current_staged_first,
-                        target_hidden=feature_store.require_current_hidden(),
+                        draft_context=feature_store.require_current_hidden(),
                         block_len=block_len,
                         mask_token_tail=mask_token_tail,
                         suppress_token_mask=suppress_token_mask,
@@ -749,7 +765,7 @@ class SpeculativeSession:
                             draft_model=draft_model,
                             draft_cache=draft_cache,
                             staged_first=current_staged_first,
-                            target_hidden=feature_store.require_current_hidden(),
+                            draft_context=feature_store.require_current_hidden(),
                             block_len=block_len,
                             mask_token_tail=mask_token_tail,
                             suppress_token_mask=suppress_token_mask,
@@ -890,7 +906,7 @@ class SpeculativeSession:
                         draft_model=draft_model,
                         draft_cache=draft_cache,
                         staged_first=staged_first_next,
-                        target_hidden=feature_store.require_current_hidden(),
+                        draft_context=feature_store.require_current_hidden(),
                         block_len=next_block_len,
                         mask_token_tail=mask_token_tail,
                         suppress_token_mask=suppress_token_mask,
@@ -1092,8 +1108,7 @@ class SpeculativeSession:
 
     def close(self) -> None:
         self.target_ops.cleanup_generation_caches(self.target_cache, self.draft_cache)
-        if hasattr(mx, "clear_cache"):
-            mx.clear_cache()
+        self.clear_cache_boundary()
 
 
 @dataclass
@@ -1186,6 +1201,7 @@ def stream_dflash_generate_impl(
     snapshot_service: Optional[SnapshotService] = None,
     stable_prefix_len: Optional[int] = None,
     prefix_cache_active: bool = False,
+    publish_generation_snapshot: bool = True,
     runtime_context: Any,
 ) -> Iterator[EngineEvent]:
     target_capabilities = target_ops.capabilities_for(target_model)
@@ -1238,6 +1254,7 @@ def stream_dflash_generate_impl(
         snapshot_service=snapshot_service,
         stable_prefix_len=stable_prefix_len,
         prefix_cache_active=prefix_cache_active,
+        publish_generation_snapshot=publish_generation_snapshot,
     )
 
     session = SpeculativeSession.open(

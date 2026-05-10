@@ -655,8 +655,28 @@ class DFlashDraftModel(nn.Module):
         text_model = target_ops.text_model(target_model)
         self.embed_scale = getattr(text_model, "embed_scale", 1.0)
 
-    def _project_target_hidden(self, target_hidden: mx.array) -> mx.array:
+    def project_target_hidden(self, target_hidden: mx.array) -> mx.array:
         return self.hidden_norm(self.fc(target_hidden))
+
+    def forward_projected_context(
+        self,
+        *,
+        noise_embedding: mx.array,
+        draft_context: mx.array,
+        cache: Optional[list[Any]] = None,
+    ) -> mx.array:
+        hidden_states = noise_embedding * self.embed_scale
+
+        if cache is None:
+            cache = [None] * len(self.layers)
+
+        for layer, layer_cache in zip(self.layers, cache, strict=True):
+            hidden_states = layer(
+                hidden_states,
+                target_hidden=draft_context,
+                cache=layer_cache,
+            )
+        return self.norm(hidden_states)
 
     def __call__(
         self,
@@ -665,19 +685,11 @@ class DFlashDraftModel(nn.Module):
         target_hidden: mx.array,
         cache: Optional[list[Any]] = None,
     ) -> mx.array:
-        hidden_states = noise_embedding * self.embed_scale
-        projected_hidden = self._project_target_hidden(target_hidden)
-
-        if cache is None:
-            cache = [None] * len(self.layers)
-
-        for layer, layer_cache in zip(self.layers, cache, strict=True):
-            hidden_states = layer(
-                hidden_states,
-                target_hidden=projected_hidden,
-                cache=layer_cache,
-            )
-        return self.norm(hidden_states)
+        return self.forward_projected_context(
+            noise_embedding=noise_embedding,
+            draft_context=self.project_target_hidden(target_hidden),
+            cache=cache,
+        )
 
     def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
         return weights

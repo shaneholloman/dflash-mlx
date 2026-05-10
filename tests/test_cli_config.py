@@ -587,7 +587,7 @@ def test_profile_balanced_sets_product_defaults(monkeypatch):
     assert cfg.prefix_cache_max_entries == 4
     assert cfg.prefix_cache_max_bytes == 8 * 1024**3
     assert cfg.clear_cache_boundaries is False
-    assert cfg.max_snapshot_tokens == 24000
+    assert cfg.max_snapshot_tokens == 32000
     assert cfg.prefix_cache_l2 is False
     assert cfg.verify_mode == "auto"
 

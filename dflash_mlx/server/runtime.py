@@ -140,6 +140,7 @@ class ServerRuntime:
             draft_model=draft_model,
             tokenizer=tokenizer,
             prompt=prepared.prompt,
+            request=request,
             runtime_context=runtime_context,
         )
         ctx.prompt_cache_count = prefix_flow.hit_tokens
@@ -167,6 +168,7 @@ class ServerRuntime:
             snapshot_service=prefix_flow.snapshot_service,
             stable_prefix_len=prefix_flow.stable_prefix_len,
             prefix_cache_active=prefix_flow.cache_active,
+            publish_generation_snapshot=prefix_flow.publish_generation_snapshot,
             runtime_context=runtime_context,
         )
         loop_result = consume_dflash_events(

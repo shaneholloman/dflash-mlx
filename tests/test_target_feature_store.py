@@ -48,6 +48,26 @@ def test_target_feature_store_writes_prompt_slices_and_prefix_view():
     assert mx.all(prefix[:, 2:3, :] == 2).item()
 
 
+def test_target_feature_store_projects_raw_features_before_storing():
+    def project(features):
+        return features[:, :, :2] * 3
+
+    store = TargetFeatureStore(prompt_len=3, project_context=project)
+    raw_prompt = mx.ones((1, 3, 4), dtype=mx.float32)
+    raw_gen = mx.ones((1, 2, 4), dtype=mx.float32) * 2
+
+    hidden = store.write_prompt_slice(start=0, end=3, features=raw_prompt)
+    store.freeze_prefill_for_snapshot(enabled=True)
+    store.commit_generation(raw_gen, collect_snapshot=True)
+    snapshot_hidden = store.generation_snapshot_hidden()
+
+    assert hidden.shape == (1, 3, 2)
+    assert store.current_hidden.shape == (1, 2, 2)
+    assert snapshot_hidden.shape == (1, 5, 2)
+    assert mx.all(snapshot_hidden[:, :3, :] == 3).item()
+    assert mx.all(snapshot_hidden[:, 3:, :] == 6).item()
+
+
 def test_target_feature_store_requires_current_hidden():
     store = TargetFeatureStore(prompt_len=1)
     with pytest.raises(RuntimeError, match="target hidden features are unavailable"):

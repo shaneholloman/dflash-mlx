@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import mlx.core as mx
 
@@ -15,6 +15,7 @@ from dflash_mlx.engine.prefill import init_target_hidden_from_snapshot
 @dataclass
 class TargetFeatureStore:
     prompt_len: int
+    project_context: Callable[[mx.array], mx.array] | None = None
     _current_hidden: mx.array | None = None
     _prefill_hidden_for_snapshot: mx.array | None = None
     _generation_chunks: list[mx.array] = field(default_factory=list)
@@ -52,6 +53,7 @@ class TargetFeatureStore:
         end: int,
         features: mx.array,
     ) -> mx.array:
+        features = self._project(features)
         if self._current_hidden is None:
             self._current_hidden = mx.zeros(
                 (features.shape[0], int(self.prompt_len), features.shape[-1]),
@@ -75,6 +77,7 @@ class TargetFeatureStore:
         *,
         collect_snapshot: bool,
     ) -> None:
+        committed_hidden = self._project(committed_hidden)
         self._current_hidden = committed_hidden
         if collect_snapshot:
             self._generation_chunks.append(committed_hidden)
@@ -90,3 +93,10 @@ class TargetFeatureStore:
         hidden = mx.concatenate([self._prefill_hidden_for_snapshot, gen_hidden], axis=1)
         mx.eval(hidden)
         return hidden
+
+    def _project(self, features: mx.array) -> mx.array:
+        if self.project_context is None:
+            return features
+        projected = self.project_context(features)
+        mx.eval(projected)
+        return projected

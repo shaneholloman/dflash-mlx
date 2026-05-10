@@ -59,6 +59,7 @@ def stream_dflash_generate(
     snapshot_service: SnapshotService | None = None,
     stable_prefix_len: int | None = None,
     prefix_cache_active: bool = False,
+    publish_generation_snapshot: bool = True,
     runtime_context: Any = None,
 ) -> Iterator[EngineEvent]:
     if runtime_context is None:
@@ -93,5 +94,6 @@ def stream_dflash_generate(
             snapshot_service=snapshot_service,
             stable_prefix_len=stable_prefix_len,
             prefix_cache_active=prefix_cache_active,
+            publish_generation_snapshot=publish_generation_snapshot,
             runtime_context=runtime_context,
         )

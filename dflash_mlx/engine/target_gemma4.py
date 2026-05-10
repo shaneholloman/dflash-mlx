@@ -205,6 +205,7 @@ class Gemma4TargetOps:
         cache: Optional[list[Any]] = None,
         input_embeddings: Optional[mx.array] = None,
         capture_layer_ids: Optional[set[int]] = None,
+        logits_last_only: bool = False,
     ) -> tuple[mx.array, list[mx.array] | dict[int, mx.array]]:
         inner = self.text_model(target_model)
         if input_embeddings is None:
@@ -258,7 +259,10 @@ class Gemma4TargetOps:
             intermediates[idx] = (shared_kv, offset)
 
         normalized = inner.norm(h)
-        logits = self.logits_from_hidden(target_model, normalized)
+        if logits_last_only and isinstance(captured, dict):
+            captured[-1] = normalized
+        logits_hidden = normalized[:, -1:, :] if logits_last_only else normalized
+        logits = self.logits_from_hidden(target_model, logits_hidden)
         return logits, captured
 
     def verify_block(

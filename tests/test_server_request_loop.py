@@ -17,12 +17,14 @@ from dflash_mlx.engine.events import (
     TokenEvent,
 )
 from dflash_mlx.server import metrics as metrics_mod
+from dflash_mlx.server import runtime as server_runtime_mod
 from dflash_mlx.server.metrics import (
     get_live_metrics_payload,
     reset_live_metrics_for_tests,
     start_live_request,
 )
 from dflash_mlx.server.request_loop import consume_dflash_events
+from dflash_mlx.server.runtime import PreparedDFlashRequest, ServerRuntime
 
 class FakeDetokenizer:
     def __init__(self):
@@ -43,6 +45,8 @@ class FakeDetokenizer:
         self.last_segment = ""
 
 class FakeTokenizer:
+    eos_token_ids = {0}
+
     def __init__(self):
         self.detokenizer = FakeDetokenizer()
 
@@ -257,6 +261,129 @@ def test_consume_dflash_events_rejects_stale_dict_events():
 
     assert events.closed is True
     assert rqueue.empty()
+
+
+def test_server_runtime_routes_tool_chat_generation_snapshot_policy(monkeypatch):
+    reset_live_metrics_for_tests()
+    monkeypatch.setattr(metrics_mod, "current_runtime_cache_manager", lambda: None)
+    captured = {}
+    runtime_context = SimpleNamespace(
+        runtime=SimpleNamespace(),
+        diagnostics=SimpleNamespace(
+            trace=SimpleNamespace(log_dir=None),
+            memory_waterfall=False,
+        ),
+    )
+    provider = SimpleNamespace(
+        model=object(),
+        tokenizer=FakeTokenizer(),
+        draft_model=object(),
+        draft_backend=object(),
+        target_ops=object(),
+        cli_args=SimpleNamespace(runtime_context=runtime_context),
+    )
+    prefix_flow = SimpleNamespace(
+        hit_tokens=4,
+        lookup_ms=0.25,
+        snapshot=object(),
+        snapshot_service=object(),
+        stable_prefix_len=3,
+        cache_active=True,
+        publish_generation_snapshot=False,
+        insert_ms=0.0,
+        prefix_cache_memory_bytes=lambda: None,
+    )
+
+    def make_prefix_flow(**kwargs):
+        assert kwargs["request"].tools == [{"type": "function"}]
+        return prefix_flow
+
+    def stream(**kwargs):
+        captured.update(kwargs)
+        return ClosableEvents(
+            [
+                PrefillCompleteEvent(
+                    prefill_us=1.0,
+                    prompt_token_count=3,
+                    logical_ctx_tokens=3,
+                    physical_prefill_tokens=3,
+                    prefill_tokens_restored=0,
+                    prefill_tokens_computed=3,
+                ),
+                TokenEvent(
+                    token_id=10,
+                    generated_tokens=1,
+                    acceptance_ratio=1.0,
+                    cycles_completed=1,
+                ),
+                SummaryEvent(
+                    elapsed_us=10.0,
+                    prompt_token_count=3,
+                    generated_token_ids=(10,),
+                    generation_tokens=1,
+                    accepted_from_draft=1,
+                    acceptance_ratio=1.0,
+                    cycles_completed=1,
+                    phase_timings_us={},
+                ),
+            ]
+        )
+
+    monkeypatch.setattr(
+        server_runtime_mod.PrefixCacheFlow,
+        "for_request",
+        staticmethod(make_prefix_flow),
+    )
+    monkeypatch.setattr(server_runtime_mod, "stream_dflash_generate", stream)
+    monkeypatch.setattr(
+        server_runtime_mod,
+        "_build_generation_context",
+        lambda *_args, **_kwargs: SimpleNamespace(prompt_cache_count=0, _should_stop=False),
+    )
+    monkeypatch.setattr(
+        server_runtime_mod,
+        "_finalize_request_observability",
+        lambda **_kwargs: None,
+    )
+
+    runtime = ServerRuntime(
+        host="127.0.0.1",
+        port=8000,
+        model_provider=provider,
+        version="test",
+    )
+    request = SimpleNamespace(
+        request_type="chat",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[{"type": "function"}],
+    )
+
+    runtime.serve_dflash_request(
+        request_id=42,
+        rqueue=SimpleQueue(),
+        request=request,
+        args=SimpleNamespace(
+            max_tokens=16,
+            stop_words=[],
+            seed=None,
+            chat_template_args={},
+            use_default_chat_template=False,
+            chat_template=None,
+        ),
+        prepared=PreparedDFlashRequest(
+            prompt=[1, 2, 3],
+            sequences={},
+            state_machine=None,
+            state_machine_state=None,
+            has_thinking=False,
+        ),
+    )
+
+    assert captured["publish_generation_snapshot"] is False
+    assert captured["prefix_snapshot"] is prefix_flow.snapshot
+    assert captured["snapshot_service"] is prefix_flow.snapshot_service
+    assert captured["stable_prefix_len"] == 3
+    assert captured["prefix_cache_active"] is True
 
 
 def test_memory_waterfall_events_are_enriched_with_prefix_cache_memory():

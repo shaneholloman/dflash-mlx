@@ -10,6 +10,7 @@ from collections.abc import Sequence
 
 COMMANDS = {
     "run": "start server, proxy, agentic client, and post-process the trace",
+    "replay": "replay captured POST bodies against a fresh server",
     "session": "run an agentic client against an already running server",
     "proxy": "run the HTTP/SSE recording proxy",
 }
@@ -32,6 +33,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         from tools.benchmarks import _agentic_trace
 
         return int(_agentic_trace.main(rest))
+    if command == "replay":
+        from tools.benchmarks import _agentic_trace
+
+        return int(_agentic_trace.replay_main(rest))
     if command == "session":
         from tools.benchmarks import _agentic_session
 
