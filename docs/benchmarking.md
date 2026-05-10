@@ -63,7 +63,7 @@ performance numbers.
 | repeat | `1` |
 | cooldown | `10` seconds |
 | memory summary | enabled |
-| split-SDPA in benchmark | enabled |
+| split-SDPA in benchmark | auto by target policy |
 | output dir | `.artifacts/dflash/benchmarks/<timestamp>-<suite>-<model>` |
 
 The default `dflash benchmark` invocation uses `smoke`; that is intentionally a
@@ -101,7 +101,7 @@ selected row indices, and selected prompt ids.
 | `--no-chat-template` | raw prompt text |
 | `--draft-quant SPEC` | draft quantization override, e.g. `w4:gs64`; use `none` to disable model defaults |
 | `--no-eos` | suppress EOS for fixed-length runs |
-| `--split-sdpa`, `--no-split-sdpa` | benchmark verifier split-SDPA mode |
+| `--split-sdpa`, `--no-split-sdpa` | benchmark verifier split-SDPA mode; default is auto by target policy |
 | `--target-fa-window INT` | experimental target FA rotating window |
 | `--draft-sink-size INT` | draft cache sink tokens |
 | `--draft-window-size INT` | draft cache rolling window tokens |

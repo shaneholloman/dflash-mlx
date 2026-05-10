@@ -51,9 +51,12 @@ class _FakeResponseGenerator:
     def __init__(self, model_provider, prompt_cache, server_runtime):
         self.events = model_provider.events
         self.fail_join = getattr(model_provider, "fail_join", False)
+        self.fail_stop = getattr(model_provider, "fail_stop", False)
 
     def stop_and_join(self):
         self.events.append("stop")
+        if self.fail_stop:
+            raise RuntimeError("stop failed")
 
     def join(self):
         self.events.append("join")
@@ -299,6 +302,44 @@ def test_server_runtime_shutdowns_after_rank_worker_join(monkeypatch, join_raise
         )
 
     assert events == ["join", "shutdown"]
+
+
+def test_server_runtime_shutdowns_after_rank0_stop_failure(monkeypatch):
+    events = []
+    model_provider = SimpleNamespace(
+        cli_args=SimpleNamespace(prompt_cache_size=7),
+        events=events,
+        fail_stop=True,
+    )
+    runtime = ServerRuntime(
+        host="127.0.0.1",
+        port=8123,
+        model_provider=model_provider,
+        version="test-version",
+    )
+
+    monkeypatch.setattr(server_runtime_mod.mx.distributed, "init", lambda: _FakeGroup())
+    monkeypatch.setattr(
+        "dflash_mlx.server.runtime.mlx_server.LRUPromptCache",
+        _FakePromptCache,
+    )
+    monkeypatch.setattr(runtime, "wait_until_ready", lambda **_kwargs: events.append("ready"))
+    monkeypatch.setattr(runtime, "configure_metrics", lambda: events.append("metrics"))
+    monkeypatch.setattr(runtime, "print_startup_banner", lambda: events.append("banner"))
+    monkeypatch.setattr(runtime, "shutdown", lambda: events.append("shutdown"))
+    monkeypatch.setattr(
+        "dflash_mlx.server.runtime.mlx_server._run_http_server",
+        lambda *_args, **_kwargs: events.append("http"),
+    )
+
+    with pytest.raises(RuntimeError, match="stop failed"):
+        runtime.serve_forever(
+            response_generator_factory=_FakeResponseGenerator,
+            handler_class=object,
+        )
+
+    assert events == ["ready", "metrics", "banner", "http", "stop", "shutdown"]
+
 
 class _ThinkingTokenizer:
     eos_token_ids = {0}

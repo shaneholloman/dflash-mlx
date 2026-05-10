@@ -62,6 +62,9 @@ def load_runtime_bundle(
         model_ref,
         lazy=lazy,
         split_full_attention_sdpa=split_full_attention_sdpa,
+        split_full_attention_sdpa_default=(
+            support_spec.defaults.split_sdpa if support_spec is not None else None
+        ),
         quantize_kv_cache=quantize_kv_cache,
         verify_config=verify_config,
     )

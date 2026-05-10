@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import sys
 import time
+from collections import deque
 from collections.abc import Generator, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
@@ -130,6 +131,9 @@ class _PrefillResult:
 class _DecodeResult:
     effective_block_tokens: int
     verify_len_cap: int
+    adaptive_block_reductions: int
+    adaptive_block_cycles: int
+    adaptive_block_min: int | None
     draft_ns_total: int
     draft_prefill_ns: int
     draft_incremental_ns: int
@@ -138,6 +142,109 @@ class _DecodeResult:
     commit_ns_total: int
     cycle_profiles: tuple[CycleCompleteEvent, ...]
     profile_totals_ns: dict[str, int]
+
+
+@dataclass
+class _AdaptiveBlockPolicy:
+    full_block_tokens: int
+    min_block_tokens: int = 4
+    window_size: int = 12
+    reduced_burst_cycles: int = 4
+    low_commit_threshold: float = 3.0
+    recent_low_commit_threshold: float = 2.75
+    high_commit_guard: int = 5
+    cooldown_full_cycles: int = 0
+    mode: Literal["full", "reduced", "probe"] = "full"
+    reduced_cycles_since_probe: int = 0
+    probe_cycles_remaining: int = 0
+    reductions: int = 0
+    reduced_cycles: int = 0
+    min_seen: int | None = None
+    high_commit_seen: bool = False
+    full_commits: deque[int] = field(default_factory=lambda: deque(maxlen=12))
+    probe_commits: list[int] = field(default_factory=list)
+
+    @classmethod
+    def from_runtime(
+        cls,
+        *,
+        runtime_config: Any,
+        effective_block_tokens: int,
+        verify_len_cap: int,
+    ) -> "_AdaptiveBlockPolicy | None":
+        if str(getattr(runtime_config, "verify_mode", "auto")) != "adaptive":
+            return None
+        full_block_tokens = int(effective_block_tokens)
+        if full_block_tokens <= 4:
+            return None
+        if int(verify_len_cap) < full_block_tokens:
+            return None
+        return cls(full_block_tokens=full_block_tokens)
+
+    def block_limit(self) -> int:
+        if self.mode == "reduced":
+            return int(min(self.full_block_tokens, self.min_block_tokens))
+        return int(self.full_block_tokens)
+
+    def record(self, *, block_len: int, acceptance_len: int) -> None:
+        block_len = int(block_len)
+        acceptance_len = int(acceptance_len)
+        commit_count = 1 + acceptance_len
+        if self.mode == "reduced" and block_len < self.full_block_tokens:
+            self.reduced_cycles += 1
+            self.reduced_cycles_since_probe += 1
+            self.min_seen = (
+                block_len
+                if self.min_seen is None
+                else min(int(self.min_seen), block_len)
+            )
+            if self.reduced_cycles_since_probe >= self.reduced_burst_cycles:
+                self.mode = "probe"
+                self.probe_cycles_remaining = 2
+                self.probe_commits.clear()
+            return
+
+        if block_len < self.full_block_tokens:
+            return
+
+        if commit_count > self.high_commit_guard:
+            self.high_commit_seen = True
+        self.full_commits.append(commit_count)
+        if self.mode == "probe":
+            self.probe_commits.append(commit_count)
+            self.probe_cycles_remaining = max(0, self.probe_cycles_remaining - 1)
+            probe_avg = sum(self.probe_commits) / len(self.probe_commits)
+            if commit_count > self.min_block_tokens or probe_avg >= 4.25:
+                self.mode = "full"
+                self.cooldown_full_cycles = self.window_size
+                self.reduced_cycles_since_probe = 0
+                self.probe_commits.clear()
+                self.probe_cycles_remaining = 0
+            elif self.probe_cycles_remaining <= 0:
+                self.mode = "reduced"
+                self.reduced_cycles_since_probe = 0
+                self.probe_commits.clear()
+            return
+
+        if self.cooldown_full_cycles > 0:
+            self.cooldown_full_cycles -= 1
+            return
+
+        if len(self.full_commits) < self.window_size:
+            return
+
+        recent_commits = list(self.full_commits)[-4:]
+        full_avg = sum(self.full_commits) / len(self.full_commits)
+        recent_avg = sum(recent_commits) / len(recent_commits)
+        if (
+            not self.high_commit_seen
+            and full_avg <= self.low_commit_threshold
+            and recent_avg <= self.recent_low_commit_threshold
+            and max(recent_commits) <= self.high_commit_guard
+        ):
+            self.mode = "reduced"
+            self.reduced_cycles_since_probe = 0
+            self.reductions += 1
 
 
 @dataclass
@@ -684,6 +791,11 @@ class SpeculativeSession:
             block_tokens,
         )
         effective_block_tokens = cycle_config.effective_block_tokens
+        adaptive_block_policy = _AdaptiveBlockPolicy.from_runtime(
+            runtime_config=runtime_config,
+            effective_block_tokens=effective_block_tokens,
+            verify_len_cap=cycle_config.verify_len_cap,
+        )
         block_token_buffer = mx.full(
             (effective_block_tokens,),
             int(draft_model.mask_token_id),
@@ -724,7 +836,12 @@ class SpeculativeSession:
             acceptance_cycle_ns = 0
             hidden_extract_cycle_ns = 0
             remaining = max_new_tokens - len(state.generated_token_ids)
-            block_len = max(1, min(effective_block_tokens, remaining))
+            block_limit = (
+                adaptive_block_policy.block_limit()
+                if adaptive_block_policy is not None
+                else effective_block_tokens
+            )
+            block_len = max(1, min(effective_block_tokens, block_limit, remaining))
             block_token_buffer[:block_len] = int(draft_model.mask_token_id)
             assert state.staged_first is not None
             block_token_buffer[:1] = state.staged_first
@@ -895,9 +1012,22 @@ class SpeculativeSession:
 
             state.accepted_from_draft += acceptance_len
             staged_first_next = posterior[acceptance_len : acceptance_len + 1]
+            if adaptive_block_policy is not None:
+                adaptive_block_policy.record(
+                    block_len=block_len,
+                    acceptance_len=acceptance_len,
+                )
             if not profile_cycles:
                 next_remaining = max_new_tokens - len(state.generated_token_ids) - commit_count
-                next_block_len = max(1, min(effective_block_tokens, next_remaining))
+                next_block_limit = (
+                    adaptive_block_policy.block_limit()
+                    if adaptive_block_policy is not None
+                    else effective_block_tokens
+                )
+                next_block_len = max(
+                    1,
+                    min(effective_block_tokens, next_block_limit, next_remaining),
+                )
                 if next_remaining > 0 and next_block_len > 1:
                     draft_start_ns = time.perf_counter_ns()
                     next_drafted = draft_backend.draft_greedy(
@@ -997,6 +1127,21 @@ class SpeculativeSession:
         return _DecodeResult(
             effective_block_tokens=effective_block_tokens,
             verify_len_cap=verify_len_cap,
+            adaptive_block_reductions=(
+                int(adaptive_block_policy.reductions)
+                if adaptive_block_policy is not None
+                else 0
+            ),
+            adaptive_block_cycles=(
+                int(adaptive_block_policy.reduced_cycles)
+                if adaptive_block_policy is not None
+                else 0
+            ),
+            adaptive_block_min=(
+                adaptive_block_policy.min_seen
+                if adaptive_block_policy is not None
+                else None
+            ),
             draft_ns_total=draft_ns_total,
             draft_prefill_ns=draft_prefill_ns,
             draft_incremental_ns=draft_incremental_ns,
@@ -1085,6 +1230,9 @@ class SpeculativeSession:
                 acceptance_history=tuple(int(x) for x in state.acceptance_history),
                 acceptance_first_20_avg=(sum(first_20) / len(first_20)) if first_20 else 0.0,
                 acceptance_last_20_avg=(sum(last_20) / len(last_20)) if last_20 else 0.0,
+                adaptive_block_reductions=int(decode.adaptive_block_reductions),
+                adaptive_block_cycles=int(decode.adaptive_block_cycles),
+                adaptive_block_min=decode.adaptive_block_min,
                 peak_memory_gb=(
                     float(mx.get_peak_memory()) / 1e9
                     if hasattr(mx, "get_peak_memory")

@@ -61,9 +61,11 @@ def test_runtime_registry_preserves_draft_resolution():
         resolve_model_support_spec("mlx-community/gemma-4-31b-it-4bit").target_family
         == "gemma4_swa"
     )
-    assert resolve_model_support_spec("Qwen/Qwen3.5-9B").default_draft_quant == "w4"
+    assert resolve_model_support_spec("Qwen/Qwen3.5-9B").defaults.draft_quant == "w4"
+    assert resolve_model_support_spec("Qwen/Qwen3.6-35B-A3B").defaults.split_sdpa is True
+    assert resolve_model_support_spec("Qwen/Qwen3.6-27B").defaults.split_sdpa is False
     assert (
-        resolve_model_support_spec("mlx-community/gemma-4-31b-it-4bit").default_draft_quant
+        resolve_model_support_spec("mlx-community/gemma-4-31b-it-4bit").defaults.draft_quant
         == "w4"
     )
 
@@ -181,8 +183,10 @@ def test_runtime_bundle_loads_and_binds_draft(monkeypatch):
     assert bundle.support_spec is not None
     assert bundle.support_spec.draft_ref == "z-lab/Qwen3.5-9B-DFlash"
     assert bundle.support_spec.target_family == "hybrid_gdn"
+    assert bundle.support_spec.defaults.split_sdpa is False
     assert draft_model.bound is True
     assert target_calls[0][1]["quantize_kv_cache"] is True
+    assert target_calls[0][1]["split_full_attention_sdpa_default"] is False
     assert calls[0] == (
         "draft",
         "z-lab/Qwen3.5-9B-DFlash",
@@ -229,6 +233,43 @@ def test_runtime_bundle_applies_model_default_draft_quant(monkeypatch):
     assert bundle.effective_draft_quant == "w4"
     assert bundle.draft_meta["draft_quant_spec"] == "w4"
     assert bundle.draft_meta["draft_quant_source"] == "model_default"
+
+
+def test_runtime_bundle_applies_model_default_split_sdpa(monkeypatch):
+    target_model = object()
+    tokenizer = object()
+    draft_model = SimpleNamespace(bound=False)
+    draft_backend = object()
+    ops = SimpleNamespace(family=lambda _target_model: "hybrid_gdn")
+    target_calls = []
+
+    def fake_load_target_bundle(*args, **kwargs):
+        target_calls.append((args, kwargs))
+        return _loaded_target(
+            target_model,
+            tokenizer,
+            {"resolved_model_ref": "mlx-community/Qwen3.6-35B-A3B-4bit"},
+            ops,
+        )
+
+    monkeypatch.setattr(runtime_bundle, "load_target_bundle", fake_load_target_bundle)
+    monkeypatch.setattr(
+        runtime_bundle,
+        "load_draft_bundle",
+        lambda draft_ref, **kwargs: (draft_model, {"resolved_model_ref": draft_ref}),
+    )
+    monkeypatch.setattr(runtime_bundle, "bind_draft_to_target", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runtime_bundle, "make_draft_backend", lambda: draft_backend)
+
+    bundle = runtime_bundle.load_runtime_bundle(
+        model_ref="mlx-community/Qwen3.6-35B-A3B-4bit",
+        draft_ref=None,
+    )
+
+    assert bundle.support_spec is not None
+    assert bundle.support_spec.defaults.split_sdpa is True
+    assert target_calls[0][1]["split_full_attention_sdpa"] is None
+    assert target_calls[0][1]["split_full_attention_sdpa_default"] is True
 
 
 def test_runtime_bundle_draft_quant_none_disables_model_default(monkeypatch):

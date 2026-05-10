@@ -227,6 +227,9 @@ def test_agentic_rows_normalize_dflash_post_metrics():
                     "accept": 0.706,
                     "tokens_per_cycle": 3.4,
                     "cycles_completed": 20,
+                    "adaptive_block_reductions": 2,
+                    "adaptive_block_cycles": 9,
+                    "adaptive_block_min": 4,
                     "cache_hit_source": "L2",
                     "memory_waterfall_peak": {
                         "phys_footprint_gb": 25.2,
@@ -265,6 +268,9 @@ def test_agentic_rows_normalize_dflash_post_metrics():
             "acceptance": 0.706,
             "tokens_per_cycle": 3.4,
             "cycles": 20,
+            "adaptive_block_reductions": 2,
+            "adaptive_block_cycles": 9,
+            "adaptive_block_min": 4,
             "phys_footprint_peak_gb": 25.2,
             "phys_footprint_start_gb": 21.0,
             "phys_footprint_end_gb": 24.5,
@@ -1281,6 +1287,86 @@ def test_build_server_cmd_forwards_gemma_runtime_overrides():
 def test_dflash_runtime_overrides_reject_mlxlm_backend(flag_args):
     with pytest.raises(SystemExit, match="requires? --backend dflash"):
         agentic_trace.main(["--backend", "mlxlm", "--target", "m", *flag_args])
+
+def test_agentic_trace_rejects_negative_system_sample_interval():
+    with pytest.raises(SystemExit, match="--system-sample-interval-s must be >= 0"):
+        agentic_trace.main(
+            [
+                "--backend",
+                "mlxlm",
+                "--target",
+                "m",
+                "--system-sample-interval-s",
+                "-1",
+            ]
+        )
+
+def test_prepare_workspace_copies_real_source_with_default_and_extra_excludes(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "README.md").write_text("# real project\n")
+    (source / "pkg").mkdir()
+    (source / "pkg" / "app.py").write_text("print('ok')\n")
+    (source / ".git").mkdir()
+    (source / ".git" / "config").write_text("[core]\n")
+    (source / "node_modules").mkdir()
+    (source / "node_modules" / "dep.js").write_text("module.exports = {}\n")
+    (source / ".env.local").write_text("TOKEN=secret\n")
+    (source / "scratch.tmp").write_text("skip\n")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("external\n")
+    (source / "outside_link").symlink_to(outside)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    summary = agentic_trace._prepare_workspace(
+        workspace=workspace,
+        workspace_source=str(source),
+        workspace_excludes=["*.tmp"],
+    )
+
+    assert summary["source"] == str(source.resolve())
+    assert summary["copied"] is True
+    assert summary["initial"]["file_count"] == 2
+    assert (workspace / "README.md").exists()
+    assert (workspace / "pkg" / "app.py").exists()
+    assert not (workspace / ".git").exists()
+    assert not (workspace / "node_modules").exists()
+    assert not (workspace / ".env.local").exists()
+    assert not (workspace / "scratch.tmp").exists()
+    assert not (workspace / "outside_link").exists()
+
+def test_prepare_workspace_rejects_recursive_output_without_exclude(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "README.md").write_text("# project\n")
+    workspace = source / "runs" / "trace" / "workspace"
+    workspace.mkdir(parents=True)
+
+    with pytest.raises(SystemExit, match="copy the run output into itself"):
+        agentic_trace._prepare_workspace(
+            workspace=workspace,
+            workspace_source=str(source),
+            workspace_excludes=[],
+        )
+
+def test_prepare_workspace_allows_recursive_output_when_excluded(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "README.md").write_text("# project\n")
+    workspace = source / "runs" / "trace" / "workspace"
+    workspace.mkdir(parents=True)
+
+    summary = agentic_trace._prepare_workspace(
+        workspace=workspace,
+        workspace_source=str(source),
+        workspace_excludes=["runs"],
+    )
+
+    assert summary["initial"]["file_count"] == 1
+    assert (workspace / "README.md").exists()
+    assert not (workspace / "runs").exists()
 
 def test_agentic_trace_metadata_records_dflash_runtime_overrides(tmp_path, monkeypatch):
     config_path = tmp_path / "opencode.jsonc"

@@ -102,6 +102,7 @@ class _FakeDraftBackend:
 
 def _runtime_context(
     diagnostics_config: DiagnosticsConfig | None = None,
+    verify_mode: str | None = None,
 ):
     return build_runtime_context(
         runtime_config_from_profile(
@@ -109,15 +110,16 @@ def _runtime_context(
             prefill_step_size=4,
             prefix_cache=False,
             prefix_cache_l2=False,
+            verify_mode=verify_mode,
         ),
         diagnostics_config=diagnostics_config,
     )
 
 
-def _draft_model():
+def _draft_model(*, block_size: int = 4):
     return SimpleNamespace(
         target_layer_ids=[0],
-        block_size=4,
+        block_size=block_size,
         mask_token_id=0,
         project_target_hidden=lambda value: value,
     )
@@ -1030,6 +1032,140 @@ def test_profile_cycle_events_disable_async_prefetch_and_match_summary():
         "other",
         "cycle_total",
     }
+
+
+def test_adaptive_verify_mode_drops_and_recovers_block_len():
+    draft_model = _draft_model(block_size=8)
+
+    class _PatternTargetOps(_FakeTargetOps):
+        def __init__(self) -> None:
+            super().__init__()
+            self.verify_lengths: list[int] = []
+            self._cycle = 0
+
+        def verify_block(
+            self,
+            *,
+            target_model,
+            verify_ids,
+            target_cache,
+            capture_layer_ids,
+        ):
+            del target_model, target_cache, capture_layer_ids
+            batch, seq_len = verify_ids.shape
+            self.verify_lengths.append(int(seq_len))
+            self._cycle += 1
+            if self._cycle <= 12:
+                pattern = [1] + [0] * (seq_len - 1)
+            else:
+                pattern = [0] * seq_len
+            logits = mx.zeros((batch, seq_len, 8), dtype=mx.float32)
+            for pos, token_id in enumerate(pattern[:seq_len]):
+                logits[:, pos, int(token_id)] = 1.0
+            hidden = {1: mx.zeros((batch, seq_len, 2), dtype=mx.float32)}
+            return logits, hidden
+
+    class _RecordingDraftBackend:
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, bool]] = []
+
+        def make_cache(self, **_kwargs):
+            return []
+
+        def draft_greedy(self, **kwargs):
+            block_len = int(kwargs["block_len"])
+            self.calls.append((block_len, bool(kwargs["async_launch"])))
+            return mx.zeros((max(0, block_len - 1),), dtype=mx.uint32)
+
+    target_ops = _PatternTargetOps()
+    draft_backend = _RecordingDraftBackend()
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=draft_model,
+            draft_backend=draft_backend,
+            prompt="unused",
+            max_new_tokens=48,
+            prompt_tokens_override=[1, 2],
+            runtime_context=_runtime_context(verify_mode="adaptive"),
+        )
+    )
+
+    summary = next(event for event in events if isinstance(event, SummaryEvent))
+
+    assert draft_backend.calls[:17] == [(8, True)] * 12 + [(4, True)] * 4 + [(8, True)]
+    assert target_ops.verify_lengths[:17] == [8] * 12 + [4] * 4 + [8]
+    assert summary.block_tokens == 8
+    assert summary.verify_len_cap == 8
+    assert summary.acceptance_history[:17] == (0,) * 12 + (3,) * 4 + (7,)
+    assert summary.adaptive_block_reductions == 1
+    assert summary.adaptive_block_cycles == 4
+    assert summary.adaptive_block_min == 4
+
+
+def test_adaptive_verify_mode_ignores_mixed_commit_windows():
+    draft_model = _draft_model(block_size=8)
+
+    class _MixedTargetOps(_FakeTargetOps):
+        def __init__(self) -> None:
+            super().__init__()
+            self.verify_lengths: list[int] = []
+            self._cycle = 0
+
+        def verify_block(
+            self,
+            *,
+            target_model,
+            verify_ids,
+            target_cache,
+            capture_layer_ids,
+        ):
+            del target_model, target_cache, capture_layer_ids
+            batch, seq_len = verify_ids.shape
+            self.verify_lengths.append(int(seq_len))
+            self._cycle += 1
+            accepted = 5 if self._cycle % 4 == 0 else 1
+            pattern = [0] + [0] * min(accepted, seq_len - 1)
+            pattern += [1] * max(0, seq_len - len(pattern))
+            logits = mx.zeros((batch, seq_len, 8), dtype=mx.float32)
+            for pos, token_id in enumerate(pattern[:seq_len]):
+                logits[:, pos, int(token_id)] = 1.0
+            hidden = {1: mx.zeros((batch, seq_len, 2), dtype=mx.float32)}
+            return logits, hidden
+
+    class _RecordingDraftBackend:
+        def make_cache(self, **_kwargs):
+            return []
+
+        def draft_greedy(self, **kwargs):
+            block_len = int(kwargs["block_len"])
+            return mx.zeros((max(0, block_len - 1),), dtype=mx.uint32)
+
+    target_ops = _MixedTargetOps()
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=draft_model,
+            draft_backend=_RecordingDraftBackend(),
+            prompt="unused",
+            max_new_tokens=64,
+            prompt_tokens_override=[1, 2],
+            runtime_context=_runtime_context(verify_mode="adaptive"),
+        )
+    )
+
+    summary = next(event for event in events if isinstance(event, SummaryEvent))
+
+    assert 4 not in target_ops.verify_lengths
+    assert summary.adaptive_block_reductions == 0
+    assert summary.adaptive_block_cycles == 0
+    assert summary.adaptive_block_min is None
 
 
 def test_memory_waterfall_decode_cycle_order_is_stable():

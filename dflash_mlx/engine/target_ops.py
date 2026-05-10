@@ -21,6 +21,7 @@ class TargetCapabilities:
     supports_target_hidden_capture: bool
     supports_verify_linear: bool = False
     supports_full_context_draft_layers: bool = False
+    supports_full_attention_split: bool = False
 
 class TargetOps(Protocol):
     backend_name: str

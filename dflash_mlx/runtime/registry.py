@@ -4,7 +4,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+
+@dataclass(frozen=True)
+class ModelRuntimeDefaults:
+    draft_quant: str | None = None
+    split_sdpa: bool = False
 
 
 @dataclass(frozen=True)
@@ -12,24 +18,48 @@ class ModelSupportSpec:
     target_names: tuple[str, ...]
     draft_ref: str
     target_family: str | None = None
-    default_draft_quant: str | None = None
+    defaults: ModelRuntimeDefaults = field(default_factory=ModelRuntimeDefaults)
 
+
+W4_DEFAULTS = ModelRuntimeDefaults(draft_quant="w4")
+QWEN36_35B_DEFAULTS = ModelRuntimeDefaults(draft_quant="w4", split_sdpa=True)
 
 MODEL_SUPPORT_SPECS: tuple[ModelSupportSpec, ...] = (
     ModelSupportSpec(("Qwen3.5-4B",), "z-lab/Qwen3.5-4B-DFlash", "hybrid_gdn"),
-    ModelSupportSpec(("Qwen3.5-9B",), "z-lab/Qwen3.5-9B-DFlash", "hybrid_gdn", "w4"),
-    ModelSupportSpec(("Qwen3.5-27B",), "z-lab/Qwen3.5-27B-DFlash", "hybrid_gdn", "w4"),
-    ModelSupportSpec(("Qwen3.5-35B-A3B",), "z-lab/Qwen3.5-35B-A3B-DFlash", "hybrid_gdn", "w4"),
-    ModelSupportSpec(("Qwen3.6-27B",), "z-lab/Qwen3.6-27B-DFlash", "hybrid_gdn", "w4"),
-    ModelSupportSpec(("Qwen3.6-35B-A3B",), "z-lab/Qwen3.6-35B-A3B-DFlash", "hybrid_gdn", "w4"),
+    ModelSupportSpec(
+        ("Qwen3.5-9B",), "z-lab/Qwen3.5-9B-DFlash", "hybrid_gdn", W4_DEFAULTS
+    ),
+    ModelSupportSpec(
+        ("Qwen3.5-27B",), "z-lab/Qwen3.5-27B-DFlash", "hybrid_gdn", W4_DEFAULTS
+    ),
+    ModelSupportSpec(
+        ("Qwen3.5-35B-A3B",),
+        "z-lab/Qwen3.5-35B-A3B-DFlash",
+        "hybrid_gdn",
+        W4_DEFAULTS,
+    ),
+    ModelSupportSpec(
+        ("Qwen3.6-27B",), "z-lab/Qwen3.6-27B-DFlash", "hybrid_gdn", W4_DEFAULTS
+    ),
+    ModelSupportSpec(
+        ("Qwen3.6-35B-A3B",),
+        "z-lab/Qwen3.6-35B-A3B-DFlash",
+        "hybrid_gdn",
+        QWEN36_35B_DEFAULTS,
+    ),
     ModelSupportSpec(("Qwen3-4B",), "z-lab/Qwen3-4B-DFlash-b16", "pure_attention"),
     ModelSupportSpec(("Qwen3-8B",), "z-lab/Qwen3-8B-DFlash-b16", "pure_attention"),
-    ModelSupportSpec(("gemma-4-31b-it",), "z-lab/gemma-4-31B-it-DFlash", "gemma4_swa", "w4"),
+    ModelSupportSpec(
+        ("gemma-4-31b-it",),
+        "z-lab/gemma-4-31B-it-DFlash",
+        "gemma4_swa",
+        W4_DEFAULTS,
+    ),
     ModelSupportSpec(
         ("gemma-4-26b-a4b-it",),
         "z-lab/gemma-4-26B-A4B-it-DFlash",
         "gemma4_swa",
-        "w4",
+        W4_DEFAULTS,
     ),
 )
 
@@ -94,11 +124,11 @@ def resolve_effective_draft_quant(
         if requested.lower() == "none":
             return None
         return requested
-    if support_spec is None or not support_spec.default_draft_quant:
+    if support_spec is None or not support_spec.defaults.draft_quant:
         return None
     if resolved_draft_ref != support_spec.draft_ref:
         return None
-    return support_spec.default_draft_quant
+    return support_spec.defaults.draft_quant
 
 
 def validate_support_spec_family(

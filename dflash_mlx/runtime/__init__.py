@@ -35,8 +35,8 @@ class VerifyConfig:
     @classmethod
     def from_mode(cls, mode: str | None) -> "VerifyConfig":
         resolved = (mode or "auto").strip().lower()
-        if resolved not in ("auto", "off"):
-            raise ValueError("verify mode must be auto or off")
+        if resolved not in ("auto", "adaptive", "off"):
+            raise ValueError("verify mode must be auto, adaptive, or off")
         return cls(mode=resolved)
 
 

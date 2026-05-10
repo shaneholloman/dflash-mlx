@@ -46,6 +46,15 @@ long-lived process ladder.
 starts the recording proxy, drives a real OpenCode or pi session, and writes
 the observed requests, SSE stream, server diagnostics, and workspace output.
 By default it writes one run directory under `.artifacts/dflash/traces/...`.
+Pass `--workspace-source <repo>` to copy a real local project into the run
+workspace before OpenCode starts. The copy excludes common VCS, cache, vendor,
+artifact, and secret-like paths by default; add `--workspace-exclude <pattern>`
+for project-specific skips. Use this mode for long real-project sessions where
+prompt growth, tool outputs, and cache behavior must look like a user working
+inside a non-empty repository.
+Pass `--system-sample-interval-s <seconds>` on live runs or replays when the
+artifact needs server RSS, VM wired memory, pageout, and `pmset` samples aligned
+with the request timeline. Keep it off for clean public throughput claims.
 
 `agentic_trace replay` is a fixed-body replay harness. It starts a fresh
 DFlash or `mlx_lm.server`, replays captured `requests/*.json` bodies directly,

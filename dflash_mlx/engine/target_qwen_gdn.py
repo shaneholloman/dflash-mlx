@@ -450,6 +450,7 @@ class QwenGdnTargetOps:
             supports_shared_kv=False,
             supports_target_hidden_capture=True,
             supports_verify_linear=self._supports_verify_linear(target_model),
+            supports_full_attention_split=has_recurrent,
         )
 
     def _supports_verify_linear(self, target_model: Any) -> bool:

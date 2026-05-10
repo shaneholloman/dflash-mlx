@@ -278,9 +278,9 @@ RUNTIME_CONFIG_FIELDS: tuple[RuntimeConfigFieldSpec, ...] = (
         flags=("--verify-mode",),
         env="DFLASH_VERIFY_MODE",
         source_default=None,
-        choices=("auto", "off"),
+        choices=("auto", "adaptive", "off"),
         help="Verify path mode. Use off only for debug/parity.",
-        doc="verifier path mode; `off` is debug/parity only",
+        doc="verifier path mode; `adaptive` probes shorter low-acceptance blocks, `off` is debug/parity only",
         doc_group="runtime",
         surfaces=(SURFACE_SERVE_DOCTOR, SURFACE_GENERATE),
     ),
@@ -550,7 +550,7 @@ def _profiles_markdown_table() -> str:
         "balanced": "default normal coding",
         "fast": "throughput first",
         "low-memory": "lower pressure, slower prefill",
-        "long-session": "revisit-oriented long sessions",
+        "long-session": "prefix revisits; serve cache `4GB`",
     }
     for profile in PROFILES.values():
         rows.append(
@@ -801,8 +801,8 @@ def validate_runtime_config(cfg: EffectiveRuntimeConfig) -> EffectiveRuntimeConf
         raise ValueError("--target-fa-window / target_fa_window must be >= 0")
     if cfg.dflash_max_ctx < 0:
         raise ValueError("--dflash-max-ctx / dflash_max_ctx must be >= 0")
-    if cfg.verify_mode not in ("auto", "off"):
-        raise ValueError("--verify-mode / verify_mode must be auto or off")
+    if cfg.verify_mode not in ("auto", "adaptive", "off"):
+        raise ValueError("--verify-mode / verify_mode must be auto, adaptive, or off")
     if not cfg.prefix_cache and cfg.prefix_cache_l2:
         return replace(cfg, prefix_cache_l2=False)
     if cfg.target_fa_window > 0 and cfg.prefix_cache:

@@ -425,7 +425,10 @@ def test_runtime_loader_delegates_hooks_to_target_ops_without_family_gate(monkey
             return "gemma4_swa"
 
         def capabilities_for(self, model):
-            return SimpleNamespace(supports_verify_linear=False)
+            return SimpleNamespace(
+                supports_verify_linear=False,
+                supports_full_attention_split=True,
+            )
 
         def install_speculative_hooks(self, model):
             calls.append(("install", {}))
@@ -453,6 +456,138 @@ def test_runtime_loader_delegates_hooks_to_target_ops_without_family_gate(monkey
     assert calls == [
         ("install", {}),
         ("configure", {"enabled": True, "chunk_size": 4}),
+    ]
+
+
+def test_runtime_loader_auto_split_uses_runtime_default(monkeypatch):
+    calls: list[tuple[str, dict]] = []
+
+    class _Ops:
+        def family(self, model):
+            return "hybrid_gdn"
+
+        def capabilities_for(self, model):
+            return SimpleNamespace(
+                supports_verify_linear=False,
+                supports_full_attention_split=True,
+            )
+
+        def install_speculative_hooks(self, model):
+            calls.append(("install", {}))
+
+        def configure_full_attention_split(self, model, **kwargs):
+            calls.append(("configure", kwargs))
+
+    monkeypatch.setattr(
+        runtime_loading,
+        "load",
+        lambda *args, **kwargs: (object(), object(), _large_dense_config()),
+    )
+    monkeypatch.setattr(runtime_loading, "resolve_target_ops", lambda model: _Ops())
+
+    target_bundle = runtime_loading.load_target_bundle(
+        "model",
+        split_full_attention_sdpa=None,
+        split_full_attention_sdpa_default=True,
+        split_full_attention_chunk_size=4,
+        quantize_kv_cache=False,
+        verify_config=VerifyConfig.from_mode("auto"),
+    )
+
+    assert target_bundle.meta["split_full_attention_sdpa_requested"] is None
+    assert target_bundle.meta["split_full_attention_sdpa_default"] is True
+    assert target_bundle.meta["split_full_attention_sdpa_resolved"] is True
+    assert target_bundle.meta["split_full_attention_sdpa"] is True
+    assert calls == [
+        ("install", {}),
+        ("configure", {"enabled": True, "chunk_size": 4}),
+    ]
+
+
+def test_runtime_loader_explicit_split_false_overrides_target_default(monkeypatch):
+    calls: list[tuple[str, dict]] = []
+
+    class _Ops:
+        def family(self, model):
+            return "hybrid_gdn"
+
+        def capabilities_for(self, model):
+            return SimpleNamespace(
+                supports_verify_linear=False,
+                supports_full_attention_split=True,
+            )
+
+        def install_speculative_hooks(self, model):
+            calls.append(("install", {}))
+
+        def configure_full_attention_split(self, model, **kwargs):
+            calls.append(("configure", kwargs))
+
+    monkeypatch.setattr(
+        runtime_loading,
+        "load",
+        lambda *args, **kwargs: (object(), object(), _large_dense_config()),
+    )
+    monkeypatch.setattr(runtime_loading, "resolve_target_ops", lambda model: _Ops())
+
+    target_bundle = runtime_loading.load_target_bundle(
+        "model",
+        split_full_attention_sdpa=False,
+        split_full_attention_sdpa_default=True,
+        split_full_attention_chunk_size=4,
+        quantize_kv_cache=False,
+        verify_config=VerifyConfig.from_mode("auto"),
+    )
+
+    assert target_bundle.meta["split_full_attention_sdpa_requested"] is False
+    assert target_bundle.meta["split_full_attention_sdpa_default"] is True
+    assert target_bundle.meta["split_full_attention_sdpa_resolved"] is False
+    assert target_bundle.meta["split_full_attention_sdpa"] is False
+    assert calls == [
+        ("install", {}),
+        ("configure", {"enabled": False, "chunk_size": 4}),
+    ]
+
+
+def test_runtime_loader_records_unsupported_split_sdpa_as_not_applied(monkeypatch):
+    calls: list[tuple[str, dict]] = []
+
+    class _Ops:
+        def family(self, model):
+            return "gemma4_swa"
+
+        def capabilities_for(self, model):
+            return SimpleNamespace(
+                supports_verify_linear=False,
+                supports_full_attention_split=False,
+            )
+
+        def install_speculative_hooks(self, model):
+            calls.append(("install", {}))
+
+        def configure_full_attention_split(self, model, **kwargs):
+            calls.append(("configure", kwargs))
+
+    monkeypatch.setattr(
+        runtime_loading,
+        "load",
+        lambda *args, **kwargs: (object(), object(), _large_dense_config()),
+    )
+    monkeypatch.setattr(runtime_loading, "resolve_target_ops", lambda model: _Ops())
+
+    target_bundle = runtime_loading.load_target_bundle(
+        "model",
+        split_full_attention_sdpa=True,
+        split_full_attention_chunk_size=4,
+        quantize_kv_cache=False,
+        verify_config=VerifyConfig.from_mode("auto"),
+    )
+
+    assert target_bundle.meta["split_full_attention_sdpa_requested"] is True
+    assert target_bundle.meta["split_full_attention_sdpa"] is False
+    assert calls == [
+        ("install", {}),
+        ("configure", {"enabled": False, "chunk_size": 4}),
     ]
 
 

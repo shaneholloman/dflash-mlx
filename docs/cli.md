@@ -47,6 +47,9 @@ dflash serve \
   --prefix-cache-max-bytes 17179869184
 ```
 
+Split-SDPA defaults are target-policy auto in both `serve` and `benchmark`; use
+`--split-sdpa` or `--no-split-sdpa` only for an explicit A/B.
+
 See [runtime-flags.md](runtime-flags.md) for the full flag surface.
 
 ## Generate

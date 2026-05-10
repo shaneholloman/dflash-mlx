@@ -70,6 +70,12 @@ def _configure_metrics(runtime_config=None):
             draft_model=SimpleNamespace(target_layer_ids=(3, 7)),
             effective_draft_quant="w4",
             draft_meta={"draft_quant_source": "model_default"},
+            target_meta={
+                "split_full_attention_sdpa": True,
+                "split_full_attention_sdpa_requested": None,
+                "split_full_attention_sdpa_default": True,
+                "split_full_attention_sdpa_resolved": True,
+            },
             cli_args=SimpleNamespace(
                 model="target-model",
                 draft_model=None,
@@ -462,6 +468,11 @@ def test_metrics_endpoint_returns_json_before_request(monkeypatch):
     assert payload["server"]["draft_quant"] == "w4"
     assert payload["server"]["draft_quant_source"] == "model_default"
     assert payload["runtime"]["prefill_step_size"] == 4096
+    assert payload["runtime"]["split_sdpa"] is True
+    assert payload["runtime"]["split_sdpa_applied"] is True
+    assert payload["runtime"]["split_sdpa_requested"] is None
+    assert payload["runtime"]["split_sdpa_default"] is True
+    assert payload["runtime"]["split_sdpa_resolved"] is True
     assert payload["memory"].keys() >= {
         "rss_gb",
         "rss_peak_gb",

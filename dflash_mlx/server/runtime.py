@@ -266,9 +266,11 @@ class ServerRuntime:
             else:
                 response_generator.join()
         finally:
-            if rank == 0 and response_generator is not None:
-                self.stop_response_generator(response_generator)
-            self.shutdown()
+            try:
+                if rank == 0 and response_generator is not None:
+                    self.stop_response_generator(response_generator)
+            finally:
+                self.shutdown()
 
 
 def build_prompt_regime(args: Any, tokenizer: Any, request: Any = None) -> dict[str, object]:
@@ -310,6 +312,19 @@ def _format_metal_limit(
 ) -> str:
     action = _bytes_to_gib(bytes_value) if applied and bytes_value is not None else "not set"
     return f"{label}: {_format_limit_request(request)} -> {action}"
+
+
+def _split_sdpa_status(model_provider: DFlashModelProvider) -> str:
+    target_meta = getattr(model_provider, "target_meta", {}) or {}
+    applied = target_meta.get("split_full_attention_sdpa")
+    requested = target_meta.get("split_full_attention_sdpa_requested")
+    resolved = target_meta.get("split_full_attention_sdpa_resolved")
+    if applied is None:
+        return "unknown"
+    source = "auto" if requested is None else "explicit"
+    if resolved is not None and bool(resolved) and not bool(applied):
+        return f"{source} -> off (not applied)"
+    return f"{source} -> {'on' if bool(applied) else 'off'}"
 
 
 def _print_startup_banner(
@@ -372,6 +387,7 @@ def _print_startup_banner(
         ),
         f"Prefix cache: {pc_status}",
         f"Target FA KV: {target_fa_status}",
+        f"Split SDPA:   {_split_sdpa_status(model_provider)}",
         f"Server:       {server_name} on port {port}",
     ]
     if runtime_config is not None:

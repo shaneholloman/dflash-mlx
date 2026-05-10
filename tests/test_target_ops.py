@@ -218,14 +218,16 @@ def test_capabilities_for_distinguishes_hybrid_and_pure_attention():
     assert hybrid.supports_recurrent_rollback is True
     assert hybrid.supports_dflash is True
     assert hybrid.supports_prefix_snapshot is True
+    assert hybrid.supports_full_attention_split is True
     assert pure.supports_recurrent_rollback is False
     assert pure.supports_dflash is True
     assert pure.supports_kv_trim is True
     assert pure.supports_rotating_cache_snapshot is False
     assert pure.supports_shared_kv is False
+    assert pure.supports_full_attention_split is False
 
 
-def test_qwen_verify_linear_capability_owns_qwen_shape_policy():
+def test_qwen_capabilities_own_qwen_shape_policy():
     ops = QwenGdnTargetOps()
 
     excluded_moe = ops.capabilities_for(
@@ -282,6 +284,7 @@ def test_gemma4_capabilities_enable_prefix_snapshot_without_shared_kv():
     assert caps.supports_shared_kv is False
     assert caps.supports_target_hidden_capture is True
     assert caps.supports_verify_linear is True
+    assert caps.supports_full_attention_split is False
 
 
 def test_gemma4_capabilities_disable_prefix_snapshot_with_shared_kv():

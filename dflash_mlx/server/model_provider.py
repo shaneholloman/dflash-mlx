@@ -32,6 +32,7 @@ class DFlashModelProvider(mlx_server.ModelProvider):
         self.target_ops = None
         self.draft_backend = None
         self.draft_meta = None
+        self.target_meta = None
         self.effective_draft_quant = None
         super().__init__(cli_args)
 
@@ -71,6 +72,7 @@ class DFlashModelProvider(mlx_server.ModelProvider):
         self.target_ops = None
         self.draft_backend = None
         self.draft_meta = None
+        self.target_meta = None
         self.effective_draft_quant = None
 
         bundle = load_runtime_bundle(
@@ -78,12 +80,14 @@ class DFlashModelProvider(mlx_server.ModelProvider):
             draft_ref=draft_ref,
             draft_quant=getattr(self.cli_args, "draft_quant", None) or None,
             verify_config=self.cli_args.runtime_context.verify,
+            split_full_attention_sdpa=getattr(self.cli_args, "split_sdpa", None),
         )
         model = bundle.target_model
         tokenizer = bundle.tokenizer
         draft_model = bundle.draft_model
         draft_backend = bundle.draft_backend
         target_ops = bundle.target_ops
+        target_meta = dict(getattr(bundle, "target_meta", {}) or {})
         draft_meta = dict(getattr(bundle, "draft_meta", {}) or {})
         effective_draft_quant = getattr(bundle, "effective_draft_quant", None)
 
@@ -109,6 +113,7 @@ class DFlashModelProvider(mlx_server.ModelProvider):
         self.tokenizer = tokenizer
         self.draft_model = draft_model
         self.draft_backend = draft_backend
+        self.target_meta = target_meta
         self.draft_meta = draft_meta
         self.effective_draft_quant = effective_draft_quant
         self.target_ops = target_ops

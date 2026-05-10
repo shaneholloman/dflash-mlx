@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import os
@@ -39,6 +40,32 @@ OPENCODE_CONFIG = Path.home() / ".config/opencode/opencode.jsonc"
 PI_CONFIG = Path.home() / ".pi/agent/models.json"
 TRACE_PROVIDER_ID = "trace"
 PI_THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh")
+DEFAULT_WORKSPACE_EXCLUDES = (
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "venv",
+    "node_modules",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".artifacts",
+    "benchmark/results",
+    "build",
+    "dist",
+    "target",
+    ".DS_Store",
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "id_rsa*",
+    "*.db",
+    "*.sqlite",
+    "*.sqlite3",
+)
 
 def _now_stamp() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -438,6 +465,9 @@ def post_event_to_server_metric(
         "prompt_tokens": pe.get("prompt_tokens"),
         "cache_hit_tokens": pe.get("cache_hit_tokens"),
         "tokens_per_cycle": tokens_per_cycle,
+        "adaptive_block_reductions": pe.get("adaptive_block_reductions"),
+        "adaptive_block_cycles": pe.get("adaptive_block_cycles"),
+        "adaptive_block_min": pe.get("adaptive_block_min"),
 
         "ttft_ms_server": pe.get("ttft_ms"),
         "prefill_ms_server": pe.get("prefill_ms"),
@@ -1302,6 +1332,110 @@ def _parse_pause_before_request(raw_values: Sequence[str]) -> dict[int, float]:
         pauses[request_idx] = pause_s
     return pauses
 
+def _workspace_excluded(
+    *,
+    source_root: Path,
+    path: Path,
+    name: str,
+    patterns: Sequence[str],
+) -> bool:
+    if path.is_symlink():
+        return True
+    rel = path.relative_to(source_root).as_posix()
+    for pattern in patterns:
+        if (
+            name == pattern
+            or rel == pattern
+            or fnmatch.fnmatch(name, pattern)
+            or fnmatch.fnmatch(rel, pattern)
+            or rel.startswith(f"{pattern.rstrip('/')}/")
+        ):
+            return True
+    return False
+
+def _workspace_ignore(source_root: Path, patterns: Sequence[str]):
+    def ignore(current_dir: str, names: list[str]) -> set[str]:
+        current = Path(current_dir)
+        ignored: set[str] = set()
+        for name in names:
+            path = current / name
+            if _workspace_excluded(
+                source_root=source_root,
+                path=path,
+                name=name,
+                patterns=patterns,
+            ):
+                ignored.add(name)
+        return ignored
+
+    return ignore
+
+def _workspace_file_summary(workspace: Path) -> dict[str, Any]:
+    file_count = 0
+    byte_count = 0
+    for path in workspace.rglob("*"):
+        if path.is_symlink():
+            continue
+        if not path.is_file():
+            continue
+        try:
+            byte_count += path.stat().st_size
+        except OSError:
+            continue
+        file_count += 1
+    return {"file_count": file_count, "bytes": byte_count}
+
+def _prepare_workspace(
+    *,
+    workspace: Path,
+    workspace_source: str | None,
+    workspace_excludes: Sequence[str],
+) -> dict[str, Any]:
+    patterns = [*DEFAULT_WORKSPACE_EXCLUDES, *workspace_excludes]
+    if workspace_source is None:
+        return {
+            "source": None,
+            "copied": False,
+            "exclude_patterns": patterns,
+            "initial": _workspace_file_summary(workspace),
+        }
+
+    source = Path(workspace_source).expanduser().resolve()
+    if not source.exists():
+        raise SystemExit(f"--workspace-source does not exist: {source}")
+    if not source.is_dir():
+        raise SystemExit(f"--workspace-source must be a directory: {source}")
+    workspace_resolved = workspace.resolve()
+    if source == workspace_resolved or source in workspace_resolved.parents:
+        rel = workspace_resolved.relative_to(source)
+        recursive_root = rel.parts[0] if rel.parts else "."
+        recursive_root_path = source / recursive_root
+        if not _workspace_excluded(
+            source_root=source,
+            path=recursive_root_path,
+            name=recursive_root,
+            patterns=patterns,
+        ):
+            raise SystemExit(
+                "--workspace-source would copy the run output into itself; "
+                f"use an out-root outside {source} or pass "
+                f"--workspace-exclude {recursive_root!r}"
+            )
+
+    shutil.copytree(
+        source,
+        workspace,
+        dirs_exist_ok=True,
+        ignore=_workspace_ignore(source, patterns),
+        symlinks=True,
+    )
+    return {
+        "source": str(source),
+        "copied": True,
+        "exclude_patterns": patterns,
+        "initial": _workspace_file_summary(workspace),
+    }
+
 def _build_opencode_cmd(args, workspace: Path, task: str, label: str) -> list[str]:
     cmd = [
         args.opencode_bin,
@@ -1388,7 +1522,7 @@ def replay_main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--fastpath-max-tokens", type=int, default=None)
     p.add_argument("--verify-len-cap", type=int, default=None)
     p.add_argument("--max-snapshot-tokens", type=int, default=None)
-    p.add_argument("--verify-mode", choices=("auto", "off"), default=None)
+    p.add_argument("--verify-mode", choices=("auto", "adaptive", "off"), default=None)
     p.add_argument("--clear-cache-boundaries", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--target-fa-window", type=int, default=None)
     p.add_argument("--chat-template-args", default='{"enable_thinking":true}')
@@ -1710,11 +1844,28 @@ def main(argv: Sequence[str] | None = None) -> int:
                    help="Path to a file holding the task prompt (overrides --task).")
     p.add_argument("--label", default=None)
     p.add_argument("--out-root", default=None, help="Output root directory (default: .artifacts/dflash/traces).")
+    p.add_argument(
+        "--workspace-source",
+        default=None,
+        help="Copy this real project directory into the run workspace before starting the client.",
+    )
+    p.add_argument(
+        "--workspace-exclude",
+        action="append",
+        default=[],
+        help="Extra glob/path pattern excluded when copying --workspace-source.",
+    )
     p.add_argument("--proxy-port", type=int, default=DEFAULT_PROXY_PORT)
     p.add_argument("--dflash-port", type=int, default=DEFAULT_DFLASH_PORT)
     p.add_argument("--mlxlm-port", type=int, default=DEFAULT_MLXLM_PORT)
     p.add_argument("--server-ready-timeout-s", type=float, default=300.0)
     p.add_argument("--proxy-ready-timeout-s", type=float, default=30.0)
+    p.add_argument(
+        "--system-sample-interval-s",
+        type=float,
+        default=0.0,
+        help="Write low-overhead ps/vm_stat/thermal samples every N seconds.",
+    )
     p.add_argument("--client", choices=["opencode", "pi"], default="opencode",
                    help="agentic client to drive through the proxy")
     p.add_argument("--client-timeout-s", type=float, default=1800.0,
@@ -1813,7 +1964,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     p.add_argument(
         "--verify-mode",
-        choices=("auto", "off"),
+        choices=("auto", "adaptive", "off"),
         default=None,
         help="dflash only: pass --verify-mode to dflash serve.",
     )
@@ -1887,6 +2038,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("--target-fa-window must be >= 0")
     if args.prefix_cache_l2_max_bytes is not None and int(args.prefix_cache_l2_max_bytes) < 0:
         raise SystemExit("--prefix-cache-l2-max-bytes must be >= 0")
+    if args.system_sample_interval_s < 0:
+        raise SystemExit("--system-sample-interval-s must be >= 0")
     if args.backend == "dflash":
         _validate_l2_flags(args)
     if args.backend == "dflash":
@@ -1918,6 +2071,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     (run_dir / client_subdir).mkdir()
     workspace = run_dir / "workspace"
     workspace.mkdir()
+    workspace_source_summary = _prepare_workspace(
+        workspace=workspace,
+        workspace_source=args.workspace_source,
+        workspace_excludes=args.workspace_exclude,
+    )
 
     task = Path(args.task_file).read_text() if args.task_file else args.task
 
@@ -2002,6 +2160,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "server_cmd": server_cmd,
         "proxy_port": args.proxy_port,
         "server_port": server_port,
+        "workspace_source": workspace_source_summary,
+        "system_sample_interval_s": args.system_sample_interval_s,
     }
     if args.backend == "dflash":
         metadata["dflash_runtime_overrides"] = {
@@ -2039,6 +2199,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     server_proc = None
     proxy_proc = None
     client_proc = None
+    system_sampler = None
+    system_sampler_error = None
     client_returncode = None
     client_wall_s = None
 
@@ -2048,6 +2210,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         server_proc = _spawn(server_cmd, run_dir / "server" / "stdout.log", run_dir / "server" / "stderr.log")
         if not _wait_health(server_health_url, args.server_ready_timeout_s, "server"):
             raise SystemExit("server not ready")
+        system_sampler = _start_system_sampler(
+            run_dir=run_dir,
+            server_pid=int(server_proc.pid),
+            interval_s=float(args.system_sample_interval_s),
+        )
 
         sys.stderr.write(f"[orch] starting proxy: {' '.join(proxy_cmd)}\n")
         proxy_proc = _spawn(proxy_cmd, run_dir / "proxy" / "stdout.log", run_dir / "proxy" / "stderr.log")
@@ -2086,6 +2253,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             sys.stderr.write(f"[orch] restore config err: {e!r}\n")
         if proxy_proc is not None:
             _terminate(proxy_proc, "proxy")
+        system_sampler_error = _stop_system_sampler(system_sampler)
         if server_proc is not None:
             _terminate(server_proc, "server")
 
@@ -2156,11 +2324,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "client_wall_s": client_wall_s,
         "post_count": len(posts),
         "posts": posts,
+        "workspace_source": workspace_source_summary,
         "workspace_files": workspace_files,
         "totals": totals,
         "cache_summary": cache_summary if args.backend == "dflash" else None,
         "prompt_transitions": prompt_transitions,
     }
+    if system_sampler_error is not None:
+        summary["system_sampler_error"] = system_sampler_error
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False))
     _write_post_rows(run_dir, summary)
 
@@ -2303,6 +2474,11 @@ def _normalized_post_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
                 "acceptance": _float_value(view.get("accept")),
                 "tokens_per_cycle": _float_value(view.get("tokens_per_cycle")),
                 "cycles": _int_value(sm.get("cycles_completed")),
+                "adaptive_block_reductions": _int_value(
+                    sm.get("adaptive_block_reductions")
+                ),
+                "adaptive_block_cycles": _int_value(sm.get("adaptive_block_cycles")),
+                "adaptive_block_min": _int_value(sm.get("adaptive_block_min")),
                 "phys_footprint_peak_gb": _memory_gb(
                     memory,
                     "phys_footprint_gb",

@@ -92,6 +92,9 @@ class _RequestAccounting:
     acceptance_ratio: Optional[float] = None
     tokens_per_cycle: Optional[float] = None
     cycles_completed: Optional[int] = None
+    adaptive_block_reductions: int = 0
+    adaptive_block_cycles: int = 0
+    adaptive_block_min: Optional[int] = None
     finish_reason: Optional[str] = None
     cache_lookup_ms: Optional[float] = None
     cache_hit_tokens: int = 0
@@ -175,6 +178,15 @@ class _RequestAccounting:
         acceptance_ratio = float(summary_event.acceptance_ratio if summary_event else 0.0)
         cycles_completed = int(summary_event.cycles_completed if summary_event else 0)
         tokens_per_cycle = float(summary_event.tokens_per_cycle if summary_event else 0.0)
+        adaptive_block_reductions = int(
+            summary_event.adaptive_block_reductions if summary_event else 0
+        )
+        adaptive_block_cycles = int(
+            summary_event.adaptive_block_cycles if summary_event else 0
+        )
+        adaptive_block_min = (
+            summary_event.adaptive_block_min if summary_event is not None else None
+        )
         prefill_phase_timings_us = _prefill_phase_timings(prefill_event)
         prefill_accounting = _prefill_accounting(prefill_event)
         runtime_config_payload = _runtime_config_payload(runtime_config)
@@ -216,6 +228,9 @@ class _RequestAccounting:
             acceptance_ratio=acceptance_ratio,
             tokens_per_cycle=tokens_per_cycle,
             cycles_completed=cycles_completed,
+            adaptive_block_reductions=adaptive_block_reductions,
+            adaptive_block_cycles=adaptive_block_cycles,
+            adaptive_block_min=adaptive_block_min,
             finish_reason=finish_reason,
             max_tokens=int(max_tokens),
             cache_lookup_ms=float(cache_lookup_ms),
@@ -302,6 +317,9 @@ class _RequestAccounting:
                 "acceptance_ratio": self.acceptance_ratio,
                 "tokens_per_cycle": self.tokens_per_cycle,
                 "cycles_completed": self.cycles_completed,
+                "adaptive_block_reductions": int(self.adaptive_block_reductions),
+                "adaptive_block_cycles": int(self.adaptive_block_cycles),
+                "adaptive_block_min": self.adaptive_block_min,
                 "finish_reason": self.finish_reason,
                 "prompt_regime": dict(self.prompt_regime or {}),
                 "prefill_event": dict(self.prefill_event_payload or {}),
@@ -329,6 +347,7 @@ def configure_live_metrics(
     target_ref = model_key[0] if len(model_key) > 0 else getattr(cli_args, "model", None)
     draft_ref = model_key[2] if len(model_key) > 2 else getattr(cli_args, "draft_model", None)
     draft_meta = getattr(model_provider, "draft_meta", {}) or {}
+    target_meta = getattr(model_provider, "target_meta", {}) or {}
     target_fa_window = _int_or_none(getattr(runtime_config, "target_fa_window", None))
     prefix_cache_enabled = bool(
         runtime_config is not None
@@ -364,6 +383,21 @@ def configure_live_metrics(
                 "prefix_cache_enabled": prefix_cache_enabled,
                 "target_fa_window": (
                     None if int(target_fa_window or 0) <= 0 else int(target_fa_window)
+                ),
+                "split_sdpa_applied": _bool_or_none(
+                    target_meta.get("split_full_attention_sdpa")
+                ),
+                "split_sdpa": _bool_or_none(
+                    target_meta.get("split_full_attention_sdpa")
+                ),
+                "split_sdpa_requested": _bool_or_none(
+                    target_meta.get("split_full_attention_sdpa_requested")
+                ),
+                "split_sdpa_default": _bool_or_none(
+                    target_meta.get("split_full_attention_sdpa_default")
+                ),
+                "split_sdpa_resolved": _bool_or_none(
+                    target_meta.get("split_full_attention_sdpa_resolved")
                 ),
                 "diagnostics": getattr(cli_args, "diagnostics", None),
             }
@@ -623,6 +657,11 @@ def reset_live_metrics_for_tests() -> None:
                 "prefill_step_size": None,
                 "prefix_cache_enabled": None,
                 "target_fa_window": None,
+                "split_sdpa_applied": None,
+                "split_sdpa": None,
+                "split_sdpa_requested": None,
+                "split_sdpa_default": None,
+                "split_sdpa_resolved": None,
                 "diagnostics": None,
             }
         )
@@ -1010,6 +1049,13 @@ def _int_or_none(value: Optional[Any]) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _bool_or_none(value: Optional[Any]) -> Optional[bool]:
+    if value is None:
+        return None
+    return bool(value)
+
 
 def _fmt_ms(value: Optional[float]) -> str:
     if value is None:

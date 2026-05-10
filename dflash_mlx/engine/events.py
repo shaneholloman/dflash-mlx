@@ -143,6 +143,9 @@ class SummaryEvent:
     acceptance_history: tuple[int, ...] = ()
     acceptance_first_20_avg: float = 0.0
     acceptance_last_20_avg: float = 0.0
+    adaptive_block_reductions: int = 0
+    adaptive_block_cycles: int = 0
+    adaptive_block_min: int | None = None
     peak_memory_gb: float | None = None
     cycle_profile_us: tuple[CycleCompleteEvent, ...] | None = None
     cycle_profile_totals_us: dict[str, float] | None = None
@@ -172,6 +175,9 @@ class SummaryEvent:
             "clear_cache_boundaries": self.clear_cache_boundaries,
             "acceptance_first_20_avg": self.acceptance_first_20_avg,
             "acceptance_last_20_avg": self.acceptance_last_20_avg,
+            "adaptive_block_reductions": self.adaptive_block_reductions,
+            "adaptive_block_cycles": self.adaptive_block_cycles,
+            "adaptive_block_min": self.adaptive_block_min,
             "peak_memory_gb": self.peak_memory_gb,
             "cycle_profile_us": (
                 [entry.to_payload() for entry in self.cycle_profile_us]
