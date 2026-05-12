@@ -38,8 +38,14 @@ from dflash_mlx.benchmark_suites import (
     slugify_prompt_id,
 )
 from dflash_mlx.draft_backend import DraftBackend
-from dflash_mlx.engine.events import SummaryEvent, TokenEvent, is_engine_event
-from dflash_mlx.metal_limits import apply_metal_limits
+from dflash_mlx.engine.events import (
+    PrefillCompleteEvent,
+    SummaryEvent,
+    TokenEvent,
+    is_engine_event,
+)
+from dflash_mlx.metal_limits import apply_metal_limits, parse_memory_limit
+from dflash_mlx.observability.memory import process_memory_snapshot
 from dflash_mlx.runtime import (
     get_stop_token_ids,
     stream_dflash_generate,
@@ -47,6 +53,7 @@ from dflash_mlx.runtime import (
 from dflash_mlx.runtime.bundle import load_runtime_bundle
 from dflash_mlx.runtime.config import (
     BENCHMARK_RUNTIME_FIELDS,
+    GiB,
     add_offline_runtime_arguments,
     offline_runtime_error_message,
     offline_runtime_kwargs,
@@ -73,12 +80,15 @@ CONTROLLED_FLAG_NAMES = (
     "no_memory",
     "repeat",
     "cooldown",
+    "wired_limit",
+    "cache_limit",
     "model",
     "draft",
     "use_chat_template",
     "draft_quant",
     "no_eos",
     "split_sdpa",
+    "prefill_step_size",
     "target_fa_window",
     "draft_sink_size",
     "draft_window_size",
@@ -149,6 +159,29 @@ def _warn_if_throttled(thermal_pressure: str) -> None:
 def _warn_benchmark(message: str) -> None:
     print(f"WARNING: {message}", file=sys.stderr)
 
+def _gb_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    return float(value) / 1_000_000_000.0
+
+def _benchmark_memory_snapshot(label: str) -> dict[str, float | None] | None:
+    try:
+        snapshot = process_memory_snapshot(include_system_wired=False)
+    except Exception as exc:
+        _warn_benchmark(
+            f"{label} memory snapshot failed: {type(exc).__name__}: {exc}; "
+            "memory breakdown will be omitted."
+        )
+        return None
+    return {
+        "rss_gb": _gb_or_none(snapshot.get("rss_bytes")),
+        "phys_footprint_gb": _gb_or_none(snapshot.get("phys_footprint_bytes")),
+        "mlx_active_gb": _gb_or_none(snapshot.get("mlx_active_bytes")),
+        "mlx_cache_gb": _gb_or_none(snapshot.get("mlx_cache_bytes")),
+        "mlx_peak_gb": _gb_or_none(snapshot.get("mlx_peak_bytes")),
+        "untracked_gb": _gb_or_none(snapshot.get("untracked_bytes")),
+    }
+
 def _reset_peak_memory_for_benchmark(label: str) -> bool:
     reset = getattr(mx, "reset_peak_memory", None)
     if reset is None:
@@ -216,6 +249,8 @@ def _finalize_benchmark_args(
         args.limit = _default_limit_for_suite(args.suite)
     if args.limit < 1:
         raise ValueError("--limit must be >= 1")
+    if args.cache_limit is None:
+        args.cache_limit = 4 * GiB if args.suite == "longctx" else "auto"
     build_offline_runtime_config(**offline_runtime_kwargs(args, BENCHMARK_RUNTIME_FIELDS))
     return args
 
@@ -231,12 +266,59 @@ def _compact_phase_timings(result: dict[str, Any]) -> dict[str, float]:
     timings = dict(result.get("phase_timings_us", {}) or {})
     return {str(key): float(value) for key, value in timings.items()}
 
+def _int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+def _float_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+def _tokens_per_second(token_count: Any, elapsed_us: Any) -> float | None:
+    tokens = _int_or_none(token_count)
+    elapsed = _float_or_none(elapsed_us)
+    if tokens is None or elapsed is None or elapsed <= 0.0:
+        return None
+    return tokens / (elapsed / 1_000_000.0)
+
 def _format_run_entry(run: dict[str, Any]) -> dict[str, Any]:
     baseline = dict(run["baseline"])
     dflash = dict(run["dflash"])
+    baseline_prefill_us = baseline.get("prefill_us")
+    baseline_prefill_tok_s = _float_or_none(
+        baseline.get("prefill_tok_s")
+    ) or _tokens_per_second(baseline.get("prompt_token_count"), baseline_prefill_us)
+    dflash_prefill_us = dflash.get("prefill_us")
+    dflash_logical_prefill_tokens = _int_or_none(
+        dflash.get("logical_ctx_tokens", dflash.get("prompt_token_count"))
+    )
+    dflash_physical_prefill_tokens = _int_or_none(
+        dflash.get(
+            "physical_prefill_tokens",
+            dflash.get("prefill_tokens_computed", dflash.get("prompt_token_count")),
+        )
+    )
     dflash_entry = {
         "ttft_ms": float(run["dflash_ttft_ms"]),
         "generation_tps": float(run["dflash_generation_tps"]),
+        "prefill_tok_s_physical": _tokens_per_second(
+            dflash_physical_prefill_tokens, dflash_prefill_us
+        ),
+        "prefill_tok_s_apparent": _tokens_per_second(
+            dflash_logical_prefill_tokens, dflash_prefill_us
+        ),
+        "prefill_tokens_physical": dflash_physical_prefill_tokens,
+        "prefill_tokens_restored": _int_or_none(dflash.get("prefill_tokens_restored")),
+        "prefill_tokens_computed": _int_or_none(dflash.get("prefill_tokens_computed")),
+        "logical_ctx_tokens": dflash_logical_prefill_tokens,
         "tokens_per_cycle": float(dflash.get("tokens_per_cycle", 0.0)),
         "cycles": int(dflash.get("cycles_completed", 0)),
         "acceptance_ratio": float(dflash.get("acceptance_ratio", 0.0)),
@@ -247,13 +329,23 @@ def _format_run_entry(run: dict[str, Any]) -> dict[str, Any]:
     phase_timings_us = _compact_phase_timings(dflash)
     if phase_timings_us:
         dflash_entry["phase_timings_us"] = phase_timings_us
+    baseline_memory_end = (
+        dict(baseline["memory_end"]) if baseline.get("memory_end") is not None else None
+    )
+    if dflash.get("memory_end") is not None:
+        dflash_entry["memory_end"] = dict(dflash["memory_end"])
     return {
         "run": int(run["run_index"]),
         "thermal_pressure": str(run.get("thermal_pressure", "unknown")),
         "baseline": {
             "ttft_ms": float(run["baseline_ttft_ms"]),
             "generation_tps": float(run["baseline_generation_tps"]),
+            "prefill_tok_s": baseline_prefill_tok_s,
+            "prefill_tok_s_physical": baseline_prefill_tok_s,
+            "prefill_tok_s_apparent": baseline_prefill_tok_s,
+            "prefill_tokens_physical": _int_or_none(baseline.get("prompt_token_count")),
             "peak_memory_gb": baseline.get("peak_memory_gb"),
+            "memory_end": baseline_memory_end,
         },
         "dflash": dflash_entry,
         "speedup": float(run["generation_speedup_vs_baseline"]) if run["generation_speedup_vs_baseline"] is not None else None,
@@ -304,6 +396,7 @@ def _build_config(
     split_sdpa_requested: bool | None,
     split_sdpa_default: bool | None,
     split_sdpa_resolved: bool | None,
+    prefill_step_size: int,
     target_fa_window: int,
     draft_sink_size: int,
     draft_window_size: int,
@@ -324,6 +417,7 @@ def _build_config(
         "split_sdpa_requested": split_sdpa_requested,
         "split_sdpa_default": split_sdpa_default,
         "split_sdpa_resolved": split_sdpa_resolved,
+        "prefill_step_size": int(prefill_step_size),
         "target_fa_window": int(target_fa_window),
         "draft_sink_size": int(draft_sink_size),
         "draft_window_size": int(draft_window_size),
@@ -336,18 +430,21 @@ def _build_config(
 
 def _offline_runtime_values(
     *,
+    prefill_step_size: int | None = None,
     target_fa_window: int | None = None,
     draft_sink_size: int | None = None,
     draft_window_size: int | None = None,
     verify_len_cap: int | None = None,
 ) -> dict[str, int]:
     cfg = build_offline_runtime_config(
+        prefill_step_size=prefill_step_size,
         target_fa_window=target_fa_window,
         draft_sink_size=draft_sink_size,
         draft_window_size=draft_window_size,
         verify_len_cap=verify_len_cap,
     )
     return {
+        "prefill_step_size": int(cfg.prefill_step_size),
         "target_fa_window": int(cfg.target_fa_window),
         "draft_sink_size": int(cfg.draft_sink_size),
         "draft_window_size": int(cfg.draft_window_size),
@@ -371,6 +468,7 @@ def _build_single_case_report(
     split_sdpa_requested: bool | None,
     split_sdpa_default: bool | None,
     split_sdpa_resolved: bool | None,
+    prefill_step_size: int,
     target_fa_window: int,
     draft_sink_size: int,
     draft_window_size: int,
@@ -381,6 +479,21 @@ def _build_single_case_report(
     dflash_tps_values = [float(run["dflash_generation_tps"]) for run in runs]
     speedup_values = [float(run["generation_speedup_vs_baseline"]) for run in runs if run["generation_speedup_vs_baseline"] is not None]
     acceptance_ratio_values = [float(run["dflash"]["acceptance_ratio"]) for run in runs]
+    baseline_prefill_tok_s_values = [
+        value
+        for run in run_entries
+        if (value := run.get("baseline", {}).get("prefill_tok_s")) is not None
+    ]
+    dflash_prefill_physical_values = [
+        value
+        for run in run_entries
+        if (value := run.get("dflash", {}).get("prefill_tok_s_physical")) is not None
+    ]
+    dflash_prefill_apparent_values = [
+        value
+        for run in run_entries
+        if (value := run.get("dflash", {}).get("prefill_tok_s_apparent")) is not None
+    ]
     prompt_tokens = int(runs[0]["baseline"]["prompt_token_count"]) if runs else 0
     return {
         "hardware": _hardware_info(),
@@ -400,6 +513,7 @@ def _build_single_case_report(
             split_sdpa_requested=split_sdpa_requested,
             split_sdpa_default=split_sdpa_default,
             split_sdpa_resolved=split_sdpa_resolved,
+            prefill_step_size=prefill_step_size,
             target_fa_window=target_fa_window,
             draft_sink_size=draft_sink_size,
             draft_window_size=draft_window_size,
@@ -412,6 +526,21 @@ def _build_single_case_report(
             "dflash_tps_min": min(dflash_tps_values) if dflash_tps_values else None,
             "dflash_tps_max": max(dflash_tps_values) if dflash_tps_values else None,
             "speedup_median": statistics.median(speedup_values) if speedup_values else None,
+            "baseline_prefill_tok_s_median": (
+                statistics.median(baseline_prefill_tok_s_values)
+                if baseline_prefill_tok_s_values
+                else None
+            ),
+            "dflash_prefill_tok_s_physical_median": (
+                statistics.median(dflash_prefill_physical_values)
+                if dflash_prefill_physical_values
+                else None
+            ),
+            "dflash_prefill_tok_s_apparent_median": (
+                statistics.median(dflash_prefill_apparent_values)
+                if dflash_prefill_apparent_values
+                else None
+            ),
             "acceptance_ratio_median": statistics.median(acceptance_ratio_values) if acceptance_ratio_values else None,
         },
     }
@@ -427,6 +556,10 @@ def _attach_memory_summary(result: dict[str, Any]) -> None:
         for run in result.get("runs", [])
         if run.get("dflash", {}).get("peak_memory_gb") is not None
     ]
+    baseline_phys = _memory_end_values(result, "baseline", "phys_footprint_gb")
+    dflash_phys = _memory_end_values(result, "dflash", "phys_footprint_gb")
+    baseline_cache = _memory_end_values(result, "baseline", "mlx_cache_gb")
+    dflash_cache = _memory_end_values(result, "dflash", "mlx_cache_gb")
     result.setdefault("summary", {}).update(
         {
             "baseline_peak_memory_gb_median": statistics.median(baseline_peaks)
@@ -435,8 +568,33 @@ def _attach_memory_summary(result: dict[str, Any]) -> None:
             "dflash_peak_memory_gb_median": statistics.median(dflash_peaks)
             if dflash_peaks
             else None,
+            "baseline_memory_end_phys_footprint_gb_median": (
+                statistics.median(baseline_phys) if baseline_phys else None
+            ),
+            "dflash_memory_end_phys_footprint_gb_median": (
+                statistics.median(dflash_phys) if dflash_phys else None
+            ),
+            "baseline_memory_end_mlx_cache_gb_median": (
+                statistics.median(baseline_cache) if baseline_cache else None
+            ),
+            "dflash_memory_end_mlx_cache_gb_median": (
+                statistics.median(dflash_cache) if dflash_cache else None
+            ),
         }
     )
+
+def _memory_end_values(
+    result: dict[str, Any],
+    side: str,
+    key: str,
+) -> list[float]:
+    values: list[float] = []
+    for run in result.get("runs", []):
+        memory = run.get(side, {}).get("memory_end") or {}
+        value = memory.get(key)
+        if value is not None:
+            values.append(float(value))
+    return values
 
 def _speedup(baseline_elapsed: float, dflash_elapsed: float) -> float | None:
     return baseline_elapsed / dflash_elapsed if dflash_elapsed > 0.0 else None
@@ -540,6 +698,7 @@ def _generate_stock_baseline_once(
             "generated_token_ids": [],
             "generation_tokens": 0,
             "peak_memory_gb": _peak_memory_gb_if_reset(memory_reset_ok),
+            "memory_end": _benchmark_memory_snapshot("baseline"),
         }
 
     prompt_tokens = int(final_response.prompt_tokens)
@@ -551,6 +710,7 @@ def _generate_stock_baseline_once(
     return {
         "elapsed_us": elapsed_us,
         "prefill_us": prefill_us,
+        "prefill_tok_s": prompt_tps,
         "prompt_token_count": prompt_tokens,
         "generated_token_ids": generated_token_ids,
         "generation_tokens": generation_tokens,
@@ -558,6 +718,7 @@ def _generate_stock_baseline_once(
         "peak_memory_gb": (
             float(final_response.peak_memory) if memory_reset_ok else None
         ),
+        "memory_end": _benchmark_memory_snapshot("baseline"),
     }
 
 def _generate_dflash_stream_once(
@@ -580,6 +741,7 @@ def _generate_dflash_stream_once(
 
     start_ns = time.perf_counter_ns()
     first_token_us: float | None = None
+    prefill: PrefillCompleteEvent | None = None
     summary: SummaryEvent | None = None
     stream = stream_dflash_generate(
         target_model=target_model,
@@ -598,6 +760,9 @@ def _generate_dflash_stream_once(
     )
     try:
         for event in stream:
+            if isinstance(event, PrefillCompleteEvent):
+                prefill = event
+                continue
             if isinstance(event, TokenEvent):
                 if first_token_us is None:
                     first_token_us = (time.perf_counter_ns() - start_ns) / 1_000.0
@@ -613,8 +778,11 @@ def _generate_dflash_stream_once(
     if summary is None:
         raise RuntimeError("DFlash stream did not yield a summary event")
     summary_payload = summary.to_payload()
+    if prefill is not None:
+        summary_payload.update(prefill.to_payload())
     if not memory_reset_ok:
         summary_payload["peak_memory_gb"] = None
+    summary_payload["memory_end"] = _benchmark_memory_snapshot("dflash")
 
     summary_payload["ttft_us"] = (
         first_token_us
@@ -664,6 +832,7 @@ def _run_once_sequential(
     draft_quant: str | None,
     no_eos: bool,
     split_sdpa: bool | None,
+    prefill_step_size: int | None = None,
     target_fa_window: int | None = None,
     draft_sink_size: int | None = None,
     draft_window_size: int | None = None,
@@ -703,6 +872,7 @@ def _run_once_sequential(
     draft_model = None
     try:
         runtime_context = build_offline_runtime_context(
+            prefill_step_size=prefill_step_size,
             target_fa_window=target_fa_window,
             draft_sink_size=draft_sink_size,
             draft_window_size=draft_window_size,
@@ -808,6 +978,7 @@ def benchmark_once(
     draft_quant: str | None = None,
     no_eos: bool = False,
     split_sdpa: bool | None = None,
+    prefill_step_size: int | None = None,
     target_fa_window: int | None = None,
     draft_sink_size: int | None = None,
     draft_window_size: int | None = None,
@@ -815,6 +986,7 @@ def benchmark_once(
     cooldown: int = 10,
 ) -> dict[str, Any]:
     runtime_values = _offline_runtime_values(
+        prefill_step_size=prefill_step_size,
         target_fa_window=target_fa_window,
         draft_sink_size=draft_sink_size,
         draft_window_size=draft_window_size,
@@ -871,6 +1043,7 @@ def benchmark_repeated(
     draft_quant: str | None = None,
     no_eos: bool = False,
     split_sdpa: bool | None = None,
+    prefill_step_size: int | None = None,
     target_fa_window: int | None = None,
     draft_sink_size: int | None = None,
     draft_window_size: int | None = None,
@@ -878,6 +1051,7 @@ def benchmark_repeated(
     cooldown: int = 10,
 ) -> dict[str, Any]:
     runtime_values = _offline_runtime_values(
+        prefill_step_size=prefill_step_size,
         target_fa_window=target_fa_window,
         draft_sink_size=draft_sink_size,
         draft_window_size=draft_window_size,
@@ -960,6 +1134,7 @@ def benchmark_suite(
         "draft_quant": args.draft_quant,
         "no_eos": args.no_eos,
         "split_sdpa": args.split_sdpa,
+        "prefill_step_size": args.prefill_step_size,
         "target_fa_window": args.target_fa_window,
         "draft_sink_size": args.draft_sink_size,
         "draft_window_size": args.draft_window_size,
@@ -1003,7 +1178,7 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         choices=SUITE_CHOICES,
         default="smoke",
         help=(
-            "Named runtime prompt suite. Default: smoke.\n"
+            "Named benchmark prompt suite. Default: smoke.\n"
             "humaneval/gsm8k/math500 load HF datasets for runtime measurement, "
             "not official accuracy scores."
         ),
@@ -1086,6 +1261,26 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         help="Sleep between measured runs. Default: 10.",
     )
     parser.add_argument(
+        "--wired-limit",
+        metavar="auto|none|BYTES",
+        type=parse_memory_limit,
+        default="auto",
+        help=(
+            "MLX wired memory limit. Default: auto. "
+            "Use none to skip mx.set_wired_limit; BYTES accepts suffixes like 48GB."
+        ),
+    )
+    parser.add_argument(
+        "--cache-limit",
+        metavar="auto|none|BYTES",
+        type=parse_memory_limit,
+        default=None,
+        help=(
+            "MLX cache memory limit. Default: 4GB for longctx, auto otherwise. "
+            "Use none to skip mx.set_cache_limit; BYTES accepts suffixes like 4GB."
+        ),
+    )
+    parser.add_argument(
         "--model",
         metavar="HF_REF_OR_PATH",
         default=None,
@@ -1153,6 +1348,8 @@ def _controlled_flag_values(
         "no_memory": bool(args.no_memory),
         "repeat": int(args.repeat),
         "cooldown": int(args.cooldown),
+        "wired_limit": config.get("wired_limit", args.wired_limit),
+        "cache_limit": config.get("cache_limit", args.cache_limit),
         "model": config.get("model", args.model),
         "draft": config.get("draft", args.draft),
         "use_chat_template": not bool(args.no_chat_template),
@@ -1161,6 +1358,7 @@ def _controlled_flag_values(
         "split_sdpa": _optional_bool(config["split_sdpa"])
         if "split_sdpa" in config
         else _optional_bool(args.split_sdpa),
+        "prefill_step_size": int(args.prefill_step_size),
         "target_fa_window": int(args.target_fa_window),
         "draft_sink_size": int(args.draft_sink_size),
         "draft_window_size": int(args.draft_window_size),
@@ -1188,6 +1386,8 @@ def _explicit_flag_values(
         "--no-memory": "no_memory",
         "--repeat": "repeat",
         "--cooldown": "cooldown",
+        "--wired-limit": "wired_limit",
+        "--cache-limit": "cache_limit",
         "--model": "model",
         "--draft": "draft",
         "--no-chat-template": "use_chat_template",
@@ -1195,6 +1395,7 @@ def _explicit_flag_values(
         "--no-eos": "no_eos",
         "--split-sdpa": "split_sdpa",
         "--no-split-sdpa": "split_sdpa",
+        "--prefill-step-size": "prefill_step_size",
         "--target-fa-window": "target_fa_window",
         "--draft-sink-size": "draft_sink_size",
         "--draft-window-size": "draft_window_size",
@@ -1240,7 +1441,6 @@ def _format_command(argv: list[str]) -> str:
     return shlex.join(argv)
 
 def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
-    apply_metal_limits()
     parser = build_parser(prog=prog)
     argv_list = list(argv) if argv is not None else sys.argv[1:]
     try:
@@ -1249,6 +1449,10 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         parser.error(offline_runtime_error_message(str(exc)))
     if args.model is None:
         parser.error("--model is required")
+    args.metal_limits = apply_metal_limits(
+        wired_request=args.wired_limit,
+        cache_request=args.cache_limit,
+    )
     prompts = resolve_benchmark_prompts(args)
     output_path = create_run_dir(
         "benchmark",

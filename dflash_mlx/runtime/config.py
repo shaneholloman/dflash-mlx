@@ -225,7 +225,7 @@ RUNTIME_CONFIG_FIELDS: tuple[RuntimeConfigFieldSpec, ...] = (
         metavar="INT",
         doc="target prefill chunk size",
         doc_group="runtime",
-        surfaces=(SURFACE_SERVE_DOCTOR, SURFACE_GENERATE),
+        surfaces=(SURFACE_SERVE_DOCTOR, SURFACE_GENERATE, SURFACE_BENCHMARK),
     ),
     RuntimeConfigFieldSpec(
         field="draft_sink_size",
@@ -469,6 +469,7 @@ _GENERATE_RUNTIME_FIELD_ORDER = (
 )
 
 _BENCHMARK_RUNTIME_FIELD_ORDER = (
+    "prefill_step_size",
     "target_fa_window",
     "draft_sink_size",
     "draft_window_size",

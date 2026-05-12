@@ -64,6 +64,7 @@ performance numbers.
 | repeat | `1` |
 | cooldown | `10` seconds |
 | memory summary | enabled |
+| MLX wired/cache limits | wired `auto`; cache `4GB` for `longctx`, `auto` otherwise |
 | split-SDPA in benchmark | auto by target policy |
 | output dir | `.artifacts/dflash/benchmarks/<timestamp>-<suite>-<model>` |
 
@@ -85,7 +86,7 @@ selected row indices, and selected prompt ids.
 
 | Flag | Meaning |
 | --- | --- |
-| `--suite {smoke,humaneval,gsm8k,math500,longctx}` | named runtime prompt suite |
+| `--suite {smoke,humaneval,gsm8k,math500,longctx}` | named benchmark prompt suite |
 | `--limit N` | deterministic prompt count limit |
 | `--ctx-tokens N` | synthetic context target for `longctx` |
 | `--prompt-file PATH` | JSONL prompt override, rows contain `id`, `suite`, `prompt` |
@@ -97,12 +98,15 @@ selected row indices, and selected prompt ids.
 | `--block-tokens INT` | DFlash verify block size |
 | `--repeat INT` | measured runs |
 | `--cooldown SECONDS` | sleep between runs |
+| `--wired-limit auto\|none\|BYTES` | MLX wired memory limit for reproducible memory runs |
+| `--cache-limit auto\|none\|BYTES` | MLX allocator cache limit; default is `4GB` for `longctx`, `auto` otherwise |
 | `--model REF_OR_PATH` | target model; required |
 | `--draft REF_OR_PATH` | draft override |
 | `--no-chat-template` | raw prompt text |
 | `--draft-quant SPEC` | draft quantization override, e.g. `w4:gs64`; use `none` to disable model defaults |
 | `--no-eos` | suppress EOS for fixed-length runs |
 | `--split-sdpa`, `--no-split-sdpa` | benchmark verifier split-SDPA mode; default is auto by target policy |
+| `--prefill-step-size INT` | target prefill chunk size |
 | `--target-fa-window INT` | experimental target FA rotating window |
 | `--draft-sink-size INT` | draft cache sink tokens |
 | `--draft-window-size INT` | draft cache rolling window tokens |
@@ -116,7 +120,9 @@ Each public benchmark run writes:
 
 - `manifest.json` - repo/runtime metadata;
 - `invocation.json` - command, model refs, prompt token mode, protocol;
-- `results.json` - raw per-prompt metrics plus aggregate metrics;
+- `results.json` - raw per-prompt metrics plus aggregate metrics, including
+  end-of-leg `phys_footprint`, `mlx_active`, and `mlx_cache` memory breakdown
+  when available;
 - `runs.jsonl` - per-run measurements;
 - `summary.json` - aggregate numbers;
 - `summary.md` - human-readable report.
@@ -212,6 +218,18 @@ dflash benchmark \
   --ctx-tokens 65536 \
   --max-tokens 64 \
   --out .artifacts/dflash/benchmarks/manual-64k
+```
+
+High-context memory sweep with bounded MLX cache:
+
+```bash
+dflash benchmark \
+  --suite longctx \
+  --model Qwen/Qwen3.5-9B \
+  --ctx-tokens 32768 \
+  --max-tokens 64 \
+  --cache-limit 4GB \
+  --out .artifacts/dflash/benchmarks/manual-32k-cache4gb
 ```
 
 External prompt file:

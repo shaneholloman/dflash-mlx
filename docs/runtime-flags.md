@@ -217,7 +217,7 @@ Flags:
 
 | Flag | Meaning |
 | --- | --- |
-| `--suite {smoke,humaneval,gsm8k,math500,longctx}` | named runtime prompt suite |
+| `--suite {smoke,humaneval,gsm8k,math500,longctx}` | named benchmark prompt suite |
 | `--limit N` | deterministic prompt count limit |
 | `--ctx-tokens N` | synthetic context target for `longctx` |
 | `--prompt-file PATH` | JSONL prompt override with `id`, `suite`, `prompt` rows |
@@ -241,6 +241,7 @@ Runtime override flags:
 <!-- dflash-runtime-config:benchmark-runtime:start -->
 | Flag | Meaning |
 | --- | --- |
+| `--prefill-step-size INT` | target prefill chunk size |
 | `--target-fa-window INT` | experimental target FA rotating window; `0` means full KV |
 | `--draft-sink-size INT` | draft cache sink tokens |
 | `--draft-window-size INT` | draft cache rolling window tokens |

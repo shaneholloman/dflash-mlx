@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import statistics
 from collections.abc import Sequence
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,12 @@ from dflash_mlx.benchmark_suites import BenchmarkPrompt, ctx_tokens
 
 def _optional_bool(value: Any) -> bool | None:
     return None if value is None else bool(value)
+
+def _metal_limits_payload(args: argparse.Namespace) -> dict[str, Any] | None:
+    limits = getattr(args, "metal_limits", None)
+    if limits is None:
+        return None
+    return asdict(limits)
 
 
 def aggregate_prompt_reports(prompt_reports: list[dict[str, Any]]) -> dict[str, Any]:
@@ -46,13 +53,42 @@ def aggregate_prompt_reports(prompt_reports: list[dict[str, Any]]) -> dict[str, 
         "dflash_peak_memory_gb_median": _median(
             summary.get("dflash_peak_memory_gb_median") for summary in summaries
         ),
+        "baseline_memory_end_phys_footprint_gb_median": _median(
+            summary.get("baseline_memory_end_phys_footprint_gb_median")
+            for summary in summaries
+        ),
+        "dflash_memory_end_phys_footprint_gb_median": _median(
+            summary.get("dflash_memory_end_phys_footprint_gb_median")
+            for summary in summaries
+        ),
+        "baseline_memory_end_mlx_cache_gb_median": _median(
+            summary.get("baseline_memory_end_mlx_cache_gb_median")
+            for summary in summaries
+        ),
+        "dflash_memory_end_mlx_cache_gb_median": _median(
+            summary.get("dflash_memory_end_mlx_cache_gb_median")
+            for summary in summaries
+        ),
         "acceptance_ratio_median": _median(
             summary.get("acceptance_ratio_median") for summary in summaries
         ),
         "prefix_saved_tokens": None,
         "prefix_cache_stats": None,
-        "prefill_tps_baseline": None,
-        "prefill_tps_dflash": None,
+        "prefill_tps_baseline": _median(
+            summary.get("baseline_prefill_tok_s_median") for summary in summaries
+        ),
+        "prefill_tps_dflash": _median(
+            summary.get("dflash_prefill_tok_s_physical_median") for summary in summaries
+        ),
+        "baseline_prefill_tok_s_median": _median(
+            summary.get("baseline_prefill_tok_s_median") for summary in summaries
+        ),
+        "dflash_prefill_tok_s_physical_median": _median(
+            summary.get("dflash_prefill_tok_s_physical_median") for summary in summaries
+        ),
+        "dflash_prefill_tok_s_apparent_median": _median(
+            summary.get("dflash_prefill_tok_s_apparent_median") for summary in summaries
+        ),
     }
 
 def suite_report(
@@ -88,6 +124,9 @@ def suite_report(
             "no_memory": not bool(include_memory),
             "repeat": int(args.repeat),
             "cooldown": int(args.cooldown),
+            "wired_limit": getattr(args, "wired_limit", "auto"),
+            "cache_limit": getattr(args, "cache_limit", "auto"),
+            "metal_limits": _metal_limits_payload(args),
             "use_chat_template": not bool(args.no_chat_template),
             "draft_quant": config.get("draft_quant", args.draft_quant),
             "no_eos": bool(args.no_eos),
@@ -159,10 +198,30 @@ def print_summary(result: dict[str, Any], output_path: Path) -> None:
     print(f"  baseline generation_tps median: {summary.get('baseline_tps_median')}")
     print(f"  dflash generation_tps median  : {summary.get('dflash_tps_median')}")
     print(f"  speedup median                : {summary.get('speedup_median')}")
+    print(f"  baseline prefill tok/s median : {summary.get('baseline_prefill_tok_s_median')}")
+    print(
+        "  dflash prefill tok/s median  : "
+        f"{summary.get('dflash_prefill_tok_s_physical_median')} physical / "
+        f"{summary.get('dflash_prefill_tok_s_apparent_median')} apparent"
+    )
     print(f"  acceptance median             : {summary.get('acceptance_ratio_median')}")
     if "baseline_peak_memory_gb_median" in summary or "dflash_peak_memory_gb_median" in summary:
         print(f"  baseline peak memory median   : {summary.get('baseline_peak_memory_gb_median')}")
         print(f"  dflash peak memory median     : {summary.get('dflash_peak_memory_gb_median')}")
+    if (
+        summary.get("baseline_memory_end_phys_footprint_gb_median") is not None
+        or summary.get("dflash_memory_end_phys_footprint_gb_median") is not None
+    ):
+        print(
+            "  memory end phys footprint     : "
+            f"{summary.get('baseline_memory_end_phys_footprint_gb_median')} baseline / "
+            f"{summary.get('dflash_memory_end_phys_footprint_gb_median')} dflash"
+        )
+        print(
+            "  memory end mlx cache          : "
+            f"{summary.get('baseline_memory_end_mlx_cache_gb_median')} baseline / "
+            f"{summary.get('dflash_memory_end_mlx_cache_gb_median')} dflash"
+        )
     print(f"Artifacts written to: {output_path}")
 
 def summary_markdown(result: dict[str, Any]) -> str:
@@ -173,6 +232,9 @@ def summary_markdown(result: dict[str, Any]) -> str:
     ttft = summary.get("dflash_ttft_ms_median")
     peak_memory = summary.get("dflash_peak_memory_gb_median")
     acceptance = summary.get("acceptance_ratio_median")
+    baseline_prefill = summary.get("baseline_prefill_tok_s_median")
+    dflash_prefill_physical = summary.get("dflash_prefill_tok_s_physical_median")
+    dflash_prefill_apparent = summary.get("dflash_prefill_tok_s_apparent_median")
     prompt_rows = []
     for prompt_report in result.get("prompts", []):
         prompt_config = dict(prompt_report.get("config", {}))
@@ -194,9 +256,9 @@ def summary_markdown(result: dict[str, Any]) -> str:
     lines = [
         "# DFlash Benchmark",
         "",
-        "| suite | prompts | prompt tok avg | baseline tok/s | dflash tok/s | speedup | TTFT | peak memory | acceptance | prefix saved |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
-        "| {suite} | {prompts} | {prompt_tok_avg} | {baseline} | {dflash} | {speedup} | {ttft} | {peak} | {acceptance} | {prefix} |".format(
+        "| suite | prompts | prompt tok avg | baseline tok/s | dflash tok/s | speedup | TTFT | peak memory | acceptance | prefix saved | baseline prefill tok/s | dflash prefill physical tok/s | dflash prefill apparent tok/s |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| {suite} | {prompts} | {prompt_tok_avg} | {baseline} | {dflash} | {speedup} | {ttft} | {peak} | {acceptance} | {prefix} | {baseline_prefill} | {dflash_prefill_physical} | {dflash_prefill_apparent} |".format(
             suite=config.get("suite", config.get("benchmark_mode")),
             prompts=_md_value(config.get("prompt_count", 1), precision=0),
             prompt_tok_avg=_md_value(summary.get("prompt_tok_avg")),
@@ -207,6 +269,9 @@ def summary_markdown(result: dict[str, Any]) -> str:
             peak=_md_value(peak_memory, suffix=" GB"),
             acceptance=_md_value(acceptance),
             prefix=_md_value(summary.get("prefix_saved_tokens"), precision=0),
+            baseline_prefill=_md_value(baseline_prefill),
+            dflash_prefill_physical=_md_value(dflash_prefill_physical),
+            dflash_prefill_apparent=_md_value(dflash_prefill_apparent),
         ),
         "",
         f"- mode: {config.get('benchmark_mode')}",

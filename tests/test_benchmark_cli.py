@@ -20,6 +20,7 @@ from dflash_mlx.engine.events import (
     SummaryEvent,
     TokenEvent,
 )
+from dflash_mlx.metal_limits import MetalLimitConfig
 from dflash_mlx.runtime.context import build_offline_runtime_context
 from dflash_mlx.runtime.config import PROFILES
 
@@ -58,6 +59,8 @@ def test_benchmark_help_documents_public_flags(capsys):
         "--no-memory",
         "--repeat",
         "--cooldown",
+        "--wired-limit",
+        "--cache-limit",
         "--model",
         "--draft",
         "--no-chat-template",
@@ -131,6 +134,59 @@ def test_benchmark_cli_requires_model_without_traceback(capsys):
     assert "Traceback" not in err
 
 
+def test_benchmark_main_applies_requested_metal_limits(monkeypatch, tmp_path):
+    calls: list[dict] = []
+
+    def fake_apply_metal_limits(**kwargs):
+        calls.append(kwargs)
+        return {
+            "metal_available": True,
+            "wired_request": kwargs["wired_request"],
+            "cache_request": kwargs["cache_request"],
+        }
+
+    def fake_suite(*, prompts, args):
+        assert prompts[0].id == "smoke-default"
+        assert args.metal_limits["cache_request"] == 4 * 1024**3
+        return {
+            "hardware": {},
+            "config": {
+                "suite": args.suite,
+                "model": args.model,
+                "draft": "auto-draft",
+                "split_sdpa": False,
+            },
+            "prompts": [],
+            "runs": [],
+            "summary": {},
+        }
+
+    monkeypatch.setattr(benchmark, "apply_metal_limits", fake_apply_metal_limits)
+    monkeypatch.setattr(benchmark, "benchmark_suite", fake_suite)
+
+    benchmark.main(
+        [
+            "--model",
+            "m",
+            "--wired-limit",
+            "48GB",
+            "--cache-limit",
+            "4GB",
+            "--out",
+            str(tmp_path / "bench"),
+        ],
+        prog="dflash benchmark",
+    )
+
+    assert calls == [
+        {
+            "wired_request": 48 * 1024**3,
+            "cache_request": 4 * 1024**3,
+        }
+    ]
+    assert (tmp_path / "bench" / "invocation.json").exists()
+
+
 def test_benchmark_invocation_records_explicit_and_effective_values():
     parser = benchmark.build_parser()
     args = parser.parse_args(
@@ -141,6 +197,12 @@ def test_benchmark_invocation_records_explicit_and_effective_values():
             "1",
             "--prompt",
             "p",
+            "--cooldown",
+            "120",
+            "--wired-limit",
+            "48GB",
+            "--cache-limit",
+            "4GB",
             "--model",
             "target-alias",
             "--draft",
@@ -179,6 +241,12 @@ def test_benchmark_invocation_records_explicit_and_effective_values():
             "1",
             "--prompt",
             "p",
+            "--cooldown",
+            "120",
+            "--wired-limit",
+            "48GB",
+            "--cache-limit",
+            "4GB",
             "--model",
             "target-alias",
             "--draft",
@@ -215,6 +283,9 @@ def test_benchmark_invocation_records_explicit_and_effective_values():
     assert invocation["explicit_flags"]["max_tokens"] == 8
     assert invocation["explicit_flags"]["ctx"] == 65536
     assert invocation["explicit_flags"]["no_memory"] is True
+    assert invocation["explicit_flags"]["cooldown"] == 120
+    assert invocation["explicit_flags"]["wired_limit"] == 48 * 1024**3
+    assert invocation["explicit_flags"]["cache_limit"] == 4 * 1024**3
     assert invocation["explicit_flags"]["out"] == "/tmp/result.json"
     assert invocation["explicit_flags"]["draft_sink_size"] == 32
     assert invocation["explicit_flags"]["draft_window_size"] == 512
@@ -226,6 +297,8 @@ def test_benchmark_invocation_records_explicit_and_effective_values():
     assert invocation["effective"]["shuffle"] is False
     assert invocation["effective"]["seed"] == 0
     assert invocation["effective"]["include_memory"] is False
+    assert invocation["effective"]["wired_limit"] == 48 * 1024**3
+    assert invocation["effective"]["cache_limit"] == 4 * 1024**3
     assert invocation["effective"]["use_chat_template"] is False
     assert invocation["effective"]["draft_quant"] == "w4"
     assert invocation["effective"]["split_sdpa"] is False
@@ -251,7 +324,28 @@ def test_benchmark_default_suite_is_smoke():
 
     assert args.suite == "smoke"
     assert args.limit == 1
+    assert args.cache_limit == "auto"
     assert [prompt.id for prompt in prompts] == ["smoke-default"]
+
+def test_benchmark_longctx_defaults_to_bounded_cache_limit():
+    parser = benchmark.build_parser()
+    args = benchmark._finalize_benchmark_args(
+        parser.parse_args(["--suite", "longctx", "--model", "m"]),
+        ["--suite", "longctx", "--model", "m"],
+    )
+
+    assert args.cache_limit == 4 * 1024**3
+
+def test_benchmark_explicit_auto_cache_limit_overrides_longctx_default():
+    parser = benchmark.build_parser()
+    args = benchmark._finalize_benchmark_args(
+        parser.parse_args(
+            ["--suite", "longctx", "--model", "m", "--cache-limit", "auto"]
+        ),
+        ["--suite", "longctx", "--model", "m", "--cache-limit", "auto"],
+    )
+
+    assert args.cache_limit == "auto"
 
 def _fake_hf_rows(suite: str, count: int = 5) -> list[dict[str, str]]:
     if suite == "humaneval":
@@ -445,7 +539,10 @@ def test_benchmark_summary_markdown_handles_missing_metrics():
 
     text = benchmark_report.summary_markdown(result)
 
-    assert "| smoke | 1 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a |" in text
+    assert (
+        "| smoke | 1 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | "
+        "n/a | n/a | n/a |"
+    ) in text
     assert "- draft_quant: w4" in text
 
 
@@ -474,8 +571,44 @@ def test_benchmark_manifest_config_fields_are_suite_aware(monkeypatch):
     )
     parser = benchmark.build_parser()
     args = benchmark._finalize_benchmark_args(
-        parser.parse_args(["--suite", "humaneval", "--limit", "2", "--model", "m", "--shuffle", "--seed", "9"]),
-        ["--suite", "humaneval", "--limit", "2", "--model", "m", "--shuffle", "--seed", "9"],
+        parser.parse_args(
+            [
+                "--suite",
+                "humaneval",
+                "--limit",
+                "2",
+                "--model",
+                "m",
+                "--shuffle",
+                "--seed",
+                "9",
+                "--cache-limit",
+                "4GB",
+            ]
+        ),
+        [
+            "--suite",
+            "humaneval",
+            "--limit",
+            "2",
+            "--model",
+            "m",
+            "--shuffle",
+            "--seed",
+            "9",
+            "--cache-limit",
+            "4GB",
+        ],
+    )
+    args.metal_limits = MetalLimitConfig(
+        metal_available=True,
+        recommended_bytes=64 * 1024**3,
+        wired_request="auto",
+        wired_bytes=64 * 1024**3,
+        wired_applied=True,
+        cache_request=4 * 1024**3,
+        cache_bytes=4 * 1024**3,
+        cache_applied=True,
     )
     prompts = benchmark_suites.resolve_benchmark_prompts(args)
     result = benchmark_report.suite_report(
@@ -522,6 +655,8 @@ def test_benchmark_manifest_config_fields_are_suite_aware(monkeypatch):
     assert result["config"]["selected_row_indices"] == [prompt.row_index for prompt in prompts]
     assert result["config"]["prompt_count"] == 2
     assert result["config"]["ctx_tokens"] == 0
+    assert result["config"]["cache_limit"] == 4 * 1024**3
+    assert result["config"]["metal_limits"]["cache_bytes"] == 4 * 1024**3
     assert result["runs"] == []
 
 def test_benchmark_runs_json_rows_keep_provenance():
@@ -625,12 +760,14 @@ def test_benchmark_split_sdpa_cli_is_tri_state():
 
 def test_benchmark_runtime_context_uses_product_verify_config():
     context = build_offline_runtime_context(
+        prefill_step_size=2048,
         target_fa_window=2048,
         draft_sink_size=32,
         draft_window_size=512,
         verify_len_cap=8,
     )
 
+    assert context.runtime.prefill_step_size == 2048
     assert context.runtime.target_fa_window == 2048
     assert context.runtime.draft_sink_size == 32
     assert context.runtime.draft_window_size == 512
@@ -638,6 +775,21 @@ def test_benchmark_runtime_context_uses_product_verify_config():
     assert context.runtime.prefix_cache is False
     assert context.verify.mode == "auto"
     assert context.verify.enable_qmm is True
+
+
+def test_benchmark_prefill_step_size_cli_reaches_invocation(tmp_path):
+    parser = benchmark.build_parser()
+    argv = ["dflash benchmark", "--model", "m", "--prefill-step-size", "2048"]
+    args = benchmark._finalize_benchmark_args(
+        parser.parse_args(argv[1:]),
+        argv[1:],
+    )
+
+    invocation = benchmark._build_invocation(args, tmp_path, argv, {})
+
+    assert args.prefill_step_size == 2048
+    assert invocation["explicit_flags"]["prefill_step_size"] == 2048
+    assert invocation["effective"]["prefill_step_size"] == 2048
 
 def test_benchmark_direct_defaults_follow_balanced_profile(monkeypatch):
     monkeypatch.setitem(
@@ -706,11 +858,13 @@ def _fake_baseline_result() -> dict:
     return {
         "elapsed_us": 2_000_000.0,
         "prefill_us": 1_000_000.0,
+        "prefill_tok_s": 3.0,
         "prompt_token_count": 3,
         "generated_token_ids": [7],
         "generation_tokens": 1,
         "generation_tps": 1.0,
         "peak_memory_gb": 1.0,
+        "memory_end": {"phys_footprint_gb": 2.0, "mlx_cache_gb": 0.5},
     }
 
 
@@ -719,10 +873,17 @@ def _fake_dflash_result() -> dict:
         "elapsed_us": 1_000_000.0,
         "phase_timings_us": {"prefill": 100_000.0, "verify": 50_000.0},
         "ttft_us": 100_000.0,
+        "prefill_us": 100_000.0,
+        "prompt_token_count": 3,
+        "logical_ctx_tokens": 5,
+        "physical_prefill_tokens": 3,
+        "prefill_tokens_restored": 2,
+        "prefill_tokens_computed": 3,
         "generated_token_ids": [7],
         "generation_tokens": 1,
         "acceptance_ratio": 1.0,
         "cycles_completed": 1,
+        "memory_end": {"phys_footprint_gb": 3.0, "mlx_cache_gb": 0.75},
     }
 
 
@@ -814,7 +975,35 @@ def test_benchmark_omits_dflash_peak_memory_when_reset_fails(monkeypatch, capsys
 
     assert stream.closed is True
     assert result["peak_memory_gb"] is None
+    assert result["logical_ctx_tokens"] == 3
+    assert result["physical_prefill_tokens"] == 3
+    assert result["prefill_tokens_computed"] == 3
     assert "dflash peak memory reset failed" in capsys.readouterr().err
+
+
+def test_benchmark_memory_summary_includes_end_breakdown():
+    result = {
+        "runs": [
+            {
+                "baseline": {
+                    "peak_memory_gb": 1.0,
+                    "memory_end": {"phys_footprint_gb": 2.0, "mlx_cache_gb": 0.5},
+                },
+                "dflash": {
+                    "peak_memory_gb": 4.0,
+                    "memory_end": {"phys_footprint_gb": 5.0, "mlx_cache_gb": 0.75},
+                },
+            }
+        ],
+        "summary": {},
+    }
+
+    benchmark._attach_memory_summary(result)
+
+    assert result["summary"]["baseline_peak_memory_gb_median"] == 1.0
+    assert result["summary"]["dflash_peak_memory_gb_median"] == 4.0
+    assert result["summary"]["baseline_memory_end_phys_footprint_gb_median"] == 2.0
+    assert result["summary"]["dflash_memory_end_mlx_cache_gb_median"] == 0.75
 
 
 def test_benchmark_rejects_stale_dict_engine_event(monkeypatch):
@@ -1088,6 +1277,14 @@ def test_benchmark_preserves_dflash_phase_timings_in_artifact_entry(monkeypatch)
 
     entry = benchmark._format_run_entry({**run, "run_index": 1})
 
+    assert entry["baseline"]["prefill_tok_s"] == 3.0
+    assert entry["baseline"]["prefill_tok_s_physical"] == 3.0
+    assert entry["baseline"]["memory_end"]["mlx_cache_gb"] == 0.5
+    assert entry["dflash"]["prefill_tok_s_physical"] == 30.0
+    assert entry["dflash"]["prefill_tok_s_apparent"] == 50.0
+    assert entry["dflash"]["memory_end"]["phys_footprint_gb"] == 3.0
+    assert entry["dflash"]["prefill_tokens_restored"] == 2
+    assert entry["dflash"]["prefill_tokens_computed"] == 3
     assert entry["dflash"]["phase_timings_us"] == {
         "prefill": 100_000.0,
         "verify": 50_000.0,

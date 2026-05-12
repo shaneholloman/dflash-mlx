@@ -129,12 +129,12 @@ def bench_size(target_mb: int) -> dict:
             print(
                 f"after insert_async   RSS={rss_post_insert:7.0f} MB   "
                 f"MLX active={mlx_post_insert:7.0f} MB   "
-                f"(insert_async {insert_ms:.0f} ms = mx.eval + np.array(copy))"
+                f"(insert_async {insert_ms:.0f} ms = mx.eval + safetensors materialize)"
             )
             print(
                 f"after writer drain   RSS={rss_post_write:7.0f} MB   "
                 f"MLX active={mlx_post_write:7.0f} MB   "
-                f"(writer {write_complete_ms:.0f} ms = safetensors save + rename)"
+                f"(writer {write_complete_ms:.0f} ms = rename + eviction)"
             )
 
             token_len = len(snap.token_ids)
