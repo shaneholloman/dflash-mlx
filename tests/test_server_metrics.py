@@ -57,6 +57,16 @@ def _runtime_config(**overrides):
     return SimpleNamespace(**values)
 
 
+def _fake_tokenizer():
+    return SimpleNamespace(
+        chat_template="template",
+        unk_token_id=-1,
+        has_tool_calling=False,
+        has_thinking=False,
+        convert_tokens_to_ids=lambda tokens: [-1 for _ in tokens],
+    )
+
+
 def _configure_metrics(runtime_config=None):
     runtime_config = runtime_config or _runtime_config()
     runtime_context = SimpleNamespace(
@@ -76,11 +86,13 @@ def _configure_metrics(runtime_config=None):
                 "split_full_attention_sdpa_default": True,
                 "split_full_attention_sdpa_resolved": True,
             },
+            tokenizer=_fake_tokenizer(),
             cli_args=SimpleNamespace(
                 model="target-model",
                 draft_model=None,
                 runtime_config=runtime_config,
                 runtime_context=runtime_context,
+                chat_template_args={"enable_thinking": False},
                 diagnostics="off",
                 metal_limits=SimpleNamespace(wired_bytes=64 * 1024**3),
             ),
@@ -571,11 +583,13 @@ def test_metrics_startup_preserves_request_cache_identity(monkeypatch):
     model_provider = SimpleNamespace(
         model_key=("target-model", None, "draft-model"),
         draft_model=draft_model,
+        tokenizer=_fake_tokenizer(),
         cli_args=SimpleNamespace(
             model="target-model",
             draft_model=None,
             runtime_config=runtime_config,
             runtime_context=runtime_context,
+            chat_template_args={"enable_thinking": False},
             diagnostics="off",
             metal_limits=SimpleNamespace(wired_bytes=64 * 1024**3),
         ),

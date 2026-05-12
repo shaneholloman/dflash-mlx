@@ -54,6 +54,8 @@ from dflash_mlx.engine.memory_waterfall import (
     should_sample_cycle as _should_sample_memory_cycle,
 )
 
+_DECODE_CLEAR_CACHE_INTERVAL_TOKENS = 1024
+
 
 @dataclass(frozen=True)
 class _SessionRequest:
@@ -116,6 +118,21 @@ class _SessionRequest:
             else None
         )
         object.__setattr__(self, "stop_token_array", stop_array)
+
+    def should_collect_generation_snapshot_hidden(
+        self,
+        supports_prefix_snapshot: bool,
+    ) -> bool:
+        if not supports_prefix_snapshot or not self.publish_generation_snapshot:
+            return False
+        if self.snapshot_service is None or not self.snapshot_service.active:
+            return False
+        if (
+            self.stable_prefix_len is not None
+            and 0 < int(self.stable_prefix_len) < int(self.prompt_len)
+        ):
+            return False
+        return True
 
 
 @dataclass(frozen=True)
@@ -355,8 +372,14 @@ class SpeculativeSession:
         )
 
     def clear_cache_boundary(self) -> None:
-        if self.clear_cache_boundaries and hasattr(mx, "clear_cache"):
-            mx.clear_cache()
+        if not self.clear_cache_boundaries:
+            return
+        synchronize = getattr(mx, "synchronize", None)
+        if callable(synchronize):
+            synchronize()
+        clear_cache = getattr(mx, "clear_cache", None)
+        if callable(clear_cache):
+            clear_cache()
 
     def memory_waterfall_event(
         self,
@@ -477,6 +500,36 @@ class SpeculativeSession:
                 features=feat,
             )
             del feat, prefill_hidden_states
+            if (
+                supports_prefix_snapshot
+                and snapshot_service is not None
+                and snapshot_service.should_publish_frontier(chunk_end)
+                and chunk_end < snapshot_boundary
+            ):
+                _snapshot_build = yield_pause.mark()
+                snapshot_event = _publish_snapshot_event(
+                    token_ids=list(prompt_tokens[:chunk_end]),
+                    target_cache=target_cache,
+                    target_hidden=feature_store.prefix_view(chunk_end),
+                    last_logits=(
+                        state.prefill_logits[:, -1, :]
+                        if state.prefill_logits is not None
+                        else None
+                    ),
+                    snapshot_service=snapshot_service,
+                    kind="prefill",
+                    require_logits=True,
+                    snapshot_boundary=chunk_end,
+                    allow_full_context_draft_layers=allow_full_context_draft_layers,
+                    from_snapshot=bool(snap_prefix_len > 0),
+                    snap_prefix_len=min(int(snap_prefix_len), int(chunk_end)),
+                    l2_only=True,
+                )
+                yield_pause.done(_snapshot_build)
+                if snapshot_event is not None:
+                    _pre_yield = yield_pause.mark()
+                    yield snapshot_event
+                    yield_pause.done(_pre_yield)
             if profile_cycles:
                 _phase_cold_ns += time.perf_counter_ns() - _t
             self.clear_cache_boundary()
@@ -633,7 +686,12 @@ class SpeculativeSession:
 
         prefill_ns = time.perf_counter_ns() - prefill_start_ns
 
-        feature_store.freeze_prefill_for_snapshot(enabled=supports_prefix_snapshot)
+        collect_generation_snapshot_hidden = (
+            request.should_collect_generation_snapshot_hidden(supports_prefix_snapshot)
+        )
+        feature_store.freeze_prefill_for_snapshot(
+            enabled=collect_generation_snapshot_hidden
+        )
 
         if state.prefill_logits is None:
             raise RuntimeError("prefill logits unavailable after prefix snapshot restore")
@@ -685,13 +743,11 @@ class SpeculativeSession:
         supports_prefix_snapshot: bool,
         yield_pause: "_YieldPauseTracker",
     ) -> Iterator[EngineEvent]:
-        if not supports_prefix_snapshot or not state.generated_token_ids:
-            return
-        if not request.publish_generation_snapshot:
-            return
         if (
-            request.stable_prefix_len is not None
-            and 0 < int(request.stable_prefix_len) < int(request.prompt_len)
+            not state.generated_token_ids
+            or not request.should_collect_generation_snapshot_hidden(
+                supports_prefix_snapshot
+            )
         ):
             return
 
@@ -757,6 +813,9 @@ class SpeculativeSession:
         feature_store = prefill.feature_store
         suppress_token_mask = prefill.suppress_token_mask
         supports_prefix_snapshot = prefill.supports_prefix_snapshot
+        collect_generation_snapshot_hidden = (
+            request.should_collect_generation_snapshot_hidden(supports_prefix_snapshot)
+        )
 
         def _waterfall_event(
             phase: str,
@@ -826,9 +885,20 @@ class SpeculativeSession:
             "other": 0,
             "cycle_total": 0,
         }
+        decode_clear_interval = (
+            _DECODE_CLEAR_CACHE_INTERVAL_TOKENS if self.clear_cache_boundaries else 0
+        )
+        next_decode_clear_at = decode_clear_interval
 
         while len(state.generated_token_ids) < max_new_tokens:
             cycle_start_ns = time.perf_counter_ns() if profile_cycles else 0
+            if (
+                decode_clear_interval > 0
+                and len(state.generated_token_ids) >= next_decode_clear_at
+            ):
+                self.clear_cache_boundary()
+                while next_decode_clear_at <= len(state.generated_token_ids):
+                    next_decode_clear_at += decode_clear_interval
             draft_cycle_ns = 0
             verify_cycle_ns = 0
             replay_cycle_ns = 0
@@ -980,7 +1050,7 @@ class SpeculativeSession:
             state.start += commit_count
             feature_store.commit_generation(
                 committed_hidden,
-                collect_snapshot=supports_prefix_snapshot,
+                collect_snapshot=collect_generation_snapshot_hidden,
             )
             state.last_cycle_logits = verify_logits[:, acceptance_len, :]
             replay_cycle_ns = target_ops.restore_after_acceptance(
@@ -1299,6 +1369,7 @@ def _publish_snapshot_event(
     allow_full_context_draft_layers: bool,
     from_snapshot: bool = False,
     snap_prefix_len: int = 0,
+    l2_only: bool = False,
 ) -> Optional[SnapshotPublishedEvent]:
     if snapshot_service is None or target_hidden is None:
         return None
@@ -1313,6 +1384,7 @@ def _publish_snapshot_event(
         allow_full_attention_context=allow_full_context_draft_layers,
         from_snapshot=from_snapshot,
         snap_prefix_len=snap_prefix_len,
+        l2_only=l2_only,
     )
     if publication is None:
         return None
@@ -1377,8 +1449,13 @@ def stream_dflash_generate_impl(
     configured_max_ctx = int(runtime_config.dflash_max_ctx)
     dflash_max_ctx = configured_max_ctx if configured_max_ctx > 0 else sys.maxsize
     target_fa_window = int(runtime_config.target_fa_window)
-    if prompt_len >= dflash_max_ctx:
-        fallback_reason = f"prompt_len={prompt_len} >= DFLASH_MAX_CTX={dflash_max_ctx}"
+    projected_ctx = prompt_len + max(0, int(max_new_tokens))
+    if projected_ctx >= dflash_max_ctx:
+        fallback_reason = (
+            f"projected_ctx={projected_ctx} "
+            f"(prompt_len={prompt_len}, max_new_tokens={int(max_new_tokens)}) "
+            f">= DFLASH_MAX_CTX={dflash_max_ctx}"
+        )
         yield from stream_baseline_generate(
             target_model=target_model,
             target_ops=target_ops,

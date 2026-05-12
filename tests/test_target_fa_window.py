@@ -48,6 +48,8 @@ def _make_prefix_key(target_fa_window: int) -> DFlashPrefixKey:
         capture_layer_ids=(3, 7),
         draft_sink_size=64,
         draft_window_size=1024,
+        template_hash="a" * 64,
+        prompt_policy_hash="b" * 64,
         target_fa_window=target_fa_window,
     )
 
@@ -237,6 +239,14 @@ def test_build_prefix_key_records_target_fa_window(monkeypatch):
 
     class FakeProvider:
         model_key = ("target", None, "draft")
+        tokenizer = SimpleNamespace(
+            chat_template="template",
+            unk_token_id=-1,
+            has_tool_calling=False,
+            has_thinking=False,
+            convert_tokens_to_ids=lambda tokens: [-1 for _ in tokens],
+        )
+        cli_args = SimpleNamespace(chat_template_args={"enable_thinking": False})
 
     class FakeDraft:
         target_layer_ids = [3, 7]

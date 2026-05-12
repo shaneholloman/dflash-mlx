@@ -100,6 +100,8 @@ def _make_key(**overrides) -> DFlashPrefixKey:
         capture_layer_ids=(10, 20),
         draft_sink_size=16,
         draft_window_size=2048,
+        template_hash="a" * 64,
+        prompt_policy_hash="b" * 64,
     )
     base.update(overrides)
     return DFlashPrefixKey(**base)
@@ -162,6 +164,59 @@ def test_l1_generation_snapshot_without_logits_is_prefix_only():
     prefix_len, prefix = cache.lookup([1, 2, 3, 4], key)
     assert prefix_len == 3
     assert prefix is snapshot
+
+
+def test_l1_prunes_dominated_prefill_snapshots_without_frontier_stride():
+    cache = DFlashPrefixCache(max_entries=8, max_bytes=8 * 1024 * 1024 * 1024)
+    key = _make_key()
+    cache.insert(_make_synthetic_snapshot([1, 2, 3, 4], key))
+    cache.insert(_make_synthetic_snapshot([1, 2, 3, 4, 5, 6, 7, 8], key))
+    cache.insert(_make_synthetic_snapshot([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], key))
+
+    matched_len, snapshot = cache.lookup([1, 2, 3, 4, 99], key)
+
+    assert matched_len == 0
+    assert snapshot is None
+    assert cache.stats()["current_entries"] == 1
+
+
+def test_l1_preserves_aligned_prefill_frontiers():
+    cache = DFlashPrefixCache(
+        max_entries=8,
+        max_bytes=8 * 1024 * 1024 * 1024,
+        frontier_stride=4,
+    )
+    key = _make_key()
+    frontier = _make_synthetic_snapshot([1, 2, 3, 4], key)
+    cache.insert(frontier)
+    cache.insert(_make_synthetic_snapshot([1, 2, 3, 4, 5, 6, 7, 8], key))
+    cache.insert(_make_synthetic_snapshot([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], key))
+
+    matched_len, snapshot = cache.lookup([1, 2, 3, 4, 99], key)
+
+    assert matched_len == 4
+    assert snapshot is frontier
+    assert cache.stats()["current_entries"] == 3
+
+
+def test_l1_aligned_frontier_duplicate_replaces_old_snapshot():
+    cache = DFlashPrefixCache(
+        max_entries=8,
+        max_bytes=8 * 1024 * 1024 * 1024,
+        frontier_stride=4,
+    )
+    key = _make_key()
+    old_frontier = _make_synthetic_snapshot([1, 2, 3, 4], key)
+    new_frontier = _make_synthetic_snapshot([1, 2, 3, 4], key)
+    cache.insert(old_frontier)
+    cache.insert(_make_synthetic_snapshot([1, 2, 3, 4, 5, 6, 7, 8], key))
+    cache.insert(new_frontier)
+
+    matched_len, snapshot = cache.lookup([1, 2, 3, 4, 99], key)
+
+    assert matched_len == 4
+    assert snapshot is new_frontier
+    assert cache.stats()["current_entries"] == 2
 
 
 def test_l1_lookup_cache_event_records_request_id(tmp_path):
@@ -247,6 +302,48 @@ def test_store_l2_hit_cache_event_records_request_id(tmp_path):
     lookup = [row for row in rows if row.get("op") == "lookup"][-1]
     assert lookup["request_id"] == 123
     assert lookup["result"] == "l2_hit"
+
+
+def test_store_promotes_l2_prefix_hit_to_l1_for_next_lookup():
+    key = _make_key()
+    l2_snapshot = _make_synthetic_snapshot([1, 2, 3], key)
+
+    class _HitL2:
+        def __init__(self, snapshot):
+            self.snapshot = snapshot
+            self.lookups = []
+            self.inserts = []
+
+        def lookup(self, _tokens, _key, **kwargs):
+            self.lookups.append(kwargs)
+            min_token_len = int(kwargs.get("min_token_len", 0))
+            if len(self.snapshot.token_ids) <= min_token_len:
+                return None
+            return self.snapshot
+
+        def insert_async(self, snapshot):
+            self.inserts.append(snapshot)
+            return True
+
+        def stats(self):
+            return {}
+
+    l2 = _HitL2(l2_snapshot)
+    store = PrefixSnapshotStore(
+        l1=DFlashPrefixCache(max_entries=8, max_bytes=8 * 1024 * 1024 * 1024),
+        l2=l2,
+    )
+
+    first_len, first = store.lookup([1, 2, 3, 4], key)
+    second_len, second = store.lookup([1, 2, 3, 5], key)
+
+    assert first_len == 3
+    assert first is l2_snapshot
+    assert second_len == 3
+    assert second is l2_snapshot
+    assert len(l2.lookups) == 2
+    assert l2.lookups[0].get("min_token_len", 0) == 0
+    assert l2.lookups[1]["min_token_len"] == 3
 
 
 def test_prefix_snapshot_builder_matches_build_snapshot_shape():
@@ -1332,7 +1429,7 @@ class TestSkipLongSnapshot:
         assert cache.stats()["current_entries"] == 1
         assert cache.stats()["skipped_too_long"] == 0
 
-    def test_cap_bypassed_when_l2_wired(self):
+    def test_cap_limits_l1_when_l2_wired_but_prefill_persists_to_l2(self):
 
         class _StubL2:
             def __init__(self):
@@ -1362,11 +1459,12 @@ class TestSkipLongSnapshot:
         )
         key = _make_key()
         too_long = _make_synthetic_snapshot([1, 2, 3, 4, 5, 6], key)
-        cache.insert(too_long)
+        assert cache.insert(too_long) is True
         stats = cache.stats()
-        assert stats["current_entries"] == 1
-        assert stats["skipped_too_long"] == 0
-        assert stats["insertions"] == 1
+        assert stats["current_entries"] == 0
+        assert stats["skipped_too_long"] == 1
+        assert stats["insertions"] == 0
+        assert l2.inserts == [too_long]
 
 class TestByteBudget:
     def test_byte_budget_evicts(self):

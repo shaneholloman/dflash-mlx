@@ -13,5 +13,7 @@ class DFlashPrefixKey:
     capture_layer_ids: tuple[int, ...]
     draft_sink_size: int
     draft_window_size: int
+    template_hash: str
+    prompt_policy_hash: str
     target_fa_window: int = 0
-    format_version: int = 2
+    format_version: int = 3

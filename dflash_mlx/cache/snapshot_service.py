@@ -62,7 +62,24 @@ class SnapshotService:
 
     @property
     def active(self) -> bool:
-        return self._cache_manager is not None
+        cache_manager = self._cache_manager
+        if cache_manager is None:
+            return False
+        if not cache_manager.active:
+            self._cache_manager = None
+            return False
+        return True
+
+    def should_publish_frontier(self, prefix_len: int) -> bool:
+        cache_manager = self._cache_manager
+        if cache_manager is None:
+            return False
+        try:
+            stride = cache_manager.frontier_stride()
+        except RuntimeCacheManagerClosed:
+            self._cache_manager = None
+            return False
+        return stride > 0 and int(prefix_len) > 0 and int(prefix_len) % stride == 0
 
     def publish(
         self,
@@ -77,6 +94,7 @@ class SnapshotService:
         allow_full_attention_context: bool,
         from_snapshot: bool = False,
         snap_prefix_len: int = 0,
+        l2_only: bool = False,
     ) -> SnapshotPublication | None:
         if target_hidden is None:
             return None
@@ -103,7 +121,12 @@ class SnapshotService:
                 snap_prefix_len=int(snap_prefix_len),
             )
         try:
-            insert_result = cache_manager.maybe_insert_snapshot(
+            insert = (
+                cache_manager.maybe_insert_snapshot_l2_only
+                if l2_only
+                else cache_manager.maybe_insert_snapshot
+            )
+            insert_result = insert(
                 snapshot,
                 key=self._builder.key,
                 kind=kind,

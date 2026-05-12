@@ -101,6 +101,12 @@ def _set_key_metadata_field(name: str, value):
 
     return _tamper
 
+def _delete_key_metadata_field(name: str):
+    def _tamper(meta):
+        del meta["key"][name]
+
+    return _tamper
+
 def _replace_metadata(value):
     def _tamper(_meta):
         return value
@@ -325,6 +331,61 @@ class TestL2Lifecycle:
         finally:
             l2.shutdown()
 
+    def test_l2_exact_hit_respects_l1_snapshot_token_cap(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            key = _make_key()
+            l2._write_one(_make_synthetic_snapshot([7, 8, 9, 10], key))
+            cache = PrefixSnapshotStore(
+                l1=DFlashPrefixCache(
+                    max_entries=4,
+                    max_bytes=10**9,
+                    max_snapshot_tokens=3,
+                ),
+                l2=l2,
+            )
+
+            matched, hydrated = cache.lookup([7, 8, 9, 10], key)
+
+            assert matched == 4
+            assert hydrated is not None
+            stats = cache.stats()
+            assert stats["l2_hits"] == 1
+            assert stats["exact_hits"] == 1
+            assert stats["current_entries"] == 0
+            assert stats["skipped_too_long"] == 1
+
+            cache.lookup([7, 8, 9, 10], key)
+            assert cache.stats()["l2_hits"] == 2
+        finally:
+            l2.shutdown()
+
+    def test_l2_prefix_hit_promotes_to_l1(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
+        try:
+            key = _make_key()
+            l2._write_one(_make_synthetic_snapshot([7, 8, 9, 10], key))
+            cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
+
+            matched, hydrated = cache.lookup([7, 8, 9, 10, 11], key)
+
+            assert matched == 4
+            assert hydrated is not None
+            assert hydrated.token_ids == (7, 8, 9, 10)
+            stats = cache.stats()
+            assert stats["l2_hits"] == 1
+            assert stats["current_entries"] == 1
+
+            matched_again, hydrated_again = cache.lookup([7, 8, 9, 10, 11], key)
+
+            assert matched_again == 4
+            assert hydrated_again is not None
+            stats = cache.stats()
+            assert stats["l2_hits"] == 1
+            assert stats["prefix_hits"] == 2
+        finally:
+            l2.shutdown()
+
     def test_l2_longer_prefix_wins_over_shorter_l1_prefix(self, tmp_path):
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
@@ -499,6 +560,7 @@ class TestL2Lifecycle:
             l2._write_one(snap)
             res = l2.lookup((1, 2, 3), key)
             assert res is None
+            assert l2.stats()["lookup_loads"] == 0
         finally:
             l2.shutdown()
 
@@ -594,6 +656,12 @@ class TestFailureModes:
             _set_key_metadata_field("capture_layer_ids", ["10", 20]),
             _set_key_metadata_field("draft_sink_size", "16"),
             _set_key_metadata_field("draft_window_size", 2048.0),
+            _set_key_metadata_field("template_hash", None),
+            _set_key_metadata_field("template_hash", "short"),
+            _set_key_metadata_field("prompt_policy_hash", 42),
+            _set_key_metadata_field("prompt_policy_hash", "z" * 64),
+            _delete_key_metadata_field("template_hash"),
+            _delete_key_metadata_field("prompt_policy_hash"),
             _set_key_metadata_field("target_fa_window", False),
             _set_key_metadata_field("format_version", True),
         ],
@@ -1008,6 +1076,24 @@ class TestStatsHotPath:
                 f"stats() called _walk_snapshots {calls['n']} times — "
                 "tracked counter is not used on the hot path"
             )
+        finally:
+            l2.shutdown()
+
+    def test_eviction_does_not_rescan_after_each_unlink(self, tmp_path):
+        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=1)
+        try:
+            calls = {"n": 0}
+
+            def _fail_snapshot_disk_bytes():
+                calls["n"] += 1
+                raise AssertionError("eviction should use the file sizes it already stat()ed")
+
+            l2._snapshot_disk_bytes = _fail_snapshot_disk_bytes
+
+            l2._write_one(_make_synthetic_snapshot([1, 2, 3], _make_key()))
+
+            assert l2.stats()["evictions"] >= 1
+            assert calls["n"] == 0
         finally:
             l2.shutdown()
 

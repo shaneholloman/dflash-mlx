@@ -110,6 +110,38 @@ class _RecordingDraftBackend(_FakeDraftBackend):
         return mx.zeros((max(0, block_len - 1),), dtype=mx.uint32)
 
 
+class _RecordingL2:
+    def __init__(self) -> None:
+        self.snapshots: list[DFlashPrefixSnapshot] = []
+
+    def lookup(self, req_tokens, key, *, min_token_len: int = 0):
+        req_tuple = tuple(int(token) for token in req_tokens)
+        matches = [
+            snapshot
+            for snapshot in self.snapshots
+            if snapshot.key == key
+            and len(snapshot.token_ids) > int(min_token_len)
+            and len(snapshot.token_ids) <= len(req_tuple)
+            and req_tuple[: len(snapshot.token_ids)] == snapshot.token_ids
+        ]
+        if not matches:
+            return None
+        return max(matches, key=lambda snapshot: len(snapshot.token_ids))
+
+    def insert_async(self, snapshot):
+        self.snapshots.append(snapshot)
+        return True
+
+    def stats(self):
+        return {}
+
+    def clear(self) -> None:
+        self.snapshots.clear()
+
+    def shutdown(self, *, wait: bool = True) -> None:
+        del wait
+
+
 def _runtime_context(
     diagnostics_config: DiagnosticsConfig | None = None,
     verify_mode: str | None = None,
@@ -156,6 +188,8 @@ def _prefix_key() -> DFlashPrefixKey:
         capture_layer_ids=(0,),
         draft_sink_size=64,
         draft_window_size=1024,
+        template_hash="a" * 64,
+        prompt_policy_hash="b" * 64,
         target_fa_window=0,
     )
 
@@ -175,6 +209,58 @@ def _snapshot_service(draft_model, *, cache=None, builder=None):
     return SnapshotService(
         cache_manager=RuntimeCacheManager(PrefixSnapshotStore(l1=cache)),
         builder=builder,
+    )
+
+
+def _frontier_snapshot_setup(
+    *,
+    with_l2: bool,
+    frontier_stride: int = 4,
+    prefill_step_size: int = 4,
+):
+    context = build_runtime_context(
+        runtime_config_from_profile(
+            profile="balanced",
+            prefill_step_size=prefill_step_size,
+            prefix_cache=True,
+            prefix_cache_l2=True,
+        )
+    )
+    draft_model = SimpleNamespace(
+        target_layer_ids=[0],
+        block_size=4,
+        mask_token_id=0,
+        project_target_hidden=lambda value: value,
+    )
+    key = DFlashPrefixKey(
+        target_model_id="target",
+        draft_model_id="draft",
+        capture_layer_ids=(0,),
+        draft_sink_size=64,
+        draft_window_size=1024,
+        template_hash="a" * 64,
+        prompt_policy_hash="b" * 64,
+        target_fa_window=0,
+    )
+    cache = DFlashPrefixCache(max_entries=8, frontier_stride=frontier_stride)
+    l2 = _RecordingL2() if with_l2 else None
+    manager = RuntimeCacheManager(PrefixSnapshotStore(l1=cache, l2=l2))
+    return (
+        context,
+        draft_model,
+        key,
+        cache,
+        l2,
+        manager,
+        SnapshotService(
+            cache_manager=manager,
+            builder=PrefixSnapshotBuilder(
+                key=key,
+                draft_model=draft_model,
+                draft_sink_size=64,
+                draft_window_size=1024,
+            ),
+        ),
     )
 
 
@@ -297,6 +383,54 @@ def test_dflash_max_ctx_fallback_skips_session_request_materialization(monkeypat
     assert calls == []
     assert prefill_event.fallback_ar is True
     assert summary_event.fallback_ar is True
+    assert "projected_ctx=3" in summary_event.fallback_reason
+
+
+def test_dflash_max_ctx_fallback_accounts_for_requested_generation(monkeypatch):
+    target_ops = _FakeTargetOps()
+
+    class FakeTarget:
+        def __call__(self, input_ids, cache):
+            del cache
+            batch, seq_len = input_ids.shape
+            return mx.zeros((batch, seq_len, 8), dtype=mx.float32)
+
+    context = build_runtime_context(
+        runtime_config_from_profile(
+            profile="balanced",
+            prefill_step_size=4,
+            prefix_cache=False,
+            prefix_cache_l2=False,
+            dflash_max_ctx=4,
+        )
+    )
+    calls = []
+    original_from_tokens = spec_epoch._SessionRequest.from_tokens
+
+    def tracked_from_tokens(*args, **kwargs):
+        calls.append((args, kwargs))
+        return original_from_tokens(*args, **kwargs)
+
+    monkeypatch.setattr(spec_epoch._SessionRequest, "from_tokens", tracked_from_tokens)
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=FakeTarget(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=_draft_model(),
+            draft_backend=_FakeDraftBackend(),
+            prompt="unused",
+            max_new_tokens=2,
+            prompt_tokens_override=[1, 2],
+            runtime_context=context,
+        )
+    )
+
+    summary_event = next(event for event in events if isinstance(event, SummaryEvent))
+    assert calls == []
+    assert summary_event.fallback_ar is True
+    assert "projected_ctx=4" in summary_event.fallback_reason
 
 
 def _prefix_snapshot(*, token_ids=(1, 2), fa_states=(), gdn_states=(), last_logits=None):
@@ -397,6 +531,12 @@ def test_clear_cache_boundaries_false_skips_mlx_clear_cache(monkeypatch):
     calls = []
     monkeypatch.setattr(
         spec_epoch.mx,
+        "synchronize",
+        lambda: calls.append("sync"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        spec_epoch.mx,
         "clear_cache",
         lambda: calls.append("clear"),
         raising=False,
@@ -437,6 +577,12 @@ def test_clear_cache_boundaries_true_clears_safe_boundaries(monkeypatch):
     calls = []
     monkeypatch.setattr(
         spec_epoch.mx,
+        "synchronize",
+        lambda: calls.append("sync"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        spec_epoch.mx,
         "clear_cache",
         lambda: calls.append("clear"),
         raising=False,
@@ -468,7 +614,62 @@ def test_clear_cache_boundaries_true_clears_safe_boundaries(monkeypatch):
 
     summary = next(event for event in events if isinstance(event, SummaryEvent))
     assert summary.clear_cache_boundaries is True
-    assert calls == ["clear", "clear", "clear", "clear"]
+    assert calls == [
+        "sync",
+        "clear",
+        "sync",
+        "clear",
+        "sync",
+        "clear",
+        "sync",
+        "clear",
+    ]
+
+
+def test_clear_cache_boundaries_true_clears_during_long_decode(monkeypatch):
+    target_ops = _FakeTargetOps()
+    draft_backend = _FakeDraftBackend()
+    calls = []
+    monkeypatch.setattr(
+        spec_epoch.mx,
+        "synchronize",
+        lambda: calls.append("sync"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        spec_epoch.mx,
+        "clear_cache",
+        lambda: calls.append("clear"),
+        raising=False,
+    )
+
+    context = build_runtime_context(
+        runtime_config_from_profile(
+            profile="balanced",
+            prefill_step_size=4,
+            clear_cache_boundaries=True,
+            prefix_cache=False,
+            prefix_cache_l2=False,
+        )
+    )
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=_draft_model(),
+            draft_backend=draft_backend,
+            prompt="unused",
+            max_new_tokens=1030,
+            prompt_tokens_override=list(range(6)),
+            runtime_context=context,
+        )
+    )
+
+    summary = next(event for event in events if isinstance(event, SummaryEvent))
+    assert summary.generation_tokens == 1030
+    assert calls == ["sync", "clear"] * 5
 
 
 def test_runtime_prefill_accounting_reports_warm_restore():
@@ -503,6 +704,8 @@ def test_runtime_prefill_accounting_reports_warm_restore():
             capture_layer_ids=(0,),
             draft_sink_size=64,
             draft_window_size=1024,
+            template_hash="a" * 64,
+            prompt_policy_hash="b" * 64,
             target_fa_window=0,
         ),
     )
@@ -633,6 +836,8 @@ def test_prefill_snapshot_event_carries_snapshot_not_live_arrays():
         capture_layer_ids=(0,),
         draft_sink_size=64,
         draft_window_size=1024,
+        template_hash="a" * 64,
+        prompt_policy_hash="b" * 64,
         target_fa_window=0,
     )
     cache = DFlashPrefixCache(max_entries=4)
@@ -674,6 +879,156 @@ def test_prefill_snapshot_event_carries_snapshot_not_live_arrays():
     assert snapshot is not None
     assert snapshot.key == key
     assert snapshot.token_ids == (1, 2)
+
+
+def test_prefill_publishes_aligned_frontiers_when_l2_cache_is_enabled():
+    context, draft_model, key, cache, l2, manager, snapshot_service = _frontier_snapshot_setup(
+        with_l2=True
+    )
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=_FakeTargetOps(),
+            tokenizer=object(),
+            draft_model=draft_model,
+            draft_backend=_FakeDraftBackend(),
+            prompt="unused",
+            max_new_tokens=0,
+            prompt_tokens_override=list(range(1, 11)),
+            snapshot_service=snapshot_service,
+            runtime_context=context,
+        )
+    )
+
+    prefill_snapshots = [
+        event
+        for event in events
+        if isinstance(event, SnapshotPublishedEvent) and event.kind == "prefill"
+    ]
+    assert [event.prefix_len for event in prefill_snapshots] == [4, 8, 10]
+
+    matched, snapshot = cache.lookup([1, 2, 3, 4, 99], key)
+    assert matched == 0
+    assert snapshot is None
+
+    result = manager.lookup([1, 2, 3, 4, 99], key)
+    matched = result.matched_tokens
+    snapshot = result.snapshot
+    assert matched == 4
+    assert snapshot is not None
+    assert snapshot.token_ids == (1, 2, 3, 4)
+    assert l2 is not None
+    assert [snapshot.prefix_len for snapshot in l2.snapshots] == [4, 8, 10]
+
+
+def test_prefill_frontiers_use_cache_stride_not_prefill_step_size():
+    context, draft_model, key, cache, l2, manager, snapshot_service = _frontier_snapshot_setup(
+        with_l2=True,
+        frontier_stride=8,
+    )
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=_FakeTargetOps(),
+            tokenizer=object(),
+            draft_model=draft_model,
+            draft_backend=_FakeDraftBackend(),
+            prompt="unused",
+            max_new_tokens=0,
+            prompt_tokens_override=list(range(1, 11)),
+            snapshot_service=snapshot_service,
+            runtime_context=context,
+        )
+    )
+
+    prefill_snapshots = [
+        event
+        for event in events
+        if isinstance(event, SnapshotPublishedEvent) and event.kind == "prefill"
+    ]
+    assert [event.prefix_len for event in prefill_snapshots] == [8, 10]
+
+    result = manager.lookup([1, 2, 3, 4, 99], key)
+    assert result.matched_tokens == 0
+    assert result.snapshot is None
+
+    result = manager.lookup([1, 2, 3, 4, 5, 6, 7, 8, 99], key)
+    assert result.matched_tokens == 8
+    assert result.snapshot is not None
+    assert result.snapshot.token_ids == tuple(range(1, 9))
+    assert l2 is not None
+    assert [snapshot.prefix_len for snapshot in l2.snapshots] == [8, 10]
+
+
+def test_prefill_frontier_stride_can_follow_non_divisor_chunk_size():
+    context, draft_model, key, cache, l2, manager, snapshot_service = _frontier_snapshot_setup(
+        with_l2=True,
+        frontier_stride=10000,
+        prefill_step_size=5000,
+    )
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=_FakeTargetOps(),
+            tokenizer=object(),
+            draft_model=draft_model,
+            draft_backend=_FakeDraftBackend(),
+            prompt="unused",
+            max_new_tokens=0,
+            prompt_tokens_override=list(range(1, 10003)),
+            snapshot_service=snapshot_service,
+            runtime_context=context,
+        )
+    )
+
+    prefill_snapshots = [
+        event
+        for event in events
+        if isinstance(event, SnapshotPublishedEvent) and event.kind == "prefill"
+    ]
+    assert [event.prefix_len for event in prefill_snapshots] == [10000, 10002]
+
+    result = manager.lookup([*range(1, 5001), 99], key)
+    assert result.matched_tokens == 0
+    assert result.snapshot is None
+
+    result = manager.lookup([*range(1, 10001), 99], key)
+    assert result.matched_tokens == 10000
+    assert result.snapshot is not None
+    assert result.snapshot.token_ids == tuple(range(1, 10001))
+    assert l2 is not None
+    assert [snapshot.prefix_len for snapshot in l2.snapshots] == [10000, 10002]
+
+
+def test_prefill_skips_aligned_frontiers_without_l2_store():
+    context, draft_model, _key, _cache, _l2, _manager, snapshot_service = (
+        _frontier_snapshot_setup(with_l2=False)
+    )
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=_FakeTargetOps(),
+            tokenizer=object(),
+            draft_model=draft_model,
+            draft_backend=_FakeDraftBackend(),
+            prompt="unused",
+            max_new_tokens=0,
+            prompt_tokens_override=list(range(1, 11)),
+            snapshot_service=snapshot_service,
+            runtime_context=context,
+        )
+    )
+
+    prefill_snapshots = [
+        event
+        for event in events
+        if isinstance(event, SnapshotPublishedEvent) and event.kind == "prefill"
+    ]
+    assert [event.prefix_len for event in prefill_snapshots] == [10]
 
 
 def test_prefill_snapshot_service_build_failure_propagates():
@@ -872,11 +1227,13 @@ def test_generation_snapshot_skipped_for_truncated_stable_prefix():
             draft_model=draft_model,
             draft_backend=draft_backend,
             prompt="unused",
-            max_new_tokens=3,
+            max_new_tokens=6,
             prompt_tokens_override=[1, 2, 3],
             snapshot_service=snapshot_service,
             stable_prefix_len=2,
-            runtime_context=_runtime_context(),
+            runtime_context=_runtime_context(
+                diagnostics_config=DiagnosticsConfig(memory_waterfall=True),
+            ),
         )
     )
 
@@ -897,6 +1254,7 @@ def test_generation_snapshot_skipped_for_truncated_stable_prefix():
     assert matched == 2
     assert snapshot is not None
     assert snapshot.kind == "prefill"
+    _assert_no_generation_chunks_retained(events)
 
 
 def test_generation_snapshot_skipped_when_request_policy_disallows_it():
@@ -924,11 +1282,13 @@ def test_generation_snapshot_skipped_when_request_policy_disallows_it():
             draft_model=draft_model,
             draft_backend=draft_backend,
             prompt="unused",
-            max_new_tokens=3,
+            max_new_tokens=6,
             prompt_tokens_override=[1, 2],
             snapshot_service=snapshot_service,
             publish_generation_snapshot=False,
-            runtime_context=_runtime_context(),
+            runtime_context=_runtime_context(
+                diagnostics_config=DiagnosticsConfig(memory_waterfall=True),
+            ),
         )
     )
 
@@ -943,6 +1303,65 @@ def test_generation_snapshot_skipped_when_request_policy_disallows_it():
     assert matched == 2
     assert snapshot is not None
     assert snapshot.kind == "prefill"
+    _assert_no_generation_chunks_retained(events)
+
+
+def test_generation_snapshot_hidden_not_retained_when_snapshot_service_retires():
+    target_ops = _FakeTargetOps()
+    draft_backend = _FakeDraftBackend()
+    draft_model = _draft_model()
+    cache = DFlashPrefixCache(max_entries=4)
+    manager = RuntimeCacheManager(PrefixSnapshotStore(l1=cache))
+    manager.shutdown()
+    snapshot_service = SnapshotService(
+        cache_manager=manager,
+        builder=PrefixSnapshotBuilder(
+            key=_prefix_key(),
+            draft_model=draft_model,
+            draft_sink_size=64,
+            draft_window_size=1024,
+        ),
+    )
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=draft_model,
+            draft_backend=draft_backend,
+            prompt="unused",
+            max_new_tokens=6,
+            prompt_tokens_override=[1, 2],
+            snapshot_service=snapshot_service,
+            runtime_context=_runtime_context(
+                diagnostics_config=DiagnosticsConfig(memory_waterfall=True),
+            ),
+        )
+    )
+
+    snapshots = [
+        event
+        for event in events
+        if isinstance(event, SnapshotPublishedEvent)
+    ]
+
+    assert len(snapshots) == 1
+    assert snapshots[0].kind == "prefill"
+    assert snapshots[0].admitted is False
+    assert snapshot_service.active is False
+    _assert_no_generation_chunks_retained(events)
+
+
+def _assert_no_generation_chunks_retained(events):
+    after_rollback = [
+        event.fields
+        for event in events
+        if isinstance(event, MemoryWaterfallEvent)
+        and event.fields.get("memory_phase") == "after_rollback"
+    ]
+    assert after_rollback
+    assert all(int(fields["gen_hidden_chunks_bytes"]) == 0 for fields in after_rollback)
 
 
 def test_request_state_preserves_async_prefetched_draft_reuse():

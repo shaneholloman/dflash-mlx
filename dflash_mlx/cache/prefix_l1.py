@@ -20,6 +20,7 @@ class PrefixCacheL1InsertResult:
     admitted: bool
     removed_snapshots: tuple[DFlashPrefixSnapshot, ...] = ()
     inserted_evicted_snapshot: DFlashPrefixSnapshot | None = None
+    skipped_too_long: bool = False
 
 
 class DFlashPrefixCache:
@@ -31,6 +32,7 @@ class DFlashPrefixCache:
         cross_kind_prune: bool = True,
         trace_config: Optional[TraceConfig] = None,
         max_snapshot_tokens: int = 24000,
+        frontier_stride: int = 0,
     ):
         self._entries: dict[int, DFlashPrefixSnapshot] = {}
         self._lru_order: list[int] = []
@@ -41,6 +43,7 @@ class DFlashPrefixCache:
         self._cross_kind_prune = bool(cross_kind_prune)
         self._trace_config = trace_config
         self._max_snapshot_tokens = max(0, int(max_snapshot_tokens))
+        self._frontier_stride = max(0, int(frontier_stride))
         self._stats: dict[str, int] = {
             "exact_hits": 0,
             "prefix_hits": 0,
@@ -54,6 +57,10 @@ class DFlashPrefixCache:
             "prefill_tokens_saved": 0,
             "fingerprint_rejects": 0,
         }
+
+    @property
+    def frontier_stride(self) -> int:
+        return int(self._frontier_stride)
 
     def lookup(
         self,
@@ -192,7 +199,10 @@ class DFlashPrefixCache:
                     entries_after=pre_entries,
                     elapsed_us=(time.perf_counter_ns() - t_start) / 1_000.0,
                 )
-                return PrefixCacheL1InsertResult(admitted=False)
+                return PrefixCacheL1InsertResult(
+                    admitted=False,
+                    skipped_too_long=True,
+                )
 
             if self._incoming_generation_should_yield_to_prefill(snapshot):
                 self._stats["insertions"] += 1
@@ -298,7 +308,12 @@ class DFlashPrefixCache:
             n = len(existing.token_ids)
             if n <= len(incoming) and incoming[:n] == existing.token_ids:
                 if same_kind:
-                    doomed_same.append(eid)
+                    if n == len(incoming) or not self._preserve_aligned_frontier(
+                        existing_len=n,
+                        incoming_len=len(incoming),
+                        kind=existing.kind,
+                    ):
+                        doomed_same.append(eid)
                 else:
                     doomed_cross.append(eid)
         for eid in doomed_same:
@@ -314,6 +329,22 @@ class DFlashPrefixCache:
             if eid in self._lru_order:
                 self._lru_order.remove(eid)
         return removed
+
+    def _preserve_aligned_frontier(
+        self,
+        *,
+        existing_len: int,
+        incoming_len: int,
+        kind: str,
+    ) -> bool:
+        stride = self._frontier_stride
+        return (
+            kind == "prefill"
+            and stride > 0
+            and existing_len > 0
+            and existing_len < incoming_len
+            and existing_len % stride == 0
+        )
 
     def _evict_until_under_budget(self) -> list[tuple[int, DFlashPrefixSnapshot]]:
         evicted: list[tuple[int, DFlashPrefixSnapshot]] = []

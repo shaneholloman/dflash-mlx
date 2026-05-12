@@ -39,6 +39,11 @@ class PrefixSnapshotStore:
         self._trace_config = trace_config
         self._l1.set_trace_config(trace_config)
 
+    def frontier_stride(self) -> int:
+        if self._l2 is None:
+            return 0
+        return int(self._l1.frontier_stride)
+
     def lookup(
         self,
         req_tokens: list[int] | tuple[int, ...],
@@ -99,9 +104,9 @@ class PrefixSnapshotStore:
         request_id: int | None = None,
     ) -> tuple[int, DFlashPrefixSnapshot]:
         l2_len = len(l2_snapshot.token_ids)
-        promote = self._l1.insert_with_evictions(l2_snapshot, skip_too_long=False)
-        self._write_snapshots_to_l2(promote.removed_snapshots)
         exact = l2_len == len(req_tuple)
+        promote = self._l1.insert_with_evictions(l2_snapshot, skip_too_long=True)
+        self._write_snapshots_to_l2(promote.removed_snapshots)
         with self._lock:
             self._stats["l2_hits"] += 1
             if exact:
@@ -139,16 +144,29 @@ class PrefixSnapshotStore:
         inserted_l2_admitted = False
         result = self._l1.insert_with_evictions(
             snapshot,
-            skip_too_long=self._l2 is None,
+            skip_too_long=True,
         )
         if self._l2 is not None:
             if result.admitted and snapshot.kind == "prefill":
                 self._write_snapshots_to_l2((snapshot,))
+            if result.skipped_too_long and snapshot.kind == "prefill":
+                inserted_l2_admitted = self._write_snapshots_to_l2(
+                    (snapshot,),
+                    inserted_snapshot=snapshot,
+                )
             inserted_l2_admitted = self._write_snapshots_to_l2(
                 result.removed_snapshots,
                 inserted_snapshot=result.inserted_evicted_snapshot,
-            )
+            ) or inserted_l2_admitted
         return bool(result.admitted or inserted_l2_admitted)
+
+    def insert_l2_only(self, snapshot: DFlashPrefixSnapshot) -> bool:
+        if self._l2 is None:
+            return False
+        return self._write_snapshots_to_l2(
+            (snapshot,),
+            inserted_snapshot=snapshot,
+        )
 
     def stats(self) -> dict[str, Any]:
         out = self._l1.stats()

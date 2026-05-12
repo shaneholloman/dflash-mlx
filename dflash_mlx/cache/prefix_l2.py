@@ -28,7 +28,7 @@ from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
 
 _LOG = logging.getLogger(__name__)
 
-L2_SCHEMA_VERSION = 3
+L2_SCHEMA_VERSION = 4
 L2_FILE_SUFFIX = ".safetensors"
 L2_TMP_SUFFIX = ".tmp.safetensors"
 L2_LOCK_NAME = ".dflash_l2.lock"
@@ -47,6 +47,12 @@ def _json_int_field(d: dict[str, Any], name: str) -> int:
         raise ValueError(f"expected integer key field {name!r}")
     return value
 
+def _sha256_field(d: dict[str, Any], name: str) -> str:
+    value = d[name]
+    if not isinstance(value, str) or len(value) != 64 or any(c not in _HEX for c in value):
+        raise ValueError(f"expected sha256 key field {name!r}")
+    return value
+
 def _key_to_dict(key: DFlashPrefixKey) -> dict[str, Any]:
     return {
         "target_model_id": key.target_model_id,
@@ -54,6 +60,8 @@ def _key_to_dict(key: DFlashPrefixKey) -> dict[str, Any]:
         "capture_layer_ids": list(key.capture_layer_ids),
         "draft_sink_size": int(key.draft_sink_size),
         "draft_window_size": int(key.draft_window_size),
+        "template_hash": key.template_hash,
+        "prompt_policy_hash": key.prompt_policy_hash,
         "target_fa_window": int(key.target_fa_window),
         "format_version": int(key.format_version),
     }
@@ -64,6 +72,8 @@ def _key_from_dict(d: dict[str, Any]) -> DFlashPrefixKey:
     target_model_id = d["target_model_id"]
     draft_model_id = d["draft_model_id"]
     capture_layer_ids = d["capture_layer_ids"]
+    template_hash = _sha256_field(d, "template_hash")
+    prompt_policy_hash = _sha256_field(d, "prompt_policy_hash")
     if not isinstance(target_model_id, str):
         raise ValueError("expected string target_model_id")
     if not isinstance(draft_model_id, str):
@@ -79,6 +89,8 @@ def _key_from_dict(d: dict[str, Any]) -> DFlashPrefixKey:
         capture_layer_ids=tuple(capture_layer_ids),
         draft_sink_size=_json_int_field(d, "draft_sink_size"),
         draft_window_size=_json_int_field(d, "draft_window_size"),
+        template_hash=template_hash,
+        prompt_policy_hash=prompt_policy_hash,
         target_fa_window=_json_int_field(d, "target_fa_window"),
         format_version=_json_int_field(d, "format_version"),
     )
@@ -248,12 +260,6 @@ def _serialize(snapshot: DFlashPrefixSnapshot) -> tuple[dict[str, mx.array], dic
     return arrays, metadata_dict
 
 def _deserialize(arrays: dict[str, mx.array], meta: dict[str, Any]) -> DFlashPrefixSnapshot:
-    def _clone(a: mx.array, name: str) -> mx.array:
-
-        cloned = mx.array(a)
-        mx.eval(cloned)
-        return cloned
-
     key = _key_from_dict(meta["key"])
 
     fa_present = meta["fa_present"]
@@ -267,8 +273,8 @@ def _deserialize(arrays: dict[str, mx.array], meta: dict[str, Any]) -> DFlashPre
             k_name = f"fa_{i}_k"
             v_name = f"fa_{i}_v"
             offset = int(fa_offsets.get(str(i), 0))
-            k = _clone(arrays[k_name], k_name)
-            v = _clone(arrays[v_name], v_name)
+            k = arrays[k_name]
+            v = arrays[v_name]
             if str(i) in fa_indices:
                 fa_states.append((k, v, offset, int(fa_indices[str(i)])))
             else:
@@ -288,7 +294,7 @@ def _deserialize(arrays: dict[str, mx.array], meta: dict[str, Any]) -> DFlashPre
             for j in range(arity):
                 if j < len(mask) and mask[j]:
                     name = f"gdn_{i}_{j}"
-                    sub.append(_clone(arrays[name], name))
+                    sub.append(arrays[name])
                 else:
                     sub.append(None)
             gdn_states.append(tuple(sub))
@@ -298,11 +304,13 @@ def _deserialize(arrays: dict[str, mx.array], meta: dict[str, Any]) -> DFlashPre
     chunk_count = len(chunk_spans_raw)
     for c in range(chunk_count):
         name = f"target_hidden_{c}"
-        target_hidden_chunks.append(_clone(arrays[name], name))
+        target_hidden_chunks.append(arrays[name])
 
     last_logits = None
     if meta.get("has_last_logits"):
-        last_logits = _clone(arrays["last_logits"], "last_logits")
+        last_logits = arrays["last_logits"]
+
+    _eval_arrays(arrays)
 
     return DFlashPrefixSnapshot(
         token_ids=tuple(int(t) for t in meta["token_ids"]),
@@ -457,6 +465,8 @@ class DFlashPrefixL2Cache:
                 with self._lock:
                     self._stats["lookup_hash_filtered"] += 1
                 continue
+            if parts.token_len == len(req_tokens) and parts.kind != "prefill":
+                continue
             with self._lock:
                 self._stats["lookup_loads"] += 1
             snap = self._load_and_validate(
@@ -465,9 +475,8 @@ class DFlashPrefixL2Cache:
             if snap is None:
                 continue
 
-            if parts.token_len == len(req_tokens):
-                if snap.kind != "prefill" or snap.last_logits is None:
-                    continue
+            if parts.token_len == len(req_tokens) and snap.last_logits is None:
+                continue
             elapsed_us = (time.perf_counter_ns() - t0) // 1000
             with self._lock:
                 self._stats["hits"] += 1
@@ -848,12 +857,16 @@ class DFlashPrefixL2Cache:
                 return
 
         files: list[tuple[int, int, Path]] = []
+        observed_bytes = 0
         for p in self._walk_snapshots():
             try:
                 st = p.stat()
             except OSError:
                 continue
+            observed_bytes += int(st.st_size)
             files.append((st.st_mtime_ns, st.st_size, p))
+        with self._lock:
+            self._tracked_disk_bytes = int(observed_bytes)
         files.sort()
         for _, sz, p in files:
             with self._lock:
@@ -865,7 +878,7 @@ class DFlashPrefixL2Cache:
                 continue
             with self._lock:
                 self._stats["evictions"] += 1
-                self._tracked_disk_bytes = self._snapshot_disk_bytes()
+                self._tracked_disk_bytes = max(0, self._tracked_disk_bytes - int(sz))
 
     def clear(self) -> None:
         if not self.writable:

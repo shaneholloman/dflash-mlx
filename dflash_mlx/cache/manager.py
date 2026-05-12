@@ -19,6 +19,7 @@ from dflash_mlx.cache.store import PrefixSnapshotStore
 _DFLASH_RUNTIME_CACHE_MANAGER: Optional["RuntimeCacheManager"] = None
 _DFLASH_RUNTIME_CACHE_CONFIG_KEY: Optional[tuple[Any, ...]] = None
 _DFLASH_RUNTIME_CACHE_LOCK = threading.Lock()
+_MIN_L2_FRONTIER_STRIDE = 8192
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,11 @@ class RuntimeCacheManager:
             self._store.shutdown()
             self._shutdown_complete = True
 
+    @property
+    def active(self) -> bool:
+        with self._state_lock:
+            return not self._retired
+
     def stats(self) -> dict[str, Any]:
         with self._state_lock:
             self._ensure_open_locked()
@@ -67,6 +73,11 @@ class RuntimeCacheManager:
         with self._state_lock:
             self._ensure_open_locked()
             return self._store.memory_waterfall_bytes()
+
+    def frontier_stride(self) -> int:
+        with self._state_lock:
+            self._ensure_open_locked()
+            return self._store.frontier_stride()
 
     def lookup(
         self,
@@ -97,14 +108,12 @@ class RuntimeCacheManager:
         kind: str,
         require_logits: bool,
     ) -> PrefixCacheInsertResult:
-        if not isinstance(snapshot, DFlashPrefixSnapshot):
-            raise TypeError(f"expected DFlashPrefixSnapshot, got {type(snapshot).__name__}")
-        if snapshot.key != key:
-            raise ValueError("prefix snapshot key does not match request key")
-        if snapshot.kind != kind:
-            raise ValueError(f"expected {kind!r} prefix snapshot, got {snapshot.kind!r}")
-        if require_logits and snapshot.last_logits is None:
-            raise ValueError("prefix snapshot requires last_logits")
+        snapshot = self._validate_snapshot_contract(
+            snapshot,
+            key=key,
+            kind=kind,
+            require_logits=require_logits,
+        )
         insert_t0 = time.perf_counter_ns()
         try:
             with self._state_lock:
@@ -127,6 +136,53 @@ class RuntimeCacheManager:
             admitted=bool(admitted),
             elapsed_ms=float(elapsed_ms),
         )
+
+    def maybe_insert_snapshot_l2_only(
+        self,
+        snapshot: Any,
+        *,
+        key: DFlashPrefixKey,
+        kind: str,
+        require_logits: bool,
+    ) -> PrefixCacheInsertResult:
+        snapshot = self._validate_snapshot_contract(
+            snapshot,
+            key=key,
+            kind=kind,
+            require_logits=require_logits,
+        )
+        insert_t0 = time.perf_counter_ns()
+        try:
+            with self._state_lock:
+                self._ensure_open_locked()
+                admitted = self._store.insert_l2_only(snapshot)
+        except RuntimeCacheManagerClosed:
+            raise
+        except Exception as exc:
+            _log_insert_failure(kind, exc)
+            raise
+        return PrefixCacheInsertResult(
+            admitted=bool(admitted),
+            elapsed_ms=(time.perf_counter_ns() - insert_t0) / 1e6,
+        )
+
+    def _validate_snapshot_contract(
+        self,
+        snapshot: Any,
+        *,
+        key: DFlashPrefixKey,
+        kind: str,
+        require_logits: bool,
+    ) -> DFlashPrefixSnapshot:
+        if not isinstance(snapshot, DFlashPrefixSnapshot):
+            raise TypeError(f"expected DFlashPrefixSnapshot, got {type(snapshot).__name__}")
+        if snapshot.key != key:
+            raise ValueError("prefix snapshot key does not match request key")
+        if snapshot.kind != kind:
+            raise ValueError(f"expected {kind!r} prefix snapshot, got {snapshot.kind!r}")
+        if require_logits and snapshot.last_logits is None:
+            raise ValueError("prefix snapshot requires last_logits")
+        return snapshot
 
     def log_stats(self, label: str = "") -> None:
         with self._state_lock:
@@ -231,6 +287,7 @@ def _prefix_cache_config_key(
         int(runtime_config.prefix_cache_max_entries),
         int(runtime_config.prefix_cache_max_bytes),
         int(runtime_config.max_snapshot_tokens),
+        int(_prefix_cache_frontier_stride(runtime_config)),
         bool(runtime_config.prefix_cache_l2),
         str(runtime_config.prefix_cache_l2_dir),
         int(runtime_config.prefix_cache_l2_max_bytes),
@@ -240,6 +297,16 @@ def _prefix_cache_config_key(
 def _runtime_cache_disabled(runtime_context: Any) -> bool:
     runtime_config = runtime_context.runtime
     return bool(runtime_config.target_fa_window > 0 or not runtime_config.prefix_cache)
+
+
+def _prefix_cache_frontier_stride(runtime_config: Any) -> int:
+    if not getattr(runtime_config, "prefix_cache_l2", False):
+        return 0
+    prefill_step_size = max(0, int(getattr(runtime_config, "prefill_step_size", 0) or 0))
+    if prefill_step_size <= 0:
+        return 0
+    steps = max(1, (_MIN_L2_FRONTIER_STRIDE + prefill_step_size - 1) // prefill_step_size)
+    return int(steps * prefill_step_size)
 
 
 def _shutdown_manager(
@@ -290,6 +357,11 @@ def _make_prefix_store(runtime_context: Any) -> PrefixSnapshotStore:
         max_bytes=max_bytes,
         trace_config=trace_config,
         max_snapshot_tokens=runtime_config.max_snapshot_tokens,
+        frontier_stride=(
+            _prefix_cache_frontier_stride(runtime_config)
+            if l2 is not None
+            else 0
+        ),
     )
     sys.stderr.write(
         f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] prefix cache enabled "

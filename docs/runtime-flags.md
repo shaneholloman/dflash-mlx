@@ -131,8 +131,10 @@ Notes:
 
 - `target_fa_window > 0` disables prefix cache reuse because snapshot cache shape
   differs from full-KV verification.
-- `max_snapshot_tokens` skips oversized inserts when L2 is absent. With L2
-  enabled, oversized snapshots may still be accepted and later spilled by budget.
+- `max_snapshot_tokens` bounds L1 snapshot inserts. With L2 enabled, oversized
+  prefill snapshots may still be persisted to disk for later restores.
+- L2 prefill frontiers are stored at a coarser internal stride, currently at
+  least `8192` tokens, to avoid writing every prefill chunk as a large snapshot.
 - For chat-template requests with a stable assistant/model boundary, DFlash
   stores the reusable prefill boundary and skips raw end-of-generation snapshots
   because the next request retokenizes assistant text through the chat template.

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import threading
+from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
@@ -63,24 +64,62 @@ def _make_key(**overrides) -> DFlashPrefixKey:
         capture_layer_ids=(10, 20),
         draft_sink_size=64,
         draft_window_size=1024,
+        template_hash="a" * 64,
+        prompt_policy_hash="b" * 64,
     )
     base.update(overrides)
     return DFlashPrefixKey(**base)
 
 
+class _FakeTokenizer:
+    unk_token_id = -1
+    chat_template = (
+        "{% for message in messages %}"
+        "{{ message.role }}:{{ message.content }}"
+        "{% endfor %}"
+    )
+    has_tool_calling = True
+    tool_call_start = "<tool_call>"
+    tool_call_end = "</tool_call>"
+    has_thinking = True
+    think_start = "<think>"
+    think_end = "</think>"
+
+    def __init__(
+        self,
+        *,
+        chat_template=None,
+        has_tool_calling=True,
+        tool_call_start="<tool_call>",
+        tool_call_end="</tool_call>",
+    ):
+        if chat_template is not None:
+            self.chat_template = chat_template
+        self.has_tool_calling = has_tool_calling
+        self.tool_call_start = tool_call_start
+        self.tool_call_end = tool_call_end
+
+    def convert_tokens_to_ids(self, tokens):
+        ids = {
+            "<|im_start|>": 151644,
+            "assistant": 77091,
+        }
+        return [ids.get(token, self.unk_token_id) for token in tokens]
+
+
 class _FakeLoadedProvider:
-    model_key = ("target/x", None, "draft/y")
+    def __init__(self, *, tokenizer=None, chat_template_args=None):
+        self.model_key = ("target/x", None, "draft/y")
+        self.tokenizer = tokenizer if tokenizer is not None else _FakeTokenizer()
+        self.cli_args = SimpleNamespace(
+            chat_template_args=(
+                chat_template_args if chat_template_args is not None else {"enable_thinking": False}
+            )
+        )
 
 
 class _FakeDraft:
     target_layer_ids = [3, 7]
-
-
-class _FakeTokenizer:
-    unk_token_id = -1
-
-    def convert_tokens_to_ids(self, tokens):
-        return [-1 for _ in tokens]
 
 
 def _snapshot_service(
@@ -178,6 +217,9 @@ class TestServeHelperShapes:
         assert key.capture_layer_ids == (3, 7)
         assert isinstance(key.draft_sink_size, int)
         assert isinstance(key.draft_window_size, int)
+        assert key.format_version == 3
+        assert len(key.template_hash) == 64
+        assert len(key.prompt_policy_hash) == 64
 
     def test_build_prefix_key_uses_runtime_draft_window(self):
         from dflash_mlx.server.prefix_cache_manager import build_prefix_key
@@ -199,6 +241,65 @@ class TestServeHelperShapes:
         assert key_windowed.draft_window_size == 512
         assert key_default != key_windowed
 
+    def test_build_prefix_key_records_template_identity(self):
+        from dflash_mlx.server.prefix_cache_manager import build_prefix_key
+
+        first = build_prefix_key(
+            _FakeLoadedProvider(tokenizer=_FakeTokenizer(chat_template="template-a")),
+            _FakeDraft(),
+            _runtime_context(),
+        )
+        second = build_prefix_key(
+            _FakeLoadedProvider(tokenizer=_FakeTokenizer(chat_template="template-b")),
+            _FakeDraft(),
+            _runtime_context(),
+        )
+
+        assert first.template_hash != second.template_hash
+        assert first.prompt_policy_hash == second.prompt_policy_hash
+        assert first != second
+
+    def test_build_prefix_key_records_prompt_policy_identity(self):
+        from dflash_mlx.server.prefix_cache_manager import build_prefix_key
+
+        disabled = build_prefix_key(
+            _FakeLoadedProvider(chat_template_args={"enable_thinking": False}),
+            _FakeDraft(),
+            _runtime_context(),
+        )
+        enabled = build_prefix_key(
+            _FakeLoadedProvider(chat_template_args={"enable_thinking": True}),
+            _FakeDraft(),
+            _runtime_context(),
+        )
+
+        assert disabled.template_hash == enabled.template_hash
+        assert disabled.prompt_policy_hash != enabled.prompt_policy_hash
+        assert disabled != enabled
+
+    def test_build_prefix_key_records_tool_marker_identity(self):
+        from dflash_mlx.server.prefix_cache_manager import build_prefix_key
+
+        plain = build_prefix_key(
+            _FakeLoadedProvider(
+                tokenizer=_FakeTokenizer(
+                    tool_call_start="<function_call>",
+                    tool_call_end="</function_call>",
+                )
+            ),
+            _FakeDraft(),
+            _runtime_context(),
+        )
+        tool_aware = build_prefix_key(
+            _FakeLoadedProvider(tokenizer=_FakeTokenizer(has_tool_calling=True)),
+            _FakeDraft(),
+            _runtime_context(),
+        )
+
+        assert plain.template_hash == tool_aware.template_hash
+        assert plain.prompt_policy_hash != tool_aware.prompt_policy_hash
+        assert plain != tool_aware
+
     def test_build_prefix_key_requires_loaded_provider_and_draft(self):
         from dflash_mlx.server.prefix_cache_manager import build_prefix_key
 
@@ -213,6 +314,11 @@ class TestServeHelperShapes:
 
         with pytest.raises(ValueError, match="must not be empty"):
             build_prefix_key(_FakeLoadedProvider(), FakeDraft(), _runtime_context())
+
+        provider = _FakeLoadedProvider()
+        provider.tokenizer = None
+        with pytest.raises(ValueError, match="tokenizer"):
+            build_prefix_key(provider, _FakeDraft(), _runtime_context())
 
     def test_build_prefix_key_requires_runtime_identity_fields(self):
         from dflash_mlx.server.prefix_cache_manager import build_prefix_key
@@ -965,6 +1071,73 @@ class TestContextConfigExposedCorrectly:
         stats = manager.stats()
         assert stats["max_entries"] == 7
         assert stats["max_bytes"] == 1234567
+
+    def test_l2_frontier_stride_has_disk_pressure_floor(self, monkeypatch, tmp_path):
+        import dflash_mlx.cache.manager as cache_manager_mod
+
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", None)
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", None)
+        manager = cache_manager_mod.get_runtime_cache_manager(
+            _runtime_context(
+                prefix_cache=True,
+                prefix_cache_l2=True,
+                prefix_cache_l2_dir=str(tmp_path),
+                prefill_step_size=4096,
+            )
+        )
+
+        assert manager is not None
+        assert manager.frontier_stride() == 8192
+
+    def test_l2_frontier_stride_never_splits_prefill_chunks(self, monkeypatch, tmp_path):
+        import dflash_mlx.cache.manager as cache_manager_mod
+
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", None)
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", None)
+        manager = cache_manager_mod.get_runtime_cache_manager(
+            _runtime_context(
+                prefix_cache=True,
+                prefix_cache_l2=True,
+                prefix_cache_l2_dir=str(tmp_path),
+                prefill_step_size=16384,
+            )
+        )
+
+        assert manager is not None
+        assert manager.frontier_stride() == 16384
+
+    def test_l2_frontier_stride_rounds_floor_to_chunk_multiple(self, monkeypatch, tmp_path):
+        import dflash_mlx.cache.manager as cache_manager_mod
+
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", None)
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", None)
+        manager = cache_manager_mod.get_runtime_cache_manager(
+            _runtime_context(
+                prefix_cache=True,
+                prefix_cache_l2=True,
+                prefix_cache_l2_dir=str(tmp_path),
+                prefill_step_size=5000,
+            )
+        )
+
+        assert manager is not None
+        assert manager.frontier_stride() == 10000
+
+    def test_frontier_stride_disabled_without_l2(self, monkeypatch):
+        import dflash_mlx.cache.manager as cache_manager_mod
+
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_MANAGER", None)
+        monkeypatch.setattr(cache_manager_mod, "_DFLASH_RUNTIME_CACHE_CONFIG_KEY", None)
+        manager = cache_manager_mod.get_runtime_cache_manager(
+            _runtime_context(
+                prefix_cache=True,
+                prefix_cache_l2=False,
+                prefill_step_size=4096,
+            )
+        )
+
+        assert manager is not None
+        assert manager.frontier_stride() == 0
 
     def test_l2_filesystem_failure_falls_back_to_l1(self, monkeypatch, capsys):
         import dflash_mlx.cache.manager as cache_manager_mod
