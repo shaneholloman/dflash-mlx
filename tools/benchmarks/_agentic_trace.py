@@ -478,6 +478,8 @@ def post_event_to_server_metric(
         "adaptive_block_reductions": pe.get("adaptive_block_reductions"),
         "adaptive_block_cycles": pe.get("adaptive_block_cycles"),
         "adaptive_block_min": pe.get("adaptive_block_min"),
+        "copyspec_hits": pe.get("copyspec_hits"),
+        "copyspec_tokens": pe.get("copyspec_tokens"),
 
         "ttft_ms_server": pe.get("ttft_ms"),
         "prefill_ms_server": pe.get("prefill_ms"),
@@ -2289,6 +2291,8 @@ def _post_view(p: dict[str, Any]) -> dict[str, Any]:
         "tps": tps,
         "accept": sm.get("accept"),
         "tokens_per_cycle": sm.get("tokens_per_cycle"),
+        "copyspec_hits": sm.get("copyspec_hits"),
+        "copyspec_tokens": sm.get("copyspec_tokens"),
         "cache_hit_tokens": cache_hit_tokens,
         "prefill_tokens_saved_cumulative": sm.get("prefill_tokens_saved_cumulative"),
         "tool_call_count": lm.get("tool_call_count"),
@@ -2385,6 +2389,8 @@ def _normalized_post_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
                 "wall_s": _float_value(view.get("wall_s")),
                 "acceptance": _float_value(view.get("accept")),
                 "tokens_per_cycle": _float_value(view.get("tokens_per_cycle")),
+                "copyspec_hits": _int_value(view.get("copyspec_hits")) or 0,
+                "copyspec_tokens": _int_value(view.get("copyspec_tokens")) or 0,
                 "cycles": _int_value(sm.get("cycles_completed")),
                 "adaptive_block_reductions": _int_value(
                     sm.get("adaptive_block_reductions")
@@ -2429,6 +2435,8 @@ _ROWS_MD_COLUMNS = (
     ("wall_s", "wall s"),
     ("acceptance", "accept"),
     ("tokens_per_cycle", "tpc"),
+    ("copyspec_hits", "copy hits"),
+    ("copyspec_tokens", "copy tok"),
     ("cycles", "cycles"),
     ("phys_footprint_peak_gb", "foot GB"),
     ("mlx_cache_peak_gb", "cache GB"),
@@ -2801,6 +2809,8 @@ def _aggregate(posts: list[dict[str, Any]], wall_s: float | None) -> dict[str, A
     total_cycles = 0
     total_commits = 0
     total_tool_calls = 0
+    total_copyspec_hits = 0
+    total_copyspec_tokens = 0
     prefill_saved_values: list[int] = []
     accept_weighted_num = 0.0
     accept_weighted_den = 0.0
@@ -2817,6 +2827,10 @@ def _aggregate(posts: list[dict[str, Any]], wall_s: float | None) -> dict[str, A
             total_cache_hit += v["cache_hit_tokens"]
         if v["tool_call_count"]:
             total_tool_calls += v["tool_call_count"]
+        if isinstance(v.get("copyspec_hits"), int):
+            total_copyspec_hits += v["copyspec_hits"]
+        if isinstance(v.get("copyspec_tokens"), int):
+            total_copyspec_tokens += v["copyspec_tokens"]
         if isinstance(v.get("prefill_tokens_saved_cumulative"), int):
             prefill_saved_values.append(v["prefill_tokens_saved_cumulative"])
         sm = p.get("server_metric") or {}
@@ -2847,6 +2861,8 @@ def _aggregate(posts: list[dict[str, Any]], wall_s: float | None) -> dict[str, A
         "total_cycle_commits": total_commits,
         "avg_tokens_per_cycle": (total_commits / total_cycles) if total_cycles else None,
         "total_tool_calls": total_tool_calls,
+        "total_copyspec_hits": total_copyspec_hits,
+        "total_copyspec_tokens": total_copyspec_tokens,
         "weighted_acceptance": (accept_weighted_num / accept_weighted_den) if accept_weighted_den else None,
         "first_tool_call_ms_per_post": first_tool_call_ms_list,
         "first_tool_call_ms_sum": sum(first_tool_call_ms_list) if first_tool_call_ms_list else None,

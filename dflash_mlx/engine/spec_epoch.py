@@ -21,6 +21,7 @@ from dflash_mlx.cache.snapshot import (
 )
 from dflash_mlx.draft_backend import DraftBackend
 from dflash_mlx.engine.acceptance import match_acceptance_length as _match_acceptance_length
+from dflash_mlx.engine.copyspec import CopySpecIndex
 from dflash_mlx.engine.fallback import stream_baseline_generate
 from dflash_mlx.engine.prefill import compute_snapshot_boundary
 from dflash_mlx.engine.sampling import (
@@ -159,6 +160,8 @@ class _DecodeResult:
     commit_ns_total: int
     cycle_profiles: tuple[CycleCompleteEvent, ...]
     profile_totals_ns: dict[str, int]
+    copyspec_hits: int
+    copyspec_tokens: int
 
 
 @dataclass
@@ -285,6 +288,7 @@ class SpeculativeSession:
     memory_waterfall: bool
     clear_cache_boundaries: bool
     target_fa_window: int
+    copyspec_index: CopySpecIndex
 
     @classmethod
     def open(
@@ -369,6 +373,7 @@ class SpeculativeSession:
             memory_waterfall=memory_waterfall,
             clear_cache_boundaries=bool(runtime_config.clear_cache_boundaries),
             target_fa_window=target_fa_window,
+            copyspec_index=CopySpecIndex(prompt_tokens),
         )
 
     def clear_cache_boundary(self) -> None:
@@ -867,6 +872,32 @@ class SpeculativeSession:
         )
         verify_len_cap = cycle_config.verify_len_cap
         state.start = prompt_len
+        forbidden_copy_tokens = (
+            set(int(token) for token in request.suppress_token_ids)
+            if request.suppress_token_ids is not None
+            else None
+        )
+
+        def _copy_draft_for_block(
+            staged_first: mx.array,
+            block_len: int,
+            draft_context: mx.array,
+        ) -> mx.array | None:
+            if state.copyspec_disabled:
+                return None
+            candidate = self.copyspec_index.draft_after(
+                int(staged_first.item()),
+                max_tokens=max(0, int(block_len) - 1),
+                forbidden_tokens=forbidden_copy_tokens,
+            )
+            if candidate is None:
+                return None
+            draft_backend.advance_context(
+                draft_model=draft_model,
+                draft_cache=draft_cache,
+                draft_context=draft_context,
+            )
+            return mx.array(candidate, dtype=mx.uint32)
 
         draft_ns_total = 0
         draft_prefill_ns = 0
@@ -917,34 +948,21 @@ class SpeculativeSession:
             block_token_ids = block_token_buffer[:block_len]
             current_staged_first = state.staged_first
             drafted = None
+            draft_source = "none"
+            copyspec_tokens = 0
 
             if block_len > 1:
                 if profile_cycles:
                     draft_start_ns = time.perf_counter_ns()
-                    drafted = draft_backend.draft_greedy(
-                        target_model=target_model,
-                        target_ops=target_ops,
-                        draft_model=draft_model,
-                        draft_cache=draft_cache,
-                        staged_first=current_staged_first,
-                        draft_context=feature_store.require_current_hidden(),
-                        block_len=block_len,
-                        mask_token_tail=mask_token_tail,
-                        suppress_token_mask=suppress_token_mask,
-                        async_launch=False,
+                    drafted = _copy_draft_for_block(
+                        current_staged_first,
+                        block_len,
+                        feature_store.require_current_hidden(),
                     )
-                    mx.eval(drafted)
-                    draft_cycle_ns = time.perf_counter_ns() - draft_start_ns
-                    block_token_ids[1:block_len] = drafted
-                else:
-                    if (
-                        state.prefetched_draft is not None
-                        and int(state.prefetched_draft["block_len"]) == block_len
-                    ):
-                        drafted = state.prefetched_draft["drafted"]
-                        current_staged_first = state.prefetched_draft["staged_first"]
+                    if drafted is not None:
+                        draft_source = "copyspec"
+                        copyspec_tokens = int(drafted.shape[0])
                     else:
-                        draft_start_ns = time.perf_counter_ns()
                         drafted = draft_backend.draft_greedy(
                             target_model=target_model,
                             target_ops=target_ops,
@@ -955,8 +973,44 @@ class SpeculativeSession:
                             block_len=block_len,
                             mask_token_tail=mask_token_tail,
                             suppress_token_mask=suppress_token_mask,
-                            async_launch=True,
+                            async_launch=False,
                         )
+                        draft_source = "dflash"
+                    mx.eval(drafted)
+                    draft_cycle_ns = time.perf_counter_ns() - draft_start_ns
+                    block_token_ids[1:block_len] = drafted
+                else:
+                    if (
+                        state.prefetched_draft is not None
+                        and int(state.prefetched_draft["block_len"]) == block_len
+                    ):
+                        drafted = state.prefetched_draft["drafted"]
+                        current_staged_first = state.prefetched_draft["staged_first"]
+                        draft_source = str(state.prefetched_draft["source"])
+                    else:
+                        draft_start_ns = time.perf_counter_ns()
+                        drafted = _copy_draft_for_block(
+                            current_staged_first,
+                            block_len,
+                            feature_store.require_current_hidden(),
+                        )
+                        if drafted is not None:
+                            draft_source = "copyspec"
+                            copyspec_tokens = int(drafted.shape[0])
+                        else:
+                            drafted = draft_backend.draft_greedy(
+                                target_model=target_model,
+                                target_ops=target_ops,
+                                draft_model=draft_model,
+                                draft_cache=draft_cache,
+                                staged_first=current_staged_first,
+                                draft_context=feature_store.require_current_hidden(),
+                                block_len=block_len,
+                                mask_token_tail=mask_token_tail,
+                                suppress_token_mask=suppress_token_mask,
+                                async_launch=True,
+                            )
+                            draft_source = "dflash"
                         draft_cycle_ns = time.perf_counter_ns() - draft_start_ns
                     state.prefetched_draft = None
                 draft_ns_total += draft_cycle_ns
@@ -1079,12 +1133,19 @@ class SpeculativeSession:
             commit_ns_total += commit_wall_ns
 
             state.accepted_from_draft += acceptance_len
+            if draft_source == "copyspec":
+                state.copyspec_hits += 1
+                state.copyspec_tokens += copyspec_tokens or max(0, int(block_len) - 1)
+                if acceptance_len == 0:
+                    state.copyspec_disabled = True
             staged_first_next = posterior[acceptance_len : acceptance_len + 1]
             if adaptive_block_policy is not None:
                 adaptive_block_policy.record(
                     block_len=block_len,
                     acceptance_len=acceptance_len,
                 )
+            committed_ids = [int(token_id) for token_id in committed_segment.tolist()]
+            self.copyspec_index.append_committed(committed_ids)
             if not profile_cycles:
                 next_remaining = max_new_tokens - len(state.generated_token_ids) - commit_count
                 next_block_limit = (
@@ -1098,18 +1159,26 @@ class SpeculativeSession:
                 )
                 if next_remaining > 0 and next_block_len > 1:
                     draft_start_ns = time.perf_counter_ns()
-                    next_drafted = draft_backend.draft_greedy(
-                        target_model=target_model,
-                        target_ops=target_ops,
-                        draft_model=draft_model,
-                        draft_cache=draft_cache,
-                        staged_first=staged_first_next,
-                        draft_context=feature_store.require_current_hidden(),
-                        block_len=next_block_len,
-                        mask_token_tail=mask_token_tail,
-                        suppress_token_mask=suppress_token_mask,
-                        async_launch=True,
+                    next_source = "copyspec"
+                    next_drafted = _copy_draft_for_block(
+                        staged_first_next,
+                        next_block_len,
+                        feature_store.require_current_hidden(),
                     )
+                    if next_drafted is None:
+                        next_source = "dflash"
+                        next_drafted = draft_backend.draft_greedy(
+                            target_model=target_model,
+                            target_ops=target_ops,
+                            draft_model=draft_model,
+                            draft_cache=draft_cache,
+                            staged_first=staged_first_next,
+                            draft_context=feature_store.require_current_hidden(),
+                            block_len=next_block_len,
+                            mask_token_tail=mask_token_tail,
+                            suppress_token_mask=suppress_token_mask,
+                            async_launch=True,
+                        )
                     launch_ns = time.perf_counter_ns() - draft_start_ns
                     draft_ns_total += launch_ns
                     draft_incremental_ns += launch_ns
@@ -1117,10 +1186,10 @@ class SpeculativeSession:
                         "block_len": next_block_len,
                         "staged_first": staged_first_next,
                         "drafted": next_drafted,
+                        "source": next_source,
                     }
                 else:
                     state.prefetched_draft = None
-            committed_ids = [int(token_id) for token_id in committed_segment.tolist()]
             for token_id in committed_ids:
                 if len(state.generated_token_ids) >= max_new_tokens:
                     break
@@ -1218,6 +1287,8 @@ class SpeculativeSession:
             commit_ns_total=commit_ns_total,
             cycle_profiles=tuple(cycle_profiles),
             profile_totals_ns=profile_totals_ns,
+            copyspec_hits=int(state.copyspec_hits),
+            copyspec_tokens=int(state.copyspec_tokens),
         )
 
     def run_events(self, request: _SessionRequest) -> Iterator[EngineEvent]:
@@ -1318,6 +1389,8 @@ class SpeculativeSession:
                     if profile_cycles
                     else None
                 ),
+                copyspec_hits=int(decode.copyspec_hits),
+                copyspec_tokens=int(decode.copyspec_tokens),
             )
             yield summary
         finally:
@@ -1339,6 +1412,9 @@ class _RequestState:
     start: int = 0
     staged_first: mx.array | None = None
     prefetched_draft: dict[str, Any] | None = None
+    copyspec_hits: int = 0
+    copyspec_tokens: int = 0
+    copyspec_disabled: bool = False
 
 
 @dataclass

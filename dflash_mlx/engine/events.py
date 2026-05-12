@@ -151,6 +151,8 @@ class SummaryEvent:
     cycle_profile_totals_us: dict[str, float] | None = None
     fallback_ar: bool = False
     fallback_reason: str | None = None
+    copyspec_hits: int = 0
+    copyspec_tokens: int = 0
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -189,6 +191,8 @@ class SummaryEvent:
                 if self.cycle_profile_totals_us is not None
                 else None
             ),
+            "copyspec_hits": self.copyspec_hits or None,
+            "copyspec_tokens": self.copyspec_tokens or None,
         }
         payload.update({key: value for key, value in optional.items() if value is not None})
         if self.fallback_ar:

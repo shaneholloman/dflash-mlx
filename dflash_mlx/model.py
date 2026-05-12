@@ -366,6 +366,40 @@ class DFlashAttention(nn.Module):
             return target_hidden[:, start:end, :], spans
         return mx.concatenate([target_hidden[:, start:end, :] for start, end in spans], axis=1), spans
 
+    def append_projected_context_cache(
+        self,
+        *,
+        target_hidden: mx.array,
+        cache: Any,
+    ) -> None:
+        if not isinstance(cache, ContextOnlyDraftKVCache):
+            raise TypeError("draft context advance requires a DFlash draft KV cache")
+        ctx_len = int(target_hidden.shape[1])
+        if ctx_len <= 0:
+            return
+        context_hidden, context_spans = self._context_segments_for_cache(target_hidden, cache)
+        selected_ctx_len = int(context_hidden.shape[1])
+        context_keys = self.k_proj(context_hidden)
+        context_keys = self.k_norm(
+            context_keys.reshape(target_hidden.shape[0], selected_ctx_len, self.n_kv_heads, -1)
+        ).transpose(0, 2, 1, 3)
+        context_values = self.v_proj(context_hidden).reshape(
+            target_hidden.shape[0], selected_ctx_len, self.n_kv_heads, -1,
+        ).transpose(0, 2, 1, 3)
+        context_keys, context_values, context_positions = self._rope_context_segments(
+            context_keys,
+            context_values,
+            cache_offset=int(cache.offset),
+            spans=context_spans,
+        )
+        cache.append_context(
+            context_keys,
+            context_values,
+            ctx_len,
+            positions=context_positions,
+            advance_positions=ctx_len,
+        )
+
     def _rope_context_segments(
         self,
         context_keys: mx.array,
@@ -630,6 +664,17 @@ class DFlashDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         return residual + hidden_states
 
+    def advance_projected_context_cache(
+        self,
+        *,
+        target_hidden: mx.array,
+        cache: Any,
+    ) -> None:
+        self.self_attn.append_projected_context_cache(
+            target_hidden=target_hidden,
+            cache=cache,
+        )
+
 class DFlashDraftModel(nn.Module):
     def __init__(self, args: DFlashDraftModelArgs):
         super().__init__()
@@ -677,6 +722,20 @@ class DFlashDraftModel(nn.Module):
                 cache=layer_cache,
             )
         return self.norm(hidden_states)
+
+    def advance_projected_context_cache(
+        self,
+        *,
+        draft_context: mx.array,
+        cache: list[Any],
+    ) -> None:
+        if cache is None:
+            raise ValueError("draft context cache is required")
+        for layer, layer_cache in zip(self.layers, cache, strict=True):
+            layer.advance_projected_context_cache(
+                target_hidden=draft_context,
+                cache=layer_cache,
+            )
 
     def __call__(
         self,

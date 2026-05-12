@@ -43,6 +43,15 @@ class DraftBackend(Protocol):
     ) -> mx.array:
         ...
 
+    def advance_context(
+        self,
+        *,
+        draft_model: DFlashDraftModel,
+        draft_cache: list[Any],
+        draft_context: mx.array,
+    ) -> None:
+        ...
+
 
 class EagerDraftBackend:
     def make_cache(
@@ -110,3 +119,15 @@ class EagerDraftBackend:
         else:
             mx.eval(draft_logits)
         return drafted
+
+    def advance_context(
+        self,
+        *,
+        draft_model: DFlashDraftModel,
+        draft_cache: list[Any],
+        draft_context: mx.array,
+    ) -> None:
+        draft_model.advance_projected_context_cache(
+            draft_context=draft_context,
+            cache=draft_cache,
+        )

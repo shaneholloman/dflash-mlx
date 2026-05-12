@@ -94,6 +94,8 @@ class _RequestAccounting:
     adaptive_block_reductions: int = 0
     adaptive_block_cycles: int = 0
     adaptive_block_min: Optional[int] = None
+    copyspec_hits: int = 0
+    copyspec_tokens: int = 0
     finish_reason: Optional[str] = None
     cache_lookup_ms: Optional[float] = None
     cache_hit_tokens: int = 0
@@ -186,6 +188,8 @@ class _RequestAccounting:
         adaptive_block_min = (
             summary_event.adaptive_block_min if summary_event is not None else None
         )
+        copyspec_hits = int(summary_event.copyspec_hits if summary_event else 0)
+        copyspec_tokens = int(summary_event.copyspec_tokens if summary_event else 0)
         prefill_phase_timings_us = _prefill_phase_timings(prefill_event)
         prefill_accounting = _prefill_accounting(prefill_event)
         runtime_config_payload = _runtime_config_payload(runtime_config)
@@ -230,6 +234,8 @@ class _RequestAccounting:
             adaptive_block_reductions=adaptive_block_reductions,
             adaptive_block_cycles=adaptive_block_cycles,
             adaptive_block_min=adaptive_block_min,
+            copyspec_hits=copyspec_hits,
+            copyspec_tokens=copyspec_tokens,
             finish_reason=finish_reason,
             max_tokens=int(max_tokens),
             cache_lookup_ms=float(cache_lookup_ms),
@@ -321,6 +327,8 @@ class _RequestAccounting:
                 "adaptive_block_reductions": int(self.adaptive_block_reductions),
                 "adaptive_block_cycles": int(self.adaptive_block_cycles),
                 "adaptive_block_min": self.adaptive_block_min,
+                "copyspec_hits": int(self.copyspec_hits),
+                "copyspec_tokens": int(self.copyspec_tokens),
                 "finish_reason": self.finish_reason,
                 "prompt_regime": dict(self.prompt_regime or {}),
                 "prefill_event": dict(self.prefill_event_payload or {}),

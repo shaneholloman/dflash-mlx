@@ -350,22 +350,36 @@ class DFlashAPIHandler(mlx_server.APIHandler):
         self.wfile.write(body)
         self.wfile.flush()
 
+    def _write_completion_error_response(self, status: int, message: str) -> None:
+        self._write_json_response(
+            status,
+            {
+                "error": {
+                    "message": message,
+                    "type": "invalid_request_error",
+                    "param": None,
+                    "code": None,
+                }
+            },
+        )
+
     def handle_completion(self, request, stop_words):
         try:
             apply_tool_choice(request, getattr(self, "tool_choice", None))
             if not bool(getattr(self, "parallel_tool_calls", True)):
                 raise ValueError("parallel_tool_calls=false is not supported")
+        except ValueError as e:
+            logging.warning("Rejected tool-call request: %s", e)
+            self._write_completion_error_response(400, str(e))
+            return
+        try:
             return super().handle_completion(request, stop_words)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             self.close_connection = True
             return
         except ToolCallParseError as e:
             logging.error("Tool parser error: %s", e)
-            self.close_connection = True
-            return
-        except ValueError as e:
-            logging.warning("Tool parser error (likely malformed tool call): %s", e)
-            self.close_connection = True
+            self._write_completion_error_response(400, str(e))
             return
 
     def generate_response(self, *args, **kwargs):

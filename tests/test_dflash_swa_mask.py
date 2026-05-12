@@ -3,6 +3,7 @@
 # Based on DFlash (arXiv:2602.06036)
 
 import mlx.core as mx
+import pytest
 
 from dflash_mlx.engine.config import _effective_draft_window_size
 from dflash_mlx.model import (
@@ -137,6 +138,31 @@ def test_context_cache_later_long_append_keeps_new_tail_only():
     assert cache.offset == 14
     assert cache.cache_length() == 5
     assert cache.position_indices().tolist() == [0, 1, 11, 12, 13]
+
+
+def test_advance_projected_context_cache_preserves_sparse_positions():
+    attn = DFlashAttention(_args(), layer_idx=0)
+    cache = ContextOnlyDraftKVCache(sink_size=2, window_size=3)
+    target_hidden = mx.zeros((1, 8, 32), dtype=mx.float32)
+
+    attn.append_projected_context_cache(target_hidden=target_hidden, cache=cache)
+    mx.eval(cache.position_indices())
+
+    assert cache.offset == 8
+    assert cache.cache_length() == 5
+    assert cache.position_indices().tolist() == [0, 1, 5, 6, 7]
+
+
+def test_draft_model_advance_projected_context_cache_requires_cache():
+    model = DFlashDraftModel.__new__(DFlashDraftModel)
+    draft_context = mx.zeros((1, 1, 32), dtype=mx.float32)
+
+    with pytest.raises(ValueError, match="draft context cache is required"):
+        model.advance_projected_context_cache(
+            draft_context=draft_context,
+            cache=None,
+        )
+
 
 def test_full_attention_layer_keeps_existing_unmasked_behavior():
     attn = DFlashAttention(_args(), layer_idx=1)

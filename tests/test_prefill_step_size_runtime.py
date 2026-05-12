@@ -97,15 +97,22 @@ class _FakeDraftBackend:
         block_len = int(_kwargs["block_len"])
         return mx.zeros((max(0, block_len - 1),), dtype=mx.uint32)
 
+    def advance_context(self, **_kwargs) -> None:
+        return None
+
 
 class _RecordingDraftBackend(_FakeDraftBackend):
     def __init__(self) -> None:
         self.calls: list[tuple[int, bool]] = []
+        self.advance_context_lengths: list[int] = []
 
     def draft_greedy(self, **kwargs):
         block_len = int(kwargs["block_len"])
         self.calls.append((block_len, bool(kwargs["async_launch"])))
         return mx.zeros((max(0, block_len - 1),), dtype=mx.uint32)
+
+    def advance_context(self, **kwargs) -> None:
+        self.advance_context_lengths.append(int(kwargs["draft_context"].shape[1]))
 
 
 class _RecordingL2:
@@ -1378,6 +1385,115 @@ def test_request_state_preserves_async_prefetched_draft_reuse():
     assert summary.cycles_completed == 2
     assert summary.accepted_from_draft == 4
     assert summary.acceptance_history == (3, 1)
+
+
+def test_copyspec_full_block_copy_skips_draft_backend():
+    target_ops = _FakeTargetOps()
+    draft_model = _draft_model()
+    draft_backend = _RecordingDraftBackend()
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=draft_model,
+            draft_backend=draft_backend,
+            prompt="unused",
+            max_new_tokens=4,
+            prompt_tokens_override=[1, 2, 3, 4, 5, 0, 0, 0, 0, 1, 2, 3, 4, 5],
+            runtime_context=_runtime_context(),
+        )
+    )
+
+    summary = next(event for event in events if isinstance(event, SummaryEvent))
+
+    assert draft_backend.calls == []
+    assert draft_backend.advance_context_lengths == [14]
+    assert summary.generated_token_ids == (0, 0, 0, 0)
+    assert summary.accepted_from_draft == 3
+    assert summary.acceptance_history == (3,)
+    assert summary.copyspec_hits == 1
+    assert summary.copyspec_tokens == 3
+
+
+def test_copyspec_consecutive_hits_advance_draft_contexts():
+    target_ops = _FakeTargetOps()
+    draft_model = _draft_model()
+    draft_backend = _RecordingDraftBackend()
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=draft_model,
+            draft_backend=draft_backend,
+            prompt="unused",
+            max_new_tokens=8,
+            prompt_tokens_override=[
+                1,
+                2,
+                3,
+                4,
+                5,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+            ],
+            runtime_context=_runtime_context(),
+        )
+    )
+
+    summary = next(event for event in events if isinstance(event, SummaryEvent))
+
+    assert draft_backend.calls == []
+    assert draft_backend.advance_context_lengths == [18, 4]
+    assert summary.generated_token_ids == (0, 0, 0, 0, 0, 0, 0, 0)
+    assert summary.accepted_from_draft == 6
+    assert summary.acceptance_history == (3, 3)
+    assert summary.copyspec_hits == 2
+    assert summary.copyspec_tokens == 6
+
+
+def test_copyspec_disables_after_full_rejection():
+    target_ops = _FakeTargetOps()
+    draft_model = _draft_model()
+    draft_backend = _RecordingDraftBackend()
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=draft_model,
+            draft_backend=draft_backend,
+            prompt="unused",
+            max_new_tokens=4,
+            prompt_tokens_override=[1, 2, 3, 4, 5, 0, 7, 7, 7, 1, 2, 3, 4, 5],
+            runtime_context=_runtime_context(),
+        )
+    )
+
+    summary = next(event for event in events if isinstance(event, SummaryEvent))
+
+    assert draft_backend.calls == [(3, True)]
+    assert draft_backend.advance_context_lengths == [14]
+    assert summary.generated_token_ids == (0, 0, 0, 0)
+    assert summary.accepted_from_draft == 2
+    assert summary.acceptance_history == (0, 2)
+    assert summary.copyspec_hits == 1
+    assert summary.copyspec_tokens == 3
 
 
 def test_profile_cycle_events_disable_async_prefetch_and_match_summary():

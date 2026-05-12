@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import json
+from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +20,7 @@ from dflash_mlx.server.protocol import (
     match_stream_token,
     thinking_enabled_for_request,
 )
+from dflash_mlx.server.tool_calls import ToolCallParseError
 from dflash_mlx.server.metrics import (
     get_live_metrics_payload,
     _reset_live_metrics_state,
@@ -435,6 +438,89 @@ def test_text_completions_clear_tool_choice_controls():
     assert request.tools is None
     assert handler.tool_choice is None
     assert handler.parallel_tool_calls is True
+
+
+def _completion_error_handler() -> DFlashAPIHandler:
+    handler = object.__new__(DFlashAPIHandler)
+    handler.wfile = BytesIO()
+    handler.statuses = []
+    handler.headers_sent = []
+    handler._set_completion_headers = lambda status=200: handler.statuses.append(status)
+    handler.send_header = lambda *args: handler.headers_sent.append(args)
+    handler.end_headers = lambda: None
+    handler.close_connection = False
+    return handler
+
+
+def test_chat_completion_rejects_function_specific_tool_choice_with_json_400(
+    monkeypatch,
+):
+    called = []
+
+    def fake_upstream_handle_completion(self, request, stop_words):
+        called.append((request, stop_words))
+
+    monkeypatch.setattr(
+        serve.mlx_server.APIHandler,
+        "handle_completion",
+        fake_upstream_handle_completion,
+    )
+    handler = _completion_error_handler()
+    handler.tool_choice = {"type": "function", "function": {"name": "lookup"}}
+    handler.parallel_tool_calls = True
+    request = SimpleNamespace(
+        tools=[{"type": "function", "function": {"name": "lookup"}}]
+    )
+
+    DFlashAPIHandler.handle_completion(handler, request, [])
+
+    payload = json.loads(handler.wfile.getvalue().decode())
+    assert handler.statuses == [400]
+    assert payload["error"]["type"] == "invalid_request_error"
+    assert "function-specific tool_choice" in payload["error"]["message"]
+    assert called == []
+    assert handler.close_connection is False
+
+
+def test_chat_completion_rejects_parallel_tool_calls_false_with_json_400(
+    monkeypatch,
+):
+    called = []
+    monkeypatch.setattr(
+        serve.mlx_server.APIHandler,
+        "handle_completion",
+        lambda self, request, stop_words: called.append((request, stop_words)),
+    )
+    handler = _completion_error_handler()
+    handler.tool_choice = None
+    handler.parallel_tool_calls = False
+
+    DFlashAPIHandler.handle_completion(handler, SimpleNamespace(tools=[]), [])
+
+    payload = json.loads(handler.wfile.getvalue().decode())
+    assert handler.statuses == [400]
+    assert payload["error"]["message"] == "parallel_tool_calls=false is not supported"
+    assert called == []
+
+
+def test_chat_completion_tool_parse_error_returns_json_400(monkeypatch):
+    def fake_upstream_handle_completion(self, request, stop_words):
+        raise ToolCallParseError("unknown tool call 'lookup'")
+
+    monkeypatch.setattr(
+        serve.mlx_server.APIHandler,
+        "handle_completion",
+        fake_upstream_handle_completion,
+    )
+    handler = _completion_error_handler()
+    handler.tool_choice = None
+    handler.parallel_tool_calls = True
+
+    DFlashAPIHandler.handle_completion(handler, SimpleNamespace(tools=[]), [])
+
+    payload = json.loads(handler.wfile.getvalue().decode())
+    assert handler.statuses == [400]
+    assert payload["error"]["message"] == "unknown tool call 'lookup'"
 
 
 def test_reasoning_response_field_normalizes_to_reasoning_content():

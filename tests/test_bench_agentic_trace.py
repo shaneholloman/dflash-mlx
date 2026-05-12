@@ -257,6 +257,8 @@ def test_aggregate_reports_cycle_and_tool_totals():
                 "wall_s": 0.5,
                 "accept": 0.75,
                 "cache_hit_tokens": 8,
+                "copyspec_hits": 3,
+                "copyspec_tokens": 12,
                 "cycles_summary": {"n_cycles": 2, "total_commits": 6},
             },
         }
@@ -268,6 +270,8 @@ def test_aggregate_reports_cycle_and_tool_totals():
     assert totals["total_cycle_commits"] == 6
     assert totals["avg_tokens_per_cycle"] == 3.0
     assert totals["total_tool_calls"] == 2
+    assert totals["total_copyspec_hits"] == 3
+    assert totals["total_copyspec_tokens"] == 12
 
 def test_aggregate_falls_back_to_post_event_cycles_when_cycle_events_absent():
     posts = [
@@ -339,6 +343,8 @@ def test_agentic_rows_normalize_dflash_post_metrics():
                     "prefill_tokens_computed": 234,
                     "accept": 0.706,
                     "tokens_per_cycle": 3.4,
+                    "copyspec_hits": 2,
+                    "copyspec_tokens": 30,
                     "cycles_completed": 20,
                     "adaptive_block_reductions": 2,
                     "adaptive_block_cycles": 9,
@@ -380,6 +386,8 @@ def test_agentic_rows_normalize_dflash_post_metrics():
             "wall_s": 4.148,
             "acceptance": 0.706,
             "tokens_per_cycle": 3.4,
+            "copyspec_hits": 2,
+            "copyspec_tokens": 30,
             "cycles": 20,
             "adaptive_block_reductions": 2,
             "adaptive_block_cycles": 9,
@@ -400,6 +408,7 @@ def test_agentic_rows_normalize_dflash_post_metrics():
         }
     ]
     assert "| # | cache | src | prompt | cached | computed |" in rendered
+    assert "| accept | tpc | copy hits | copy tok | cycles |" in rendered
     assert "| 2 | warm-l2 | L2 | 13370 | 13136 | 234 | 98.2% |" in rendered
 
 def test_cache_lookup_events_by_request_classifies_l1_and_l2_sources():
