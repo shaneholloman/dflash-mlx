@@ -24,6 +24,7 @@ from dflash_mlx.runtime.config import (
     runtime_config_sources,
 )
 from dflash_mlx.runtime.context import build_runtime_context
+from dflash_mlx.runtime.chip_detect import ChipProfile, detect_chip
 
 _VERIFY_INTERNAL_ENVS = (
     "DFLASH_VERIFY_LINEAR",
@@ -107,6 +108,7 @@ def collect_report(args: argparse.Namespace) -> dict[str, Any]:
 
     if cfg is not None:
         checks.extend(_config_warnings(cfg))
+        checks.extend(_chip_checks())
         checks.append(_check_l2_config(cfg))
 
     checks.append(_check_internal_verify_env())
@@ -226,6 +228,65 @@ def _config_warnings(cfg: EffectiveRuntimeConfig) -> list[DoctorCheck]:
             )
         )
     return checks
+
+def _chip_checks() -> list[DoctorCheck]:
+    try:
+        return _chip_warnings(detect_chip())
+    except Exception as exc:
+        return [
+            DoctorCheck(
+                "chip_profile",
+                "warning",
+                "Apple Silicon chip profile detection failed",
+                {"error": str(exc)},
+            )
+        ]
+
+
+def _chip_warnings(profile: ChipProfile) -> list[DoctorCheck]:
+    checks: list[DoctorCheck] = [
+        DoctorCheck(
+            "chip_profile",
+            "ok",
+            "Apple Silicon chip profile resolved"
+            if profile.metal_available and profile.arch_gen
+            else "Apple Silicon chip profile unavailable",
+            _chip_details(profile),
+        )
+    ]
+    if profile.bf16_emulated:
+        checks.append(
+            DoctorCheck(
+                "old_apple_bf16",
+                "warning",
+                "M1/M2 GPUs emulate BF16; quantized DFlash drafts load as FP16 on this runtime",
+                _chip_details(profile),
+            )
+        )
+    if profile.pre_m5_gpu:
+        checks.append(
+            DoctorCheck(
+                "nax_unavailable",
+                "warning",
+                "NAX matrix kernels are unavailable before M5; older Apple GPUs use steel fallback kernels",
+                _chip_details(profile),
+            )
+        )
+    return checks
+
+
+def _chip_details(profile: ChipProfile) -> dict[str, Any]:
+    return {
+        "metal_available": profile.metal_available,
+        "architecture": profile.arch_string,
+        "arch_gen": profile.arch_gen,
+        "family": profile.family,
+        "tier": profile.tier,
+        "bf16_native": profile.bf16_native,
+        "bf16_emulated": profile.bf16_emulated,
+        "nax_capable": profile.nax_capable,
+        "macos_version": profile.macos_version,
+    }
 
 def _check_l2_config(cfg: EffectiveRuntimeConfig) -> DoctorCheck:
     if not cfg.prefix_cache_l2:

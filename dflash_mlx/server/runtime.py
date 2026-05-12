@@ -353,6 +353,7 @@ def _print_startup_banner(
     draft_quant_line = (
         f"{draft_quant} ({draft_quant_source})" if draft_quant else "none"
     )
+    draft_load_dtype = draft_meta.get("draft_load_dtype") or "checkpoint"
     chat_template_args = getattr(model_provider.cli_args, "chat_template_args", {})
     if not isinstance(chat_template_args, dict):
         chat_template_args = {}
@@ -378,6 +379,7 @@ def _print_startup_banner(
         f"Target:       {target_ref}",
         f"Draft:        {draft_ref}{draft_suffix}",
         f"Draft quant:  {draft_quant_line}",
+        f"Draft dtype:  {draft_load_dtype}",
         "Mode:         DFlash (speculative decoding active)",
         f"Thinking:     {'enabled' if thinking_enabled else 'disabled'}",
         (

@@ -98,9 +98,13 @@ class EagerDraftBackend:
             [staged_first[:1], mask_token_tail[: int(block_len) - 1]],
             axis=0,
         )
+        draft_dtype = _draft_compute_dtype(draft_model)
         noise_embedding = target_ops.embed_tokens(target_model)(
             block_token_ids[None]
         )
+        if draft_dtype is not None:
+            noise_embedding = _astype_if_needed(noise_embedding, draft_dtype)
+            draft_context = _astype_if_needed(draft_context, draft_dtype)
         draft_hidden = draft_model.forward_projected_context(
             noise_embedding=noise_embedding,
             draft_context=draft_context,
@@ -128,6 +132,32 @@ class EagerDraftBackend:
         draft_context: mx.array,
     ) -> None:
         draft_model.advance_projected_context_cache(
-            draft_context=draft_context,
+            draft_context=_astype_if_needed(
+                draft_context,
+                _draft_compute_dtype(draft_model),
+            ),
             cache=draft_cache,
         )
+
+
+def _draft_compute_dtype(draft_model: DFlashDraftModel) -> Any | None:
+    for attr_path in (
+        ("hidden_norm", "weight"),
+        ("norm", "weight"),
+        ("fc", "scales"),
+        ("fc", "weight"),
+    ):
+        value: Any = draft_model
+        for attr in attr_path:
+            value = getattr(value, attr, None)
+            if value is None:
+                break
+        if hasattr(value, "dtype") and mx.issubdtype(value.dtype, mx.floating):
+            return value.dtype
+    return None
+
+
+def _astype_if_needed(value: mx.array, dtype: Any | None) -> mx.array:
+    if dtype is None or value.dtype == dtype:
+        return value
+    return value.astype(dtype)

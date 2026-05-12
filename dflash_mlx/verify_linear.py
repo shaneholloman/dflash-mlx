@@ -231,7 +231,11 @@ def _build_dispatch(
                                        transpose=True, group_size=gs, bits=bits, mode=mode)
     return call
 
-def prewarm_verify_kernels(model: nn.Module) -> int:
+def prewarm_verify_kernels(
+    model: nn.Module,
+    *,
+    input_dtype=mx.bfloat16,
+) -> int:
     from mlx.utils import tree_flatten
 
     seen: set[tuple] = set()
@@ -245,7 +249,7 @@ def prewarm_verify_kernels(model: nn.Module) -> int:
         if key in seen:
             continue
         seen.add(key)
-        dummy = mx.zeros((1, 16, K), dtype=mx.bfloat16)
+        dummy = mx.zeros((1, 16, K), dtype=input_dtype)
         mx.eval(m(dummy))
         warmed += 1
     return warmed

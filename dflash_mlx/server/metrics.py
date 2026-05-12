@@ -380,6 +380,8 @@ def configure_live_metrics(
                 "draft": str(draft_ref) if draft_ref is not None else None,
                 "draft_quant": getattr(model_provider, "effective_draft_quant", None),
                 "draft_quant_source": draft_meta.get("draft_quant_source"),
+                "draft_load_dtype": draft_meta.get("draft_load_dtype"),
+                "draft_load_dtype_source": draft_meta.get("draft_load_dtype_source"),
                 "mode": "dflash",
             }
         )

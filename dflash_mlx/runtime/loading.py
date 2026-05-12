@@ -24,6 +24,7 @@ from dflash_mlx.model import (
     DFlashDraftModelArgs,
 )
 from dflash_mlx.runtime import VerifyConfig
+from dflash_mlx.runtime.chip_detect import ChipProfile, detect_chip
 
 
 @dataclass(frozen=True)
@@ -99,6 +100,25 @@ def _resolve_draft_quant(draft_quant: str | None) -> DraftQuantSpec | None:
     if not spec:
         return None
     return parse_draft_quant_spec(spec)
+
+
+def resolve_draft_load_dtype(
+    quant_spec: DraftQuantSpec | None,
+    *,
+    chip_profile: ChipProfile | None = None,
+) -> Any | None:
+    if quant_spec is None or quant_spec.act_bits == 32:
+        return None
+    profile = chip_profile or detect_chip()
+    if profile.bf16_emulated:
+        return mx.float16
+    return None
+
+
+def _dtype_name(dtype: Any | None) -> str | None:
+    if dtype is None:
+        return None
+    return str(dtype).rsplit(".", 1)[-1]
 
 
 def _draft_lm_head_weight_names(model_path: Path) -> list[str]:
@@ -254,24 +274,39 @@ def load_draft_bundle(
     quant_spec = _resolve_draft_quant(draft_quant)
     if quant_spec is not None:
         nn.quantize(model, bits=quant_spec.weight_bits, group_size=quant_spec.group_size)
+        draft_load_dtype = resolve_draft_load_dtype(quant_spec)
+        if draft_load_dtype is not None:
+            _cast_floating_model(model, draft_load_dtype)
+        if quant_spec.act_bits == 32:
+
+            def _cast_to_f32(_, x: mx.array) -> mx.array:
+                if mx.issubdtype(x.dtype, mx.floating):
+                    return x.astype(mx.float32)
+                return x
+
+            model.apply(_cast_to_f32)
+            draft_load_dtype = mx.float32
         if quant_spec.weight_bits in (4, 8):
             from dflash_mlx.verify_linear import (
                 install_verify_linears,
                 prewarm_verify_kernels,
             )
             install_verify_linears(model, enable_qmm=True)
-            prewarm_verify_kernels(model)
-        if quant_spec.act_bits == 32:
-
-            def _cast_to_f32(_, x: mx.array) -> mx.array:
-                if x.dtype not in (mx.uint32, mx.int32):
-                    return x.astype(mx.float32)
-                return x
-
-            model.apply(_cast_to_f32)
+            prewarm_verify_kernels(
+                model,
+                input_dtype=draft_load_dtype or mx.bfloat16,
+            )
+    else:
+        draft_load_dtype = None
     return model, {
         "resolved_model_ref": str(model_ref) if model_ref is not None else str(resolved_ref),
         "config": config,
+        "draft_load_dtype": _dtype_name(draft_load_dtype),
+        "draft_load_dtype_source": (
+            "old_apple_bf16_emulation"
+            if draft_load_dtype is not None and draft_load_dtype == mx.float16
+            else None
+        ),
         "draft_quant": (
             {
                 "weight_bits": quant_spec.weight_bits,
@@ -282,3 +317,12 @@ def load_draft_bundle(
             else None
         ),
     }
+
+
+def _cast_floating_model(model: Any, dtype: Any) -> None:
+    def _cast(_, x: mx.array) -> mx.array:
+        if mx.issubdtype(x.dtype, mx.floating) and x.dtype != dtype:
+            return x.astype(dtype)
+        return x
+
+    model.apply(_cast)

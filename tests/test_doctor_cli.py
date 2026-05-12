@@ -11,6 +11,7 @@ import pytest
 
 from dflash_mlx import doctor
 from dflash_mlx.runtime.config import EffectiveRuntimeConfig
+from dflash_mlx.runtime.chip_detect import chip_profile_from_device_info
 from dflash_mlx.server.config import build_parser as build_server_parser
 
 _DOCTOR_ENV_KEYS = (
@@ -193,6 +194,46 @@ def test_doctor_warns_on_target_fa_window(monkeypatch, capsys):
     )
     assert warning["status"] == "warning"
     assert report["effective_config"]["values"]["prefix_cache"] is False
+
+
+def test_doctor_warns_on_old_apple_chip(monkeypatch, capsys):
+    _clear_doctor_env(monkeypatch)
+    monkeypatch.setattr(
+        doctor,
+        "detect_chip",
+        lambda: chip_profile_from_device_info(
+            {"architecture": "applegpu_g13s"},
+            metal_available=True,
+            macos_version="15.0",
+        ),
+    )
+
+    code, report = _json_run([], capsys)
+
+    assert code == 2
+    bf16 = next(check for check in report["checks"] if check["name"] == "old_apple_bf16")
+    nax = next(check for check in report["checks"] if check["name"] == "nax_unavailable")
+    assert bf16["status"] == "warning"
+    assert bf16["details"]["family"] == "M1"
+    assert bf16["details"]["tier"] == "max"
+    assert nax["status"] == "warning"
+
+
+def test_doctor_reports_chip_detection_error(monkeypatch, capsys):
+    _clear_doctor_env(monkeypatch)
+    monkeypatch.setattr(
+        doctor,
+        "detect_chip",
+        lambda: (_ for _ in ()).throw(RuntimeError("device info failed")),
+    )
+
+    code, report = _json_run([], capsys)
+
+    assert code == 2
+    check = next(check for check in report["checks"] if check["name"] == "chip_profile")
+    assert check["status"] == "warning"
+    assert check["details"]["error"] == "device info failed"
+
 
 def test_doctor_warns_on_internal_verify_env(monkeypatch, capsys):
     _clear_doctor_env(monkeypatch)

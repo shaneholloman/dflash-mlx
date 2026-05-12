@@ -85,6 +85,11 @@ Qwen3.6, and Gemma4 README-prompt probes showed the best practical
 memory/throughput tradeoff. Use `--draft-quant none` for bf16/non-quant draft
 debugging or A/B comparisons.
 
+On M1/M2 GPUs, quantized DFlash drafts are loaded with FP16 floating tensors to
+avoid the BF16 emulation path. Run metadata records this as
+`draft_load_dtype: "float16"`. `--draft-quant none` preserves the checkpoint
+dtype for explicit A/B comparisons.
+
 Prefix cache:
 
 | Flag | Meaning |

@@ -1233,6 +1233,50 @@ def test_benchmark_records_applied_split_sdpa_state(monkeypatch):
     assert report["config"]["split_sdpa_requested"] is True
 
 
+def test_benchmark_records_draft_load_dtype_in_config(monkeypatch):
+    target, tokenizer, target_meta = _patch_benchmark_target(monkeypatch)
+    monkeypatch.setattr(
+        benchmark,
+        "load_runtime_bundle",
+        lambda **kwargs: SimpleNamespace(
+            target_model=target,
+            tokenizer=tokenizer,
+            target_meta=target_meta,
+            draft_model=_BindableBenchmarkDraft(),
+            draft_meta={
+                "resolved_model_ref": "auto-draft",
+                "draft_load_dtype": "float16",
+                "draft_load_dtype_source": "old_apple_bf16_emulation",
+            },
+            draft_backend=object(),
+            target_ops=object(),
+        ),
+    )
+    monkeypatch.setattr(
+        benchmark,
+        "_generate_dflash_stream_once",
+        lambda **kwargs: _fake_dflash_result(),
+    )
+
+    report = benchmark.benchmark_once(
+        prompt="prompt",
+        max_new_tokens=1,
+        block_tokens=16,
+        use_chat_template=False,
+        target_model_ref="target",
+        draft_model_ref=None,
+        draft_quant=None,
+        no_eos=True,
+        cooldown=0,
+    )
+
+    assert report["config"]["draft_load_dtype"] == "float16"
+    assert (
+        report["config"]["draft_load_dtype_source"]
+        == "old_apple_bf16_emulation"
+    )
+
+
 def test_benchmark_preserves_dflash_phase_timings_in_artifact_entry(monkeypatch):
     target, tokenizer, target_meta = _patch_benchmark_target(monkeypatch)
     monkeypatch.setattr(

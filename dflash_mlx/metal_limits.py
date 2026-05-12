@@ -23,6 +23,7 @@ class MetalLimitConfig:
     cache_request: MemoryLimit
     cache_bytes: int | None
     cache_applied: bool
+    warning: str | None = None
 
 def parse_memory_limit(raw: str) -> MemoryLimit:
     value = str(raw).strip().lower()
@@ -75,7 +76,9 @@ def apply_metal_limits(
             cache_applied=False,
         )
 
-    recommended = int(mx.device_info()["max_recommended_working_set_size"])
+    device_info = dict(mx.device_info())
+    recommended_raw = device_info.get("max_recommended_working_set_size")
+    recommended = int(recommended_raw) if recommended_raw is not None else None
     wired_bytes = _resolve_wired_limit(wired_request, recommended)
     if wired_bytes is not None:
         mx.set_wired_limit(wired_bytes)
@@ -93,9 +96,14 @@ def apply_metal_limits(
         cache_request=cache_request,
         cache_bytes=cache_bytes,
         cache_applied=cache_bytes is not None,
+        warning=(
+            "mx.device_info() does not expose max_recommended_working_set_size"
+            if recommended is None
+            else None
+        ),
     )
 
-def _resolve_wired_limit(request: MemoryLimit, recommended: int) -> int | None:
+def _resolve_wired_limit(request: MemoryLimit, recommended: int | None) -> int | None:
     if request == "auto":
         return recommended
     if request == "none":
@@ -105,10 +113,11 @@ def _resolve_wired_limit(request: MemoryLimit, recommended: int) -> int | None:
 def _resolve_cache_limit(
     request: MemoryLimit,
     wired_bytes: int | None,
-    recommended: int,
+    recommended: int | None,
 ) -> int | None:
     if request == "auto":
-        return int((wired_bytes if wired_bytes is not None else recommended) // 4)
+        basis = wired_bytes if wired_bytes is not None else recommended
+        return int(basis // 4) if basis is not None else None
     if request == "none":
         return None
     return int(request)

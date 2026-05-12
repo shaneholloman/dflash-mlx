@@ -593,6 +593,85 @@ def test_configure_metal_limits_supports_none_and_explicit_cache(monkeypatch):
     assert limits.cache_bytes == 8 * 1024**3
     assert limits.cache_applied is True
 
+
+def test_configure_metal_limits_handles_missing_recommended_key(monkeypatch):
+    calls = []
+
+    class Metal:
+        @staticmethod
+        def is_available():
+            return True
+
+    monkeypatch.setattr(metal_limits.mx, "metal", Metal())
+    monkeypatch.setattr(
+        metal_limits.mx,
+        "device_info",
+        lambda: {"architecture": "applegpu_g13s"},
+    )
+    monkeypatch.setattr(
+        metal_limits.mx,
+        "set_wired_limit",
+        lambda value: calls.append(("wired", value)),
+    )
+    monkeypatch.setattr(
+        metal_limits.mx,
+        "set_cache_limit",
+        lambda value: calls.append(("cache", value)),
+    )
+
+    args = build_parser().parse_args(["--model", "m"])
+    limits = configure_metal_limits(args)
+
+    assert calls == [("cache", 4 * 1024**3)]
+    assert limits.metal_available is True
+    assert limits.recommended_bytes is None
+    assert limits.wired_applied is False
+    assert limits.cache_bytes == 4 * 1024**3
+    assert limits.cache_applied is True
+    assert "max_recommended_working_set_size" in str(limits.warning)
+
+
+def test_configure_metal_limits_applies_explicit_limits_without_recommended_key(
+    monkeypatch,
+):
+    calls = []
+
+    class Metal:
+        @staticmethod
+        def is_available():
+            return True
+
+    monkeypatch.setattr(metal_limits.mx, "metal", Metal())
+    monkeypatch.setattr(
+        metal_limits.mx,
+        "device_info",
+        lambda: {"architecture": "applegpu_g13s"},
+    )
+    monkeypatch.setattr(
+        metal_limits.mx,
+        "set_wired_limit",
+        lambda value: calls.append(("wired", value)),
+    )
+    monkeypatch.setattr(
+        metal_limits.mx,
+        "set_cache_limit",
+        lambda value: calls.append(("cache", value)),
+    )
+
+    args = build_parser().parse_args(
+        ["--model", "m", "--wired-limit", "48GB", "--cache-limit", "8GB"]
+    )
+    limits = configure_metal_limits(args)
+
+    assert calls == [("wired", 48 * 1024**3), ("cache", 8 * 1024**3)]
+    assert limits.recommended_bytes is None
+    assert limits.wired_bytes == 48 * 1024**3
+    assert limits.cache_bytes == 8 * 1024**3
+    assert limits.wired_applied is True
+    assert limits.cache_applied is True
+    assert "max_recommended_working_set_size" in str(limits.warning)
+
+
 def test_startup_banner_prints_resolved_metal_limits(monkeypatch, capsys):
     from dflash_mlx.server.runtime import ServerRuntime
 

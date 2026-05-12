@@ -384,6 +384,8 @@ def _build_config(
     draft: str,
     use_chat_template: bool,
     draft_quant: str | None,
+    draft_load_dtype: str | None,
+    draft_load_dtype_source: str | None,
     no_eos: bool,
     split_sdpa: bool,
     split_sdpa_requested: bool | None,
@@ -404,6 +406,8 @@ def _build_config(
         "cooldown": int(cooldown),
         "use_chat_template": bool(use_chat_template),
         "draft_quant": draft_quant,
+        "draft_load_dtype": draft_load_dtype,
+        "draft_load_dtype_source": draft_load_dtype_source,
         "no_eos": bool(no_eos),
         "split_sdpa": bool(split_sdpa),
         "split_sdpa_applied": bool(split_sdpa),
@@ -456,6 +460,8 @@ def _build_single_case_report(
     draft: str,
     use_chat_template: bool,
     draft_quant: str | None,
+    draft_load_dtype: str | None,
+    draft_load_dtype_source: str | None,
     no_eos: bool,
     split_sdpa: bool,
     split_sdpa_requested: bool | None,
@@ -501,6 +507,8 @@ def _build_single_case_report(
             draft=draft,
             use_chat_template=use_chat_template,
             draft_quant=draft_quant,
+            draft_load_dtype=draft_load_dtype,
+            draft_load_dtype_source=draft_load_dtype_source,
             no_eos=no_eos,
             split_sdpa=split_sdpa,
             split_sdpa_requested=split_sdpa_requested,
@@ -1015,6 +1023,8 @@ def benchmark_once(
         draft=draft_meta["resolved_model_ref"],
         use_chat_template=use_chat_template,
         draft_quant=_effective_draft_quant_label(draft_quant, draft_meta),
+        draft_load_dtype=draft_meta.get("draft_load_dtype"),
+        draft_load_dtype_source=draft_meta.get("draft_load_dtype_source"),
         no_eos=no_eos,
         split_sdpa=bool(split_sdpa_fields["split_sdpa_applied"]),
         split_sdpa_requested=split_sdpa_fields["split_sdpa_requested"],
@@ -1104,6 +1114,14 @@ def benchmark_repeated(
         draft=draft_meta["resolved_model_ref"] if draft_meta is not None else "",
         use_chat_template=use_chat_template,
         draft_quant=_effective_draft_quant_label(draft_quant, draft_meta),
+        draft_load_dtype=(
+            draft_meta.get("draft_load_dtype") if draft_meta is not None else None
+        ),
+        draft_load_dtype_source=(
+            draft_meta.get("draft_load_dtype_source")
+            if draft_meta is not None
+            else None
+        ),
         no_eos=no_eos,
         split_sdpa=bool(split_sdpa_fields["split_sdpa_applied"]),
         split_sdpa_requested=split_sdpa_fields["split_sdpa_requested"],
