@@ -12,6 +12,7 @@ import mlx_lm.server as mlx_server
 
 from dflash_mlx.runtime.bundle import load_runtime_bundle
 from dflash_mlx.runtime.registry import resolve_optional_draft_ref
+from dflash_mlx.server.tool_calls import install_tool_parser
 
 # mlx_lm 0.31.x ModelProvider / ResponseGenerator read these attrs directly.
 _MLX_LM_SERVER_DEFAULTS: dict[str, object | None] = {
@@ -95,6 +96,7 @@ class DFlashModelProvider(mlx_server.ModelProvider):
             tokenizer.chat_template = self.cli_args.chat_template
         if self.cli_args.use_default_chat_template and tokenizer.chat_template is None:
             tokenizer.chat_template = tokenizer.default_chat_template
+        install_tool_parser(tokenizer)
 
         try:
             mx.eval(model.parameters())

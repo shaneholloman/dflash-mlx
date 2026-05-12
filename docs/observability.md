@@ -33,10 +33,12 @@ Prefill throughput is split deliberately:
   divided by user-visible prefill wall time.
 - `prefill_tok_s_apparent`: logical prompt tokens divided by the same wall time.
 
-Completed requests also expose `ttft_s`, `phase_timings_us`, and
-`prefill_phase_timings_us` in `last_request` and `recent_requests`.
-`phase_timings_us` carries the runtime phase totals reported by the engine,
-including `draft`, `verify`, and `replay` when DFlash produced those phases.
+Completed requests also expose `cache_hit_tokens`, `cache_status`, `ttft_s`,
+`phase_timings_us`, and `prefill_phase_timings_us` in `last_request` and
+`recent_requests`. `cache_status` is `WARM` when prefix restore reused tokens
+and `COLD` otherwise. `phase_timings_us` carries the runtime phase totals
+reported by the engine, including `draft`, `verify`, and `replay` when DFlash
+produced those phases.
 
 Use live metrics for debugging, dashboards, and benchmark visibility. Use
 diagnostics artifacts when you need reproducible traces.
@@ -105,7 +107,7 @@ waterfall samples.
 : Per-request summary events. These include request ids, prompt length, token
 counts, acceptance/cycle fields when applicable, cache stats, prefill accounting
 (`logical_ctx_tokens`, `physical_prefill_tokens`, `prefill_tokens_restored`,
-`prefill_tokens_computed`), and memory summary fields.
+`prefill_tokens_computed`), `cache_status`, and memory summary fields.
 
 `summary.md`
 : Human-readable append-only request summary.

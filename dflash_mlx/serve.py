@@ -54,6 +54,11 @@ from dflash_mlx.server.responses_adapter import (
     chat_response_to_responses,
     responses_to_chat_body,
 )
+from dflash_mlx.server.tool_calls import (
+    ToolCallParseError,
+    apply_tool_choice,
+    normalize_parallel_tool_calls,
+)
 
 def _read_project_version() -> str:
     return _DFLASH_VERSION
@@ -276,6 +281,18 @@ class DFlashAPIHandler(mlx_server.APIHandler):
             raise ResponsesAdapterError("Request should be a JSON dictionary")
         return body
 
+    def handle_chat_completions(self):
+        self.tool_choice = self.body.get("tool_choice")
+        self.parallel_tool_calls = normalize_parallel_tool_calls(
+            self.body.get("parallel_tool_calls")
+        )
+        return super().handle_chat_completions()
+
+    def handle_text_completions(self):
+        self.tool_choice = None
+        self.parallel_tool_calls = True
+        return super().handle_text_completions()
+
     def _load_completion_fields(self, body: dict[str, object]) -> list[str]:
         self.stream = bool(body.get("stream", False))
         self.stream_options = body.get("stream_options", None)
@@ -312,6 +329,10 @@ class DFlashAPIHandler(mlx_server.APIHandler):
         self.top_logprobs = body.get("top_logprobs", -1)
         self.seed = body.get("seed", None)
         self.chat_template_kwargs = body.get("chat_template_kwargs")
+        self.tool_choice = body.get("tool_choice")
+        self.parallel_tool_calls = normalize_parallel_tool_calls(
+            body.get("parallel_tool_calls")
+        )
         self.validate_model_parameters()
 
         stop_words = body.get("stop") or []
@@ -331,8 +352,15 @@ class DFlashAPIHandler(mlx_server.APIHandler):
 
     def handle_completion(self, request, stop_words):
         try:
+            apply_tool_choice(request, getattr(self, "tool_choice", None))
+            if not bool(getattr(self, "parallel_tool_calls", True)):
+                raise ValueError("parallel_tool_calls=false is not supported")
             return super().handle_completion(request, stop_words)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self.close_connection = True
+            return
+        except ToolCallParseError as e:
+            logging.error("Tool parser error: %s", e)
             self.close_connection = True
             return
         except ValueError as e:
@@ -342,6 +370,7 @@ class DFlashAPIHandler(mlx_server.APIHandler):
 
     def generate_response(self, *args, **kwargs):
         response = super().generate_response(*args, **kwargs)
+        _normalize_reasoning_content(response)
         served_model = (
             self.response_generator.model_provider.model_key[0]
             if self.response_generator.model_provider.model_key is not None
@@ -352,6 +381,20 @@ class DFlashAPIHandler(mlx_server.APIHandler):
         if getattr(self, "_responses_mode", False):
             return chat_response_to_responses(response)
         return response
+
+def _normalize_reasoning_content(response: dict[str, object]) -> None:
+    choices = response.get("choices")
+    if not isinstance(choices, list):
+        return
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        holder = choice.get("delta") if "delta" in choice else choice.get("message")
+        if not isinstance(holder, dict) or "reasoning" not in holder:
+            continue
+        if "reasoning_content" not in holder:
+            holder["reasoning_content"] = holder["reasoning"]
+        del holder["reasoning"]
 
 def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     parser = _build_parser()

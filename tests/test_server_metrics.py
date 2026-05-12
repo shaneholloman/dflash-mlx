@@ -311,10 +311,13 @@ def test_target_only_request_records_live_metrics_and_post_event(tmp_path, monke
     assert row["mode_used"] == "ar_fastpath"
     assert row["wall_ms"] == 125.0
     assert row["max_tokens"] == 32
+    assert row["cache_hit_tokens"] == 0
+    assert row["cache_status"] == "COLD"
     payload = get_live_metrics_payload()
     assert payload["last_request"]["request_id"] == 8
     assert payload["last_request"]["mode_used"] == "ar_fastpath"
     assert payload["last_request"]["max_tokens"] == 32
+    assert payload["last_request"]["cache_status"] == "COLD"
     assert payload["totals"]["requests"] == 1
 
 
@@ -392,6 +395,7 @@ def test_finalize_request_observability_records_all_outputs(tmp_path, monkeypatc
     assert post["generated_tokens"] == 4
     assert post["prefill_tok_s"] == 8.0
     assert post["decode_tok_s"] == 2.0
+    assert post["cache_status"] == "COLD"
     assert post["prefill_event"]["physical_prefill_tokens"] == 8
     assert post["memory_waterfall_peak"]["mlx_active_gb"] == 6.0
     summary = (tmp_path / "summary.md").read_text()
@@ -753,6 +757,7 @@ def test_metrics_endpoint_reports_current_request(monkeypatch):
     assert current["prompt_tokens"] == 4096
     assert current["max_tokens"] == 64
     assert current["cache_hit_tokens"] == 3072
+    assert current["cache_status"] == "WARM"
     assert current["cache_lookup_ms"] == 1.5
     assert current["prefill_tokens_processed"] == 1024
     assert current["prefill_tokens_total"] == 4096
@@ -839,6 +844,8 @@ def test_metrics_endpoint_reports_last_request_and_prefix_cache(monkeypatch):
     assert last["request_id"] == 12
     assert last["prompt_tokens"] == 1000
     assert last["generated_tokens"] == 100
+    assert last["cache_hit_tokens"] == 750
+    assert last["cache_status"] == "WARM"
     assert last["ttft_s"] == 1.0
     assert last["prefill_tok_s_physical"] == 250.0
     assert last["prefill_tok_s_apparent"] == 1000.0
@@ -867,6 +874,7 @@ def test_metrics_endpoint_reports_last_request_and_prefix_cache(monkeypatch):
     assert payload["rates"]["active_decode_tok_s"] == last["decode_tok_s"]
     assert len(payload["recent_requests"]) == 1
     assert payload["recent_requests"][0]["request_id"] == 12
+    assert payload["recent_requests"][0]["cache_status"] == "WARM"
 
 
 def test_prompt_regime_distinguishes_text_completion_from_chat():

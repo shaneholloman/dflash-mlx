@@ -283,6 +283,7 @@ class _RequestAccounting:
             acceptance_rate=self.acceptance_ratio,
             cycles=self.cycles_completed,
             finish_reason=self.finish_reason,
+            cache_hit_tokens=self.cache_hit_tokens,
             prefill_phase_timings_us=self.prefill_phase_timings_us,
             phase_timings_us=self.phase_timings_us,
         )
@@ -296,6 +297,8 @@ class _RequestAccounting:
             "mode_used": self.mode_used,
             "max_tokens": int(self.max_tokens),
             "wall_ms": float(self.wall_ms),
+            "cache_hit_tokens": int(self.cache_hit_tokens),
+            "cache_status": _cache_status(self.cache_hit_tokens),
         }
         if self.prompt_tokens is None:
             return payload
@@ -311,7 +314,6 @@ class _RequestAccounting:
                 "decode_tok_s": self.decode_tok_s,
                 "decode_ms": self.decode_ms,
                 "cache_lookup_ms": self.cache_lookup_ms,
-                "cache_hit_tokens": int(self.cache_hit_tokens),
                 "cache_insert_ms": self.cache_insert_ms,
                 "acceptance_ratio": self.acceptance_ratio,
                 "tokens_per_cycle": self.tokens_per_cycle,
@@ -480,6 +482,7 @@ def start_live_request(
         "max_tokens": int(max_tokens),
         "generated_tokens": 0,
         "cache_hit_tokens": int(cache_hit_tokens),
+        "cache_status": _cache_status(cache_hit_tokens),
         "cache_lookup_ms": float(cache_lookup_ms),
         "prefill_tokens_processed": None,
         "prefill_tokens_total": _int_or_none(prompt_tokens),
@@ -939,6 +942,7 @@ def _last_request_payload(
     acceptance_rate: Optional[float],
     cycles: Optional[int],
     finish_reason: Optional[str],
+    cache_hit_tokens: int = 0,
     prefill_phase_timings_us: Optional[dict[str, float]] = None,
     phase_timings_us: Optional[dict[str, float]] = None,
 ) -> dict[str, Any]:
@@ -956,6 +960,8 @@ def _last_request_payload(
         "acceptance_rate": _float_or_none(acceptance_rate),
         "cycles": _int_or_none(cycles),
         "finish_reason": finish_reason,
+        "cache_hit_tokens": int(cache_hit_tokens),
+        "cache_status": _cache_status(cache_hit_tokens),
         "prefill_phase_timings_us": dict(prefill_phase_timings_us or {}),
         "phase_timings_us": dict(phase_timings_us or {}),
     }
@@ -999,6 +1005,9 @@ def _int_or_none(value: Optional[Any]) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+def _cache_status(cache_hit_tokens: int) -> str:
+    return "WARM" if int(cache_hit_tokens) > 0 else "COLD"
 
 
 def _bool_or_none(value: Optional[Any]) -> Optional[bool]:

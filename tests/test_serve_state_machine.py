@@ -12,7 +12,7 @@ from mlx_lm.generate import SequenceStateMachine
 from dflash_mlx import serve
 from dflash_mlx.server import metrics as metrics_mod
 from dflash_mlx.server import runtime as server_runtime_mod
-from dflash_mlx.serve import DFlashResponseGenerator
+from dflash_mlx.serve import DFlashAPIHandler, DFlashResponseGenerator
 from dflash_mlx.server.protocol import (
     build_generation_context,
     match_stream_token,
@@ -407,3 +407,82 @@ def test_request_thinking_default_and_request_override():
         cli_args,
         SimpleNamespace(chat_template_kwargs={"enable_thinking": True}),
     ) is True
+
+
+def test_chat_completions_loads_tool_choice_controls():
+    handler = object.__new__(DFlashAPIHandler)
+    handler.stream = True
+    handler.body = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": "lookup"}}],
+        "tool_choice": "none",
+        "parallel_tool_calls": True,
+    }
+
+    request = DFlashAPIHandler.handle_chat_completions(handler)
+
+    assert request.tools == handler.body["tools"]
+    assert handler.tool_choice == "none"
+    assert handler.parallel_tool_calls is True
+
+
+def test_text_completions_clear_tool_choice_controls():
+    handler = object.__new__(DFlashAPIHandler)
+    handler.body = {"prompt": "hi"}
+
+    request = DFlashAPIHandler.handle_text_completions(handler)
+
+    assert request.tools is None
+    assert handler.tool_choice is None
+    assert handler.parallel_tool_calls is True
+
+
+def test_reasoning_response_field_normalizes_to_reasoning_content():
+    response = {
+        "choices": [
+            {
+                "delta": {
+                    "role": "assistant",
+                    "reasoning": "think",
+                }
+            },
+            {
+                "message": {
+                    "role": "assistant",
+                    "reasoning": "done",
+                }
+            },
+        ]
+    }
+
+    serve._normalize_reasoning_content(response)
+
+    assert response["choices"][0]["delta"] == {
+        "role": "assistant",
+        "reasoning_content": "think",
+    }
+    assert response["choices"][1]["message"] == {
+        "role": "assistant",
+        "reasoning_content": "done",
+    }
+
+
+def test_reasoning_content_is_not_overwritten():
+    response = {
+        "choices": [
+            {
+                "delta": {
+                    "role": "assistant",
+                    "reasoning": "upstream",
+                    "reasoning_content": "server",
+                }
+            }
+        ]
+    }
+
+    serve._normalize_reasoning_content(response)
+
+    assert response["choices"][0]["delta"] == {
+        "role": "assistant",
+        "reasoning_content": "server",
+    }

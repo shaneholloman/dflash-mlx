@@ -110,7 +110,16 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   }"
 ```
 
-Compatible with OpenCode, aider, Continue, Open WebUI, and any OpenAI-compatible client. Tool calls, streaming, and chat templates all flow through. Short responses may take the target-only fast path; pass `--fastpath-max-tokens 0` to force DFlash on every request.
+Compatible with OpenCode, aider, Continue, Open WebUI, and any
+OpenAI-compatible client. Chat Completions tool calls stream as OpenAI
+`delta.tool_calls` for Qwen3-Coder XML, Gemma4, and JSON tool-call payloads
+inside model tool spans; malformed or undeclared tool calls fail at the server
+boundary instead of leaking raw XML/JSON as assistant content. Chat Completions
+accepts `tool_choice: "auto"` and `tool_choice: "none"`; function-specific
+`tool_choice` and `parallel_tool_calls: false` are rejected because the server
+does not implement serial tool enforcement. Short responses may take the
+target-only fast path; pass `--fastpath-max-tokens 0` to force DFlash on every
+request.
 
 `POST /v1/responses` is available as a minimal non-streaming compatibility
 adapter for text input and function-call tools. Streaming Responses,
@@ -128,8 +137,9 @@ curl http://127.0.0.1:8000/metrics
 restore. `prefill_tok_s_apparent` uses the full logical prompt length over the
 same user-visible prefill wall time. `current_request` shows an in-flight
 prefill/decode, `recent_requests` keeps the last 32 completed requests, and
-`rss_gb` reports process resident memory. `wired_gb` stays `null` unless a true
-per-process wired-memory source is available.
+`cache_status` is `WARM` when a request restored prefix tokens and `COLD`
+otherwise. `rss_gb` reports process resident memory. `wired_gb` stays `null`
+unless a true per-process wired-memory source is available.
 The endpoint is for live debugging and benchmark visibility; it does not create
 benchmark artifacts.
 
