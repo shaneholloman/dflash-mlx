@@ -15,7 +15,7 @@ import struct
 import tempfile
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any, Optional
@@ -570,23 +570,6 @@ class DFlashPrefixL2Cache:
 
                 payload = None
                 self._writer_slots.release()
-
-    def _write_one(self, snapshot: DFlashPrefixSnapshot) -> None:
-        if not self.writable:
-            return
-        try:
-            payload = self._prepare_payload(snapshot)
-        except OSError as e:
-            if e.errno in (errno.ENOSPC, errno.EDQUOT):
-                _LOG.warning("L2 write skipped (disk full): %s", e)
-                with self._lock:
-                    self._stats["write_errors"] += 1
-            else:
-                _LOG.warning("L2 sync write materialize failed: %s", e)
-                with self._lock:
-                    self._stats["materialize_errors"] += 1
-            return
-        self._write_payload(payload)
 
     def _prepare_payload(self, snapshot: DFlashPrefixSnapshot) -> _WritePayload:
         arrays_mlx, meta = _serialize(snapshot)

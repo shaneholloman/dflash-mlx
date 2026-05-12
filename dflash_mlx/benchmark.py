@@ -4,7 +4,6 @@
 
 import argparse
 import gc
-import os
 import platform
 import re
 import shlex
@@ -75,7 +74,6 @@ CONTROLLED_FLAG_NAMES = (
     "prompt",
     "max_tokens",
     "block_tokens",
-    "ctx",
     "include_memory",
     "no_memory",
     "repeat",
@@ -231,19 +229,14 @@ def _finalize_benchmark_args(
         args.repeat = 1
     if args.repeat < 1:
         raise ValueError("--repeat must be >= 1")
-    if args.ctx < 0:
-        raise ValueError("--ctx must be >= 0")
     if args.ctx_tokens is not None and args.ctx_tokens < 0:
         raise ValueError("--ctx-tokens must be >= 0")
-    if args.ctx_tokens is None and args.ctx > 0:
-        args.ctx_tokens = int(args.ctx)
     if args.ctx_tokens is not None and args.suite == "smoke" and not suite_explicit:
         args.suite = "longctx"
     if args.suite == "longctx" and (args.ctx_tokens is None or args.ctx_tokens == 0):
         args.ctx_tokens = DEFAULT_CTX_TOKENS
     if args.ctx_tokens is None:
         args.ctx_tokens = 0
-    args.ctx = int(args.ctx_tokens)
     args.seed = int(args.seed)
     if args.limit is None:
         args.limit = _default_limit_for_suite(args.suite)
@@ -706,7 +699,6 @@ def _generate_stock_baseline_once(
     generation_tokens = int(final_response.generation_tokens)
     generation_tps = float(final_response.generation_tps)
     prefill_us = (prompt_tokens / prompt_tps) * 1e6 if prompt_tps > 0.0 else 0.0
-    generation_us = (generation_tokens / generation_tps) * 1e6 if generation_tps > 0.0 else 0.0
     return {
         "elapsed_us": elapsed_us,
         "prefill_us": prefill_us,
@@ -1235,13 +1227,6 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         help="DFlash speculative verify block size. Default: 16.",
     )
     parser.add_argument(
-        "--ctx",
-        metavar="INT",
-        type=int,
-        default=0,
-        help="Existing shorthand for --ctx-tokens. Default: 0.",
-    )
-    parser.add_argument(
         "--no-memory",
         action="store_true",
         help="Omit peak memory medians from the summary. Default: memory summary enabled.",
@@ -1343,7 +1328,6 @@ def _controlled_flag_values(
         "prompt": args.prompt,
         "max_tokens": int(args.max_tokens),
         "block_tokens": int(args.block_tokens),
-        "ctx": ctx_tokens,
         "include_memory": not bool(args.no_memory),
         "no_memory": bool(args.no_memory),
         "repeat": int(args.repeat),
@@ -1382,7 +1366,6 @@ def _explicit_flag_values(
         "--prompt": "prompt",
         "--max-tokens": "max_tokens",
         "--block-tokens": "block_tokens",
-        "--ctx": "ctx",
         "--no-memory": "no_memory",
         "--repeat": "repeat",
         "--cooldown": "cooldown",

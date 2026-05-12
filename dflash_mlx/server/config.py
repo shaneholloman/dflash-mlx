@@ -29,7 +29,6 @@ from dflash_mlx.runtime.config import (
     resolve_runtime_config,
 )
 from dflash_mlx.runtime.context import build_runtime_context
-from dflash_mlx.runtime.profiles import format_profiles
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="DFlash Server.")
@@ -86,8 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=parse_memory_limit,
         default=None,
         help=(
-            "MLX cache memory limit. Default follows the runtime profile "
-            "(long-session: 4GB, others: auto); auto uses wired-limit/4; "
+            "MLX cache memory limit. Default: 4GB for the serve runtime; auto uses wired-limit/4; "
             "none skips mx.set_cache_limit; BYTES accepts suffixes like 8GB."
         ),
     )
@@ -175,9 +173,6 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 def normalize_cli_args(args: argparse.Namespace) -> argparse.Namespace:
-    if args.list_profiles:
-        print(format_profiles())
-        raise SystemExit(0)
     _normalize_chat_template_args(args)
     if args.fastpath_max_tokens < 0:
         raise SystemExit("--fastpath-max-tokens must be >= 0")
@@ -189,7 +184,6 @@ def normalize_cli_args(args: argparse.Namespace) -> argparse.Namespace:
     if runtime_config.target_fa_window > 0 and (
         args.prefix_cache is not False
         or args.prefix_cache_l2 is True
-        or runtime_config.profile == "long-session"
     ):
         sys.stderr.write(
             "[dflash] warning: target FA window disables prefix cache and L2 snapshots\n"
@@ -282,7 +276,6 @@ def _write_diagnostics_bootstrap(
         argv=list(sys.argv),
         model=getattr(args, "model", None),
         draft=getattr(args, "draft_model", None),
-        profile=runtime_config.profile,
         effective_config=effective,
     )
     write_json(
@@ -290,7 +283,7 @@ def _write_diagnostics_bootstrap(
         {
             "argv": list(sys.argv),
             "cwd": os.getcwd(),
-            "diagnostics": diagnostics_meta,
+        "diagnostics": diagnostics_meta,
         },
     )
     write_json(Path(path) / "effective_config.json", effective)
@@ -301,7 +294,6 @@ def _write_diagnostics_bootstrap(
         f"- directory: {run_path}",
         f"- model: {getattr(args, 'model', None) or 'unset'}",
         f"- draft: {getattr(args, 'draft_model', None) or 'auto'}",
-        f"- profile: {runtime_config.profile}",
         "",
         "Files:",
         "- `post_events.jsonl`: request timing, throughput, cache hit tokens, prefill accounting, and memory peak when enabled.",
@@ -320,19 +312,16 @@ def _write_diagnostics_bootstrap(
 def configure_metal_limits(args: argparse.Namespace) -> MetalLimitConfig:
     limits = apply_metal_limits(
         wired_request=getattr(args, "wired_limit", "auto"),
-        cache_request=_resolve_profile_cache_limit(args),
+        cache_request=_resolve_default_cache_limit(args),
     )
     args.metal_limits = limits
     return limits
 
-def _resolve_profile_cache_limit(args: argparse.Namespace) -> MemoryLimit:
+def _resolve_default_cache_limit(args: argparse.Namespace) -> MemoryLimit:
     explicit = getattr(args, "cache_limit", None)
     if explicit is not None:
         return explicit
-    runtime_config = getattr(args, "runtime_config", None)
-    if getattr(runtime_config, "profile", None) == "long-session":
-        return 4 * GiB
-    return "auto"
+    return 4 * GiB
 
 def configure_logging(log_level: str) -> None:
     logging.basicConfig(

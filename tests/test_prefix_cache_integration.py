@@ -15,8 +15,6 @@ from mlx_lm.models.cache import KVCache
 from dflash_mlx.cache.codecs import (
     PrefixSnapshotBuilder,
     build_snapshot,
-    hydrate_target_cache,
-    target_cache_is_serializable,
 )
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
 from dflash_mlx.cache.manager import (
@@ -29,17 +27,17 @@ from dflash_mlx.cache.prefix_l2 import DFlashPrefixL2Cache
 from dflash_mlx.cache.snapshot_service import SnapshotService
 from dflash_mlx.cache.store import PrefixSnapshotStore
 from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
-from dflash_mlx.runtime.context import build_runtime_context, runtime_config_from_profile
+from dflash_mlx.runtime.config import runtime_config_from_defaults
+from dflash_mlx.runtime.context import build_runtime_context
 
 def _runtime_context(**overrides):
     values = dict(
-        profile="balanced",
         prefix_cache=True,
         prefix_cache_l2=False,
         prefix_cache_l2_dir="/tmp/dflash-prefix-l2-test",
     )
     values.update(overrides)
-    return build_runtime_context(runtime_config_from_profile(**values))
+    return build_runtime_context(runtime_config_from_defaults(**values))
 
 def _make_populated_target_cache(n_tokens: int = 8):
     caches = []
@@ -176,7 +174,6 @@ def _simulate_serve_insert(
     last_logits = mx.arange(32, dtype=mx.float32).reshape(1, 32)
     mx.eval(target_hidden, last_logits)
 
-    assert target_cache_is_serializable(live_cache)
     snap = build_snapshot(
         token_ids=prompt_tokens,
         target_cache=live_cache,
@@ -1001,13 +998,13 @@ class TestContextConfigExposedCorrectly:
         assert cache_manager_mod.current_runtime_cache_manager() is None
         assert cache_manager_mod._DFLASH_RUNTIME_CACHE_MANAGER is None
 
-    def test_chat_template_marker_ids_returns_none_without_converter(self):
-        from dflash_mlx.server.prefix_cache_manager import chat_template_marker_ids
+    def test_chat_template_stable_marker_returns_none_without_converter(self):
+        from dflash_mlx.server.prefix_cache_manager import chat_template_stable_marker
 
-        assert chat_template_marker_ids(object()) == (None, None)
+        assert chat_template_stable_marker(object()) == (None, None, 0)
 
-    def test_chat_template_marker_ids_raises_on_tokenizer_failure(self):
-        from dflash_mlx.server.prefix_cache_manager import chat_template_marker_ids
+    def test_chat_template_stable_marker_raises_on_tokenizer_failure(self):
+        from dflash_mlx.server.prefix_cache_manager import chat_template_stable_marker
 
         class BrokenTokenizer:
             unk_token_id = -1
@@ -1016,13 +1013,10 @@ class TestContextConfigExposedCorrectly:
                 raise RuntimeError("tokenizer closed")
 
         with pytest.raises(RuntimeError, match="chat template marker ids"):
-            chat_template_marker_ids(BrokenTokenizer())
+            chat_template_stable_marker(BrokenTokenizer())
 
-    def test_chat_template_marker_ids_falls_back_to_gemma_turn_model(self):
-        from dflash_mlx.server.prefix_cache_manager import (
-            chat_template_marker_ids,
-            chat_template_stable_marker,
-        )
+    def test_chat_template_stable_marker_falls_back_to_gemma_turn_model(self):
+        from dflash_mlx.server.prefix_cache_manager import chat_template_stable_marker
 
         class GemmaTokenizer:
             unk_token_id = 3
@@ -1039,7 +1033,6 @@ class TestContextConfigExposedCorrectly:
                     return [105, 4368, 107]
                 return [3]
 
-        assert chat_template_marker_ids(GemmaTokenizer()) == (105, 4368)
         assert chat_template_stable_marker(GemmaTokenizer()) == (105, 4368, 3)
 
     def test_chat_template_stable_marker_keeps_chatml_boundary(self):

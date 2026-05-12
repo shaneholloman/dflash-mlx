@@ -13,7 +13,6 @@ dflash serve
 dflash generate
 dflash benchmark
 dflash doctor
-dflash profiles
 dflash models
 ```
 
@@ -25,24 +24,13 @@ Start the OpenAI-compatible server:
 
 ```bash
 dflash serve \
-  --model Qwen/Qwen3.5-4B \
-  --profile balanced
-```
-
-Useful profiles:
-
-```bash
-dflash profiles
-dflash serve --profile fast
-dflash serve --profile low-memory
-dflash serve --profile long-session
+  --model Qwen/Qwen3.5-4B
 ```
 
 Expert overrides stay explicit:
 
 ```bash
 dflash serve \
-  --profile balanced \
   --prefill-step-size 8192 \
   --prefix-cache-max-bytes 17179869184
 ```
@@ -127,11 +115,11 @@ dflash doctor --json
 dflash doctor --strict
 ```
 
-Validate an effective runtime profile:
+Validate effective runtime flags:
 
 ```bash
-dflash doctor --profile low-memory
-dflash doctor --profile long-session --prefix-cache-l2 --json
+dflash doctor --prefill-step-size 1024
+dflash doctor --no-prefix-cache-l2 --json
 ```
 
 Check model/draft resolution:
@@ -142,8 +130,8 @@ dflash doctor --model Qwen/Qwen3.5-4B --load-model
 ```
 
 `doctor` accepts the same runtime config flags as the server for validation:
-profile, prefill size, draft sink/window, verify cap, prefix cache, L2, target
-FA window, and max context.
+prefill size, draft sink/window, verify cap, prefix cache, L2, target FA window,
+and max context.
 
 ## Models
 
@@ -184,27 +172,26 @@ See [observability.md](observability.md).
 Normal coding server:
 
 ```bash
-dflash serve --model Qwen/Qwen3.5-27B --profile balanced
+dflash serve --model Qwen/Qwen3.5-27B
 ```
 
-Throughput-oriented server:
+Explicit prefill override:
 
 ```bash
-dflash serve --model Qwen/Qwen3.5-27B --profile fast
+dflash serve --model Qwen/Qwen3.5-27B --prefill-step-size 8192
 ```
 
-Lower-memory server:
+Lower-memory prefill override:
 
 ```bash
-dflash serve --model Qwen/Qwen3.5-27B --profile low-memory
+dflash serve --model Qwen/Qwen3.5-27B --prefill-step-size 1024
 ```
 
-Long-session cache experiment:
+Custom L2 cache directory:
 
 ```bash
 dflash serve \
   --model Qwen/Qwen3.5-27B \
-  --profile long-session \
   --prefix-cache-l2-dir .artifacts/dflash/prefix-l2
 ```
 

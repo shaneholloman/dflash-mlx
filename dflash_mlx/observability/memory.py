@@ -221,11 +221,6 @@ def darwin_task_resident_size_bytes() -> int | None:
         return None
 
 
-def darwin_phys_footprint_bytes() -> int | None:
-    task_vm = darwin_task_vm_info_bytes()
-    return _task_vm_value(task_vm, "phys_footprint")
-
-
 def darwin_task_vm_info_bytes() -> dict[str, int] | None:
     if sys.platform != "darwin":
         return None

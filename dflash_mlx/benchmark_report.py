@@ -105,7 +105,6 @@ def suite_report(
             "suite": str(args.suite),
             "limit": int(args.limit),
             "ctx_tokens": ctx_tokens(args),
-            "ctx": ctx_tokens(args),
             "prompt_file": str(args.prompt_file) if args.prompt_file else None,
             "prompt_source": prompts[0].source if prompts else None,
             "hf_dataset_name": prompts[0].hf_dataset_name if prompts else None,

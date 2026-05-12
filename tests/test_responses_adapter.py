@@ -145,9 +145,8 @@ def test_responses_function_tools_map_to_chat_tools():
     ]
 
 
-@pytest.mark.parametrize(
-    "field,value,error",
-    [
+def test_responses_unsupported_request_fields_are_rejected():
+    cases = [
         ("tool_choice", "auto", "tool_choice is not implemented"),
         ("parallel_tool_calls", True, "parallel_tool_calls is not implemented"),
         ("previous_response_id", "resp_old", "previous_response_id is not implemented"),
@@ -155,13 +154,11 @@ def test_responses_function_tools_map_to_chat_tools():
         ("reasoning", {"effort": "low"}, "reasoning is not implemented"),
         ("text", {"format": {"type": "text"}}, "text is not implemented"),
         ("truncation", "auto", "truncation is not implemented"),
-    ],
-)
-def test_responses_unsupported_request_fields_are_rejected(field, value, error):
-    body = {"model": "target", "input": "hello", field: value}
-
-    with pytest.raises(ResponsesAdapterError, match=error):
-        responses_to_chat_body(body)
+    ]
+    for field, value, error in cases:
+        body = {"model": "target", "input": "hello", field: value}
+        with pytest.raises(ResponsesAdapterError, match=error):
+            responses_to_chat_body(body)
 
 
 def test_responses_unsupported_tool_type_is_rejected():

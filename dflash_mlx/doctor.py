@@ -24,7 +24,6 @@ from dflash_mlx.runtime.config import (
     runtime_config_sources,
 )
 from dflash_mlx.runtime.context import build_runtime_context
-from dflash_mlx.runtime.profiles import format_profiles
 
 _VERIFY_INTERNAL_ENVS = (
     "DFLASH_VERIFY_LINEAR",
@@ -54,9 +53,6 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
 
 def run(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
     args = build_parser(prog=prog).parse_args(list(argv) if argv is not None else None)
-    if args.list_profiles:
-        print(format_profiles())
-        return 0
 
     report = collect_report(args)
     if args.json_output:
@@ -89,18 +85,22 @@ def collect_report(args: argparse.Namespace) -> dict[str, Any]:
         cfg = resolve_runtime_config(args)
         checks.append(
             DoctorCheck(
-                "profile_resolver",
+                "runtime_config",
                 "ok",
-                "runtime profile resolved",
-                {"profile": cfg.profile},
+                "runtime config resolved",
+                {
+                    "prefill_step_size": cfg.prefill_step_size,
+                    "prefix_cache": cfg.prefix_cache,
+                    "prefix_cache_l2": cfg.prefix_cache_l2,
+                },
             )
         )
     except Exception as exc:
         checks.append(
             DoctorCheck(
-                "profile_resolver",
+                "runtime_config",
                 "fatal",
-                "runtime profile failed to resolve",
+                "runtime config failed to resolve",
                 {"error": str(exc)},
             )
         )
@@ -388,7 +388,6 @@ def _print_text_report(report: dict[str, Any]) -> None:
         values = cfg["values"]
         print(
             "effective config: "
-            f"profile={values['profile']} "
             f"prefill_step_size={values['prefill_step_size']} "
             f"prefix_cache={values['prefix_cache']} "
             f"l2={values['prefix_cache_l2']} "

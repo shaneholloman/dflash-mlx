@@ -4,9 +4,6 @@
 
 from __future__ import annotations
 
-import itertools
-import os
-
 import mlx.core as mx
 import numpy as np
 import pytest

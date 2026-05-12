@@ -9,8 +9,6 @@ import argparse
 import hashlib
 import http.client
 import json
-import os
-import re
 import sys
 import threading
 import time

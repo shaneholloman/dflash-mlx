@@ -4,8 +4,6 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 from dflash_mlx.engine.target_qwen_gdn import QwenGdnTargetOps
 
 _OPS = QwenGdnTargetOps()
@@ -62,14 +60,6 @@ def test_clear_rollback_state_uses_clear_transients_when_present():
     _OPS.clear_rollback_state(c)
     assert c._armed is False
     assert c._tape is None and c._tape_k is None and c._snapshot is None
-
-def test_clear_rollback_state_falls_back_to_attribute_writes():
-    obj = SimpleNamespace(
-        _armed=True, _tape=1, _tape_k=2, _tape_g=3, _tape_qkv=4, _snapshot=5
-    )
-    _OPS.clear_rollback_state(obj)
-    assert obj._armed is False
-    assert obj._tape is None and obj._snapshot is None
 
 def test_full_acceptance_skips_rollback_replay():
     c = _ArmableCache()

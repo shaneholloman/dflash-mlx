@@ -11,7 +11,7 @@ import mlx.core as mx
 import pytest
 from mlx_lm.models.cache import KVCache, QuantizedKVCache, RotatingKVCache
 
-from dflash_mlx.cache.codecs import target_cache_is_serializable
+from dflash_mlx.cache.codecs import serialize_target_cache
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
 from dflash_mlx.cache.prefix_l1 import DFlashPrefixCache
 from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
@@ -127,7 +127,6 @@ def test_target_cache_window_rotates_fa_only_and_leaves_gdn_unchanged(monkeypatc
     assert isinstance(caches[1], RecurrentRollbackCache)
     assert isinstance(caches[2], RotatingKVCache)
     assert caches[2].max_size == 2048
-    assert target_cache_is_serializable(caches) is False
 
 def test_target_cache_window_rejects_quantized_target_kv(monkeypatch):
     with pytest.raises(ValueError, match="target_fa_window"):
@@ -155,7 +154,8 @@ def test_target_cache_quantized_kv_is_not_prefix_serializable(monkeypatch):
     assert isinstance(caches[0], QuantizedKVCache)
     assert isinstance(caches[1], RecurrentRollbackCache)
     assert isinstance(caches[2], QuantizedKVCache)
-    assert target_cache_is_serializable(caches) is False
+    with pytest.raises(TypeError, match="QuantizedKVCache"):
+        serialize_target_cache(caches)
 
 def test_prefix_cache_fingerprint_separates_target_fa_window():
     prompt = [1, 2, 3, 4]

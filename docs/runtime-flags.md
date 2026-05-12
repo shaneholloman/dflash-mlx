@@ -10,47 +10,23 @@ startup:
 
 1. CLI flag;
 2. startup env var;
-3. profile value;
-4. product default.
+3. product default.
 
 After that, engine code consumes typed `RuntimeContext`. Product behavior should
 not depend on rereading `os.environ` during a request.
 
 `dflash generate` and `dflash benchmark` expose a smaller explicit flag surface.
-They do not support the full server profile system.
 
-## Profiles
-
-Use:
-
-```bash
-dflash profiles
-```
-
-Current profiles:
-
-<!-- dflash-runtime-config:profiles:start -->
-| Profile | Prefill | Draft window | Prefix cache | L1 entries / byte budget | Clear cache | L2 | Intent |
-| --- | ---: | --- | --- | --- | --- | --- | --- |
-| `balanced` | 4096 | `64+1024` | on | `4 / 8GiB` | off | off | default normal coding |
-| `fast` | 8192 | `64+1024` | on | `4 / 16GiB` | off | off | throughput first |
-| `low-memory` | 1024 | `64+1024` | on | `2 / 2GiB` | off | off | lower pressure, slower prefill |
-| `long-session` | 4096 | `64+1024` | on | `8 / 8GiB` | boundary | on / `50GiB` | prefix revisits; serve cache `4GB` |
-<!-- dflash-runtime-config:profiles:end -->
-
-`clear_cache_boundaries` is enabled by `long-session` to release MLX scratch cache at safe boundaries while preserving prefix-cache state; other profiles keep it off.
-
-In `dflash serve`, `long-session` also uses a tighter default MLX cache limit
-of `4GB` based on Qwen3.6 27B OpenCode long-session probes. Explicit
-`--cache-limit auto` restores the generic wired-limit/4 policy, and
+`dflash serve` defaults are the product session policy: prefill `2048`, draft
+sink/window `64+1024`, prefix cache on, L1 `8 / 8GiB`, boundary cache clears on,
+L2 on with `50GiB`, and MLX cache limit `4GB`. Explicit flags override those
+values. `--cache-limit auto` restores the generic wired-limit/4 policy, and
 `--cache-limit none` skips `mx.set_cache_limit`.
 
-Gemma4 long-context memory-pressure note: use the existing `low-memory` profile,
-or keep another profile and set `--prefill-step-size 1024` explicitly. The
-measured 31B serve probes also showed lower peak memory and TTFT with
-`--prefill-step-size 512` under tighter memory pressure, but validate that on
-your prompt; it is not a balanced-default change or a public benchmark
-throughput claim.
+Gemma4 long-context memory-pressure note: set `--prefill-step-size 1024`
+explicitly. The measured 31B serve probes also showed lower peak memory and TTFT
+with `--prefill-step-size 512` under tighter memory pressure, but validate that
+on your prompt; it is not a public benchmark throughput claim.
 
 ## `dflash serve`
 
@@ -58,8 +34,6 @@ Core:
 
 | Flag | Meaning |
 | --- | --- |
-| `--profile {balanced,fast,low-memory,long-session}` | preset defaults |
-| `--list-profiles` | print profiles and exit |
 | `--model REF_OR_PATH` | target model |
 | `--draft-model REF_OR_PATH`, `--draft REF_OR_PATH` | draft override |
 | `--host HOST` | server host |
@@ -83,7 +57,6 @@ Generation defaults:
 
 DFlash runtime:
 
-<!-- dflash-runtime-config:serve-runtime:start -->
 | Flag | Meaning |
 | --- | --- |
 | `--prefill-step-size INT` | target prefill chunk size |
@@ -94,7 +67,6 @@ DFlash runtime:
 | `--dflash-max-ctx INT` | DFlash runtime context cap; `0` means no cap |
 | `--target-fa-window INT` | experimental target FA rotating window; `0` means full KV |
 | `--clear-cache-boundaries`, `--no-clear-cache-boundaries` | clear the MLX cache at safe request boundaries |
-<!-- dflash-runtime-config:serve-runtime:end -->
 
 Additional DFlash controls:
 
@@ -115,7 +87,6 @@ debugging or A/B comparisons.
 
 Prefix cache:
 
-<!-- dflash-runtime-config:prefix-cache:start -->
 | Flag | Meaning |
 | --- | --- |
 | `--prefix-cache`, `--no-prefix-cache` | enable/disable DFlash prefix snapshots |
@@ -125,7 +96,6 @@ Prefix cache:
 | `--prefix-cache-l2`, `--no-prefix-cache-l2` | enable/disable SSD L2 for persisted/spilled snapshots |
 | `--prefix-cache-l2-dir PATH` | L2 root directory |
 | `--prefix-cache-l2-max-bytes BYTES` | L2 disk budget |
-<!-- dflash-runtime-config:prefix-cache:end -->
 
 Notes:
 
@@ -160,7 +130,7 @@ Metal limits:
 | Flag | Meaning |
 | --- | --- |
 | `--wired-limit auto\|none\|BYTES` | MLX wired memory limit policy |
-| `--cache-limit auto\|none\|BYTES` | MLX cache limit policy; omitted follows the runtime profile |
+| `--cache-limit auto\|none\|BYTES` | MLX cache limit policy; omitted uses the serve default `4GB` |
 
 ## `dflash generate`
 
@@ -181,7 +151,6 @@ Flags:
 
 Runtime override flags:
 
-<!-- dflash-runtime-config:generate-runtime:start -->
 | Flag | Meaning |
 | --- | --- |
 | `--verify-mode {auto,adaptive,off}` | verifier path mode; `adaptive` probes shorter low-acceptance blocks, `off` is debug/parity only |
@@ -190,7 +159,6 @@ Runtime override flags:
 | `--draft-sink-size INT` | draft cache sink tokens |
 | `--draft-window-size INT` | draft cache rolling window tokens |
 | `--verify-len-cap INT` | max tokens per verify forward, `0` means block size |
-<!-- dflash-runtime-config:generate-runtime:end -->
 
 Generate disables cross-request prefix caching. Use it for local sanity checks, not for
 benchmark claims.
@@ -226,7 +194,6 @@ Flags:
 | `--shuffle` | shuffle HF dataset rows before applying `--limit` |
 | `--seed INT` | shuffle seed used only with `--shuffle` |
 | `--prompt TEXT` | prompt text |
-| `--ctx INT` | existing shorthand for `--ctx-tokens` |
 | `--max-tokens INT` | generated token count |
 | `--block-tokens INT` | DFlash verify block size |
 | `--repeat INT` | measured runs |
@@ -240,7 +207,6 @@ Flags:
 
 Runtime override flags:
 
-<!-- dflash-runtime-config:benchmark-runtime:start -->
 | Flag | Meaning |
 | --- | --- |
 | `--prefill-step-size INT` | target prefill chunk size |
@@ -248,7 +214,6 @@ Runtime override flags:
 | `--draft-sink-size INT` | draft cache sink tokens |
 | `--draft-window-size INT` | draft cache rolling window tokens |
 | `--verify-len-cap INT` | max tokens per verify forward, `0` means block size |
-<!-- dflash-runtime-config:benchmark-runtime:end -->
 
 Benchmark output flags:
 
@@ -264,8 +229,8 @@ New benchmark outputs default to `.artifacts/dflash/benchmarks/...`.
 Doctor accepts the same runtime config flags as the server for validation:
 
 ```bash
-dflash doctor --profile low-memory
-dflash doctor --profile long-session --prefix-cache-l2 --json
+dflash doctor --prefill-step-size 1024
+dflash doctor --no-prefix-cache-l2 --json
 dflash doctor --model Qwen/Qwen3.5-4B --load-model
 ```
 
@@ -278,17 +243,15 @@ Common flags:
 | `--load-model` | actually load model/draft |
 | `--model REF_OR_PATH` | target model for registry/load checks |
 | `--draft REF_OR_PATH` | draft override |
-| runtime flags | profile, prefill, draft window, prefix cache, L2, FA window, max ctx |
+| runtime flags | prefill, draft window, prefix cache, L2, FA window, max ctx |
 
 ## Startup Env Vars
 
 These are accepted as startup inputs for server/doctor config. CLI flags override
 them.
 
-<!-- dflash-runtime-config:env:start -->
 | Env var | Matching config |
 | --- | --- |
-| `DFLASH_RUNTIME_PROFILE` | `--profile {balanced,fast,low-memory,long-session}` |
 | `DFLASH_PREFILL_STEP_SIZE` | `--prefill-step-size INT` |
 | `DFLASH_DRAFT_SINK_SIZE` | `--draft-sink-size INT` |
 | `DFLASH_DRAFT_WINDOW_SIZE` | `--draft-window-size INT` |
@@ -304,7 +267,6 @@ them.
 | `DFLASH_PREFIX_CACHE_MAX_BYTES` | `--prefix-cache-max-bytes BYTES` |
 | `DFLASH_TARGET_FA_WINDOW` | `--target-fa-window INT` |
 | `DFLASH_MAX_CTX` | `--dflash-max-ctx INT` |
-<!-- dflash-runtime-config:env:end -->
 
 Prefer CLI flags for reproducible local runs. Env vars are mainly for Docker,
 CI, and wrappers.

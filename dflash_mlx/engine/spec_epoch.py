@@ -902,7 +902,6 @@ class SpeculativeSession:
             draft_cycle_ns = 0
             verify_cycle_ns = 0
             replay_cycle_ns = 0
-            commit_cycle_ns = 0
             acceptance_cycle_ns = 0
             hidden_extract_cycle_ns = 0
             remaining = max_new_tokens - len(state.generated_token_ids)
@@ -1078,7 +1077,6 @@ class SpeculativeSession:
             state.cycles_completed += 1
             commit_wall_ns = time.perf_counter_ns() - commit_start_ns
             commit_ns_total += commit_wall_ns
-            commit_cycle_ns = max(0, commit_wall_ns - replay_cycle_ns)
 
             state.accepted_from_draft += acceptance_len
             staged_first_next = posterior[acceptance_len : acceptance_len + 1]

@@ -48,7 +48,6 @@ def write_manifest(
     argv: list[str],
     model: str | None = None,
     draft: str | None = None,
-    profile: str | None = None,
     effective_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = build_manifest(
@@ -57,7 +56,6 @@ def write_manifest(
         argv=argv,
         model=model,
         draft=draft,
-        profile=profile,
         effective_config=effective_config,
     )
     write_json(run_dir / "manifest.json", payload)
@@ -70,7 +68,6 @@ def build_manifest(
     argv: list[str],
     model: str | None = None,
     draft: str | None = None,
-    profile: str | None = None,
     effective_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
@@ -86,7 +83,6 @@ def build_manifest(
         "platform": platform.platform(),
         "model": model,
         "draft": draft,
-        "profile": profile,
         "effective_config": effective_config or {},
         "output_schema_version": OUTPUT_SCHEMA_VERSION,
     }
@@ -100,9 +96,6 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     with path.open("w") as fp:
         for row in rows:
             fp.write(json.dumps(row, separators=(",", ":"), sort_keys=True) + "\n")
-
-def slug(value: str) -> str:
-    return _slug(value)
 
 def _kind_dir(kind: ArtifactKind) -> str:
     if kind == "benchmark":

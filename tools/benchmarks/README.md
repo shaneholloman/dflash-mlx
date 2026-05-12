@@ -82,7 +82,7 @@ python -m tools.benchmarks.agentic_trace run --backend mlxlm --target <model> \
     --task-file <task.txt> --label mlx_baseline
 python -m tools.benchmarks.agentic_trace run --backend dflash --target <model> \
     --draft <draft> --task-file <task.txt> --label dflash_run \
-    --draft-quant w4 --profile long-session --prefill-step-size 1024 \
+    --draft-quant w4 --prefill-step-size 1024 \
     --fastpath-max-tokens 0 --prefix-cache --prefix-cache-l2 \
     --diagnostics basic \
     --compare-to .artifacts/dflash/traces/<mlx_baseline_dir>
@@ -117,7 +117,7 @@ python -m tools.benchmarks.agentic_trace replay \
 python -m tools.benchmarks.agentic_trace replay \
     --source-trace .artifacts/dflash/traces/<captured_dir> \
     --backend dflash --target <model> --draft <draft> \
-    --draft-quant w4 --profile long-session --prefill-step-size 1024 \
+    --draft-quant w4 --prefill-step-size 1024 \
     --prefix-cache --prefix-cache-l2 \
     --diagnostics basic --label dflash_replay \
     --compare-to .artifacts/dflash/traces/<mlx_replay_dir>
@@ -153,7 +153,7 @@ New lab outputs should go under `.artifacts/dflash/...` or an explicit local
 
 Some harnesses are intentionally narrower than `dflash benchmark` and may not
 write a full public manifest. If a result will be quoted outside local
-debugging, record the exact command, model refs, git hash, profile/flags, prompt
+debugging, record the exact command, model refs, git hash, runtime flags, prompt
 tokenization mode, and output directory.
 
 ## Rules

@@ -20,7 +20,7 @@ from dflash_mlx.server.protocol import (
 )
 from dflash_mlx.server.metrics import (
     get_live_metrics_payload,
-    reset_live_metrics_for_tests,
+    _reset_live_metrics_state,
     start_live_request,
 )
 from dflash_mlx.server.runtime import ServerRuntime
@@ -152,7 +152,7 @@ def test_response_generator_ar_fastpath_accounting(monkeypatch, ar_raises):
 
 
 def test_response_generator_clears_failed_dflash_request_after_live_start(monkeypatch):
-    reset_live_metrics_for_tests()
+    _reset_live_metrics_state()
     monkeypatch.setattr(metrics_mod, "current_runtime_cache_manager", lambda: None)
 
     class RuntimeThatFails:

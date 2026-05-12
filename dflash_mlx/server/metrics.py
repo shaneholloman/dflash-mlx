@@ -41,7 +41,6 @@ _LIVE_SERVER: dict[str, Any] = {
     "draft_quant": None,
     "draft_quant_source": None,
     "mode": "dflash",
-    "profile": None,
 }
 _LIVE_RUNTIME: dict[str, Any] = {
     "prefill_step_size": None,
@@ -372,7 +371,6 @@ def configure_live_metrics(
                 "draft_quant": getattr(model_provider, "effective_draft_quant", None),
                 "draft_quant_source": draft_meta.get("draft_quant_source"),
                 "mode": "dflash",
-                "profile": getattr(runtime_config, "profile", None),
             }
         )
         _LIVE_RUNTIME.update(
@@ -639,7 +637,7 @@ def finalize_request_observability(
     _record_request_accounting(accounting, diagnostics=diagnostics)
     write_post_request_memory_line(request_id=request_id)
 
-def reset_live_metrics_for_tests() -> None:
+def _reset_live_metrics_state() -> None:
     with _LIVE_LOCK:
         global _LIVE_STARTED_AT, _LIVE_LAST_REQUEST, _LIVE_CURRENT_REQUEST
         _LIVE_STARTED_AT = time.time()
@@ -649,7 +647,6 @@ def reset_live_metrics_for_tests() -> None:
                 "model": None,
                 "draft": None,
                 "mode": "dflash",
-                "profile": None,
             }
         )
         _LIVE_RUNTIME.update(
@@ -757,52 +754,6 @@ def _write_observability_line(line: str) -> None:
             return
 
 
-def record_request_metrics(
-    *,
-    request_id: int,
-    summary_event: Optional[SummaryEvent],
-    request_start_ns: int,
-    request_done_ns: int,
-    first_token_ns: Optional[int],
-    prefill_done_ns: Optional[int],
-    prompt_token_count: int,
-    live_token_count: int,
-    cache_lookup_ms: float,
-    cache_hit_tokens: int,
-    cache_insert_ms: float,
-    finish_reason: Optional[str],
-    max_tokens: int,
-    prompt_regime: Optional[dict[str, Any]] = None,
-    memory_waterfall_peak: Optional[dict[str, Any]] = None,
-    memory_waterfall_start: Optional[dict[str, Any]] = None,
-    memory_waterfall_end: Optional[dict[str, Any]] = None,
-    diagnostics: Optional[DiagnosticsConfig] = None,
-    prefill_event: Optional[PrefillCompleteEvent] = None,
-    runtime_config: Optional[Any] = None,
-) -> None:
-    accounting = _RequestAccounting.dflash(
-        request_id=request_id,
-        summary_event=summary_event,
-        request_start_ns=request_start_ns,
-        request_done_ns=request_done_ns,
-        first_token_ns=first_token_ns,
-        prefill_done_ns=prefill_done_ns,
-        prompt_token_count=prompt_token_count,
-        live_token_count=live_token_count,
-        cache_lookup_ms=cache_lookup_ms,
-        cache_hit_tokens=cache_hit_tokens,
-        cache_insert_ms=cache_insert_ms,
-        finish_reason=finish_reason,
-        max_tokens=int(max_tokens),
-        prompt_regime=prompt_regime,
-        memory_waterfall_peak=memory_waterfall_peak,
-        memory_waterfall_start=memory_waterfall_start,
-        memory_waterfall_end=memory_waterfall_end,
-        prefill_event=prefill_event,
-        runtime_config=runtime_config,
-    )
-    _record_request_accounting(accounting, diagnostics=diagnostics)
-
 def _record_request_accounting(
     accounting: _RequestAccounting,
     *,
@@ -864,7 +815,6 @@ def _runtime_config_payload(runtime_config: Optional[Any]) -> dict[str, Any]:
     if runtime_config is None:
         return {}
     keys = (
-        "profile",
         "prefill_step_size",
         "draft_sink_size",
         "draft_window_size",

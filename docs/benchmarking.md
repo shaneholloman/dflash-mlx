@@ -93,7 +93,6 @@ selected row indices, and selected prompt ids.
 | `--shuffle` | shuffle HF dataset rows before applying `--limit` |
 | `--seed INT` | shuffle seed used only with `--shuffle` |
 | `--prompt TEXT` | prompt text |
-| `--ctx INT` | existing shorthand for `--ctx-tokens` |
 | `--max-tokens INT` | generation length |
 | `--block-tokens INT` | DFlash verify block size |
 | `--repeat INT` | measured runs |

@@ -22,22 +22,19 @@ from dflash_mlx.server.metrics import (
     finalize_request_observability,
     get_live_metrics_payload,
     record_cycle_diagnostic,
-    record_request_metrics,
     record_target_only_request,
-    reset_live_metrics_for_tests,
+    _reset_live_metrics_state,
     start_live_request,
     update_live_request,
     write_post_request_memory_line,
 )
-from dflash_mlx import serve
 from dflash_mlx.serve import DFlashAPIHandler
 from dflash_mlx.server.runtime import build_prompt_regime
 
 
 def _runtime_config(**overrides):
     values = {
-        "profile": "balanced",
-        "prefill_step_size": 4096,
+        "prefill_step_size": 2048,
         "draft_sink_size": 64,
         "draft_window_size": 1024,
         "verify_len_cap": 0,
@@ -221,7 +218,7 @@ def test_diagnostics_post_event_records_prefill_details(tmp_path):
         trace=TraceConfig(log_dir=tmp_path, cycle_events=True),
     )
 
-    record_request_metrics(
+    finalize_request_observability(
         request_id=7,
         summary_event=_summary_event(
             generation_tokens=1,
@@ -259,7 +256,6 @@ def test_diagnostics_post_event_records_prefill_details(tmp_path):
             phase_seam_us=100_000.0,
         ),
         runtime_config=SimpleNamespace(
-            profile="balanced",
             prefill_step_size=8192,
             draft_sink_size=64,
             draft_window_size=1024,
@@ -294,7 +290,7 @@ def test_diagnostics_post_event_records_prefill_details(tmp_path):
 
 
 def test_target_only_request_records_live_metrics_and_post_event(tmp_path, monkeypatch):
-    reset_live_metrics_for_tests()
+    _reset_live_metrics_state()
     monkeypatch.setattr(metrics_mod, "current_runtime_cache_manager", lambda: None)
     diagnostics = DiagnosticsConfig(
         mode="basic",
@@ -342,7 +338,7 @@ def test_cycle_diagnostic_records_cycle_event(tmp_path):
 
 
 def test_finalize_request_observability_records_all_outputs(tmp_path, monkeypatch, capsys):
-    reset_live_metrics_for_tests()
+    _reset_live_metrics_state()
     monkeypatch.setattr(metrics_mod, "current_runtime_cache_manager", lambda: None)
     monkeypatch.setattr(
         metrics_mod,
@@ -415,7 +411,7 @@ def test_diagnostics_summary_append_failure_is_signaled(
     monkeypatch,
     capsys,
 ):
-    reset_live_metrics_for_tests()
+    _reset_live_metrics_state()
     monkeypatch.setattr(metrics_mod, "current_runtime_cache_manager", lambda: None)
 
     def fail_open(self, *_args, **_kwargs):
@@ -430,7 +426,7 @@ def test_diagnostics_summary_append_failure_is_signaled(
         trace=TraceConfig(log_dir=tmp_path, cycle_events=True),
     )
 
-    record_request_metrics(
+    finalize_request_observability(
         request_id=11,
         summary_event=_summary_event(
             generation_tokens=2,
@@ -468,7 +464,7 @@ def test_diagnostics_summary_append_failure_is_signaled(
 
 
 def test_metrics_endpoint_returns_json_before_request(monkeypatch):
-    reset_live_metrics_for_tests()
+    _reset_live_metrics_state()
     _configure_metrics()
     monkeypatch.setattr(metrics_mod, "current_runtime_cache_manager", lambda: None)
 
@@ -479,7 +475,7 @@ def test_metrics_endpoint_returns_json_before_request(monkeypatch):
     assert payload["server"]["draft"] == "draft-model"
     assert payload["server"]["draft_quant"] == "w4"
     assert payload["server"]["draft_quant_source"] == "model_default"
-    assert payload["runtime"]["prefill_step_size"] == 4096
+    assert payload["runtime"]["prefill_step_size"] == 2048
     assert payload["runtime"]["split_sdpa"] is True
     assert payload["runtime"]["split_sdpa_applied"] is True
     assert payload["runtime"]["split_sdpa_requested"] is None
@@ -559,7 +555,7 @@ def test_metrics_startup_clears_stale_cache_when_runtime_disables_prefix_cache(m
             AssertionError("disabled prefix cache should not build a cache key")
         ),
     )
-    reset_live_metrics_for_tests()
+    _reset_live_metrics_state()
 
     _configure_metrics(_runtime_config(prefix_cache=False, target_fa_window=2048))
     payload = _call_metrics_endpoint()
@@ -609,7 +605,7 @@ def test_metrics_startup_preserves_request_cache_identity(monkeypatch):
 
 
 def test_metrics_endpoint_treats_retired_prefix_cache_manager_as_absent(monkeypatch):
-    reset_live_metrics_for_tests()
+    _reset_live_metrics_state()
     _configure_metrics()
     manager = RuntimeCacheManager(PrefixSnapshotStore(l1=DFlashPrefixCache()))
     manager.shutdown()
@@ -730,7 +726,7 @@ def test_mlx_memory_probe_propagates_programmer_errors(monkeypatch):
 
 
 def test_metrics_endpoint_reports_current_request(monkeypatch):
-    reset_live_metrics_for_tests()
+    _reset_live_metrics_state()
     _configure_metrics()
     monkeypatch.setattr(metrics_mod, "current_runtime_cache_manager", lambda: None)
 
@@ -792,7 +788,7 @@ def test_metrics_endpoint_reports_current_request(monkeypatch):
 
 
 def test_metrics_endpoint_reports_last_request_and_prefix_cache(monkeypatch):
-    reset_live_metrics_for_tests()
+    _reset_live_metrics_state()
     runtime_config = _configure_metrics()
     monkeypatch.setattr(
         metrics_mod,
@@ -800,7 +796,7 @@ def test_metrics_endpoint_reports_last_request_and_prefix_cache(monkeypatch):
         lambda: FakePrefixCacheManager(),
     )
 
-    record_request_metrics(
+    finalize_request_observability(
         request_id=12,
         summary_event=_summary_event(
             generation_tokens=100,

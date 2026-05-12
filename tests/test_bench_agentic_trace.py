@@ -996,8 +996,8 @@ def test_render_peer_comparison_skips_per_post_table_when_trajectories_diverge()
     assert "split_sdpa" not in rendered
     assert "fused matmul" not in rendered
 
-def test_dflash_l2_options_require_l2_enablement():
-    with pytest.raises(SystemExit, match="require --prefix-cache-l2"):
+def test_dflash_l2_options_conflict_with_explicit_l2_disable():
+    with pytest.raises(SystemExit, match="conflict with --no-prefix-cache-l2"):
         agentic_trace.main(
             [
                 "--backend",
@@ -1006,16 +1006,17 @@ def test_dflash_l2_options_require_l2_enablement():
                 "m",
                 "--draft",
                 "d",
+                "--no-prefix-cache-l2",
                 "--prefix-cache-l2-dir",
                 "cache",
             ]
         )
 
-def test_replay_l2_options_require_l2_enablement(tmp_path):
+def test_replay_l2_options_conflict_with_explicit_l2_disable(tmp_path):
     source = tmp_path / "source-trace"
     (source / "requests").mkdir(parents=True)
 
-    with pytest.raises(SystemExit, match="require --prefix-cache-l2"):
+    with pytest.raises(SystemExit, match="conflict with --no-prefix-cache-l2"):
         agentic_trace.replay_main(
             [
                 "--source-trace",
@@ -1026,25 +1027,13 @@ def test_replay_l2_options_require_l2_enablement(tmp_path):
                 "m",
                 "--draft",
                 "d",
+                "--no-prefix-cache-l2",
                 "--prefix-cache-l2-max-bytes",
                 "1",
             ]
         )
 
-@pytest.mark.parametrize(
-    "flag_args",
-    [
-        ["--verify-len-cap", "8"],
-        ["--verify-mode", "off"],
-        ["--wired-limit", "48GB"],
-        ["--cache-limit", "4GB"],
-        ["--draft-sink-size", "64"],
-        ["--draft-window-size", "2048"],
-        ["--clear-cache-boundaries"],
-        ["--no-clear-cache-boundaries"],
-    ],
-)
-def test_replay_dflash_runtime_overrides_reject_mlxlm_backend(tmp_path, flag_args):
+def test_replay_dflash_runtime_overrides_reject_mlxlm_backend(tmp_path):
     source = tmp_path / "source-trace"
     (source / "requests").mkdir(parents=True)
 
@@ -1057,7 +1046,8 @@ def test_replay_dflash_runtime_overrides_reject_mlxlm_backend(tmp_path, flag_arg
                 "mlxlm",
                 "--target",
                 "m",
-                *flag_args,
+                "--verify-len-cap",
+                "8",
             ]
         )
 
@@ -1307,7 +1297,6 @@ def _server_args(**overrides):
         "draft_quant": None,
         "wired_limit": None,
         "cache_limit": None,
-        "profile": None,
         "prefill_step_size": None,
         "draft_sink_size": None,
         "draft_window_size": None,
@@ -1328,7 +1317,6 @@ def test_build_server_cmd_disables_dflash_fastpath_by_default():
     assert port == 8123
     assert url == "http://127.0.0.1:8123"
     assert "--draft-quant" not in cmd
-    assert "--profile" not in cmd
     assert "--prefill-step-size" not in cmd
     rendered = " ".join(cmd)
     assert "--fastpath-max-tokens 0" in rendered
@@ -1341,7 +1329,6 @@ def test_build_server_cmd_forwards_gemma_runtime_overrides():
             draft_quant="w4",
             wired_limit="48GB",
             cache_limit="4GB",
-            profile="long-session",
             prefill_step_size=1024,
             draft_sink_size=64,
             draft_window_size=2048,
@@ -1359,7 +1346,6 @@ def test_build_server_cmd_forwards_gemma_runtime_overrides():
     assert "--draft-quant w4" in rendered
     assert "--wired-limit 48GB" in rendered
     assert "--cache-limit 4GB" in rendered
-    assert "--profile long-session" in rendered
     assert "--prefill-step-size 1024" in rendered
     assert "--draft-sink-size 64" in rendered
     assert "--draft-window-size 2048" in rendered
@@ -1372,9 +1358,8 @@ def test_build_server_cmd_forwards_gemma_runtime_overrides():
     idx = cmd.index("--chat-template-args")
     assert cmd[idx + 1] == '{"enable_thinking":false}'
 
-@pytest.mark.parametrize(
-    "flag_args",
-    [
+def test_dflash_runtime_overrides_reject_mlxlm_backend():
+    flag_sets = [
         ["--prefix-cache"],
         ["--no-prefix-cache"],
         ["--prefix-cache-l2"],
@@ -1384,7 +1369,6 @@ def test_build_server_cmd_forwards_gemma_runtime_overrides():
         ["--draft-quant", "w4"],
         ["--wired-limit", "48GB"],
         ["--cache-limit", "4GB"],
-        ["--profile", "long-session"],
         ["--prefill-step-size", "1024"],
         ["--draft-sink-size", "64"],
         ["--draft-window-size", "2048"],
@@ -1395,11 +1379,10 @@ def test_build_server_cmd_forwards_gemma_runtime_overrides():
         ["--clear-cache-boundaries"],
         ["--no-clear-cache-boundaries"],
         ["--target-fa-window", "0"],
-    ],
-)
-def test_dflash_runtime_overrides_reject_mlxlm_backend(flag_args):
-    with pytest.raises(SystemExit, match="requires? --backend dflash"):
-        agentic_trace.main(["--backend", "mlxlm", "--target", "m", *flag_args])
+    ]
+    for flag_args in flag_sets:
+        with pytest.raises(SystemExit, match="requires? --backend dflash"):
+            agentic_trace.main(["--backend", "mlxlm", "--target", "m", *flag_args])
 
 def test_agentic_trace_rejects_negative_system_sample_interval():
     with pytest.raises(SystemExit, match="--system-sample-interval-s must be >= 0"):
@@ -1499,8 +1482,6 @@ def test_agentic_trace_metadata_records_dflash_runtime_overrides(tmp_path, monke
             "draft-model",
             "--draft-quant",
             "w4",
-            "--profile",
-            "long-session",
             "--prefill-step-size",
             "1024",
             "--draft-sink-size",
@@ -1535,7 +1516,6 @@ def test_agentic_trace_metadata_records_dflash_runtime_overrides(tmp_path, monke
     metadata = json.loads((run_dir / "metadata.json").read_text())
     overrides = metadata["dflash_runtime_overrides"]
     assert overrides["draft_quant"] == "w4"
-    assert overrides["profile"] == "long-session"
     assert overrides["prefill_step_size"] == 1024
     assert overrides["draft_sink_size"] == 64
     assert overrides["draft_window_size"] == 2048
@@ -1544,14 +1524,13 @@ def test_agentic_trace_metadata_records_dflash_runtime_overrides(tmp_path, monke
     assert overrides["max_snapshot_tokens"] == 32000
     assert overrides["verify_mode"] == "off"
     assert overrides["clear_cache_boundaries"] is True
-    assert overrides["prefix_cache"] is True
+    assert overrides["prefix_cache"] is None
     assert overrides["prefix_cache_l2"] is True
     assert overrides["prefix_cache_l2_dir"] == str(l2_dir)
     assert overrides["diagnostics"] == "full"
     server_cmd = metadata["server_cmd"]
     rendered = " ".join(server_cmd)
     assert "--draft-quant w4" in rendered
-    assert "--profile long-session" in rendered
     assert "--prefill-step-size 1024" in rendered
     assert "--draft-sink-size 64" in rendered
     assert "--draft-window-size 2048" in rendered
@@ -1560,6 +1539,9 @@ def test_agentic_trace_metadata_records_dflash_runtime_overrides(tmp_path, monke
     assert "--max-snapshot-tokens 32000" in rendered
     assert "--verify-mode off" in rendered
     assert "--clear-cache-boundaries" in server_cmd
+    assert "--prefix-cache" not in server_cmd
+    assert "--prefix-cache-max-entries" not in server_cmd
+    assert "--prefix-cache-max-bytes" not in server_cmd
     assert "--prefix-cache-l2" in server_cmd
     assert str(l2_dir) in server_cmd
     assert (run_dir / "server" / "cmd.txt").read_text().strip()
@@ -1693,7 +1675,7 @@ def test_agentic_replay_metadata_records_source_trace(tmp_path, monkeypatch):
     assert (run_dir / "rows.md").read_text().startswith("# Agentic rows")
 
 
-def test_replay_forwards_no_prefix_cache_l2_for_long_session(tmp_path, monkeypatch):
+def test_replay_forwards_no_prefix_cache_l2(tmp_path, monkeypatch):
     source = _write_source_trace(tmp_path)
     _patch_agentic_process(monkeypatch)
     _patch_replay_outputs(monkeypatch)
@@ -1708,8 +1690,6 @@ def test_replay_forwards_no_prefix_cache_l2_for_long_session(tmp_path, monkeypat
             "fresh-target",
             "--draft",
             "fresh-draft",
-            "--profile",
-            "long-session",
             "--no-prefix-cache-l2",
             "--out-root",
             str(tmp_path),
@@ -1721,10 +1701,42 @@ def test_replay_forwards_no_prefix_cache_l2_for_long_session(tmp_path, monkeypat
     assert rc == 0
     run_dir = next(tmp_path.glob("*-replay-no-l2"))
     server_cmd = json.loads((run_dir / "metadata.json").read_text())["server_cmd"]
-    rendered = " ".join(server_cmd)
-    assert "--profile long-session" in rendered
     assert "--no-prefix-cache-l2" in server_cmd
     assert "--prefix-cache-l2" not in server_cmd
+
+def test_replay_uses_serve_cache_defaults_when_cache_flags_omitted(tmp_path, monkeypatch):
+    source = _write_source_trace(tmp_path)
+    _patch_agentic_process(monkeypatch)
+    _patch_replay_outputs(monkeypatch)
+
+    rc = agentic_trace.replay_main(
+        [
+            "--source-trace",
+            str(source),
+            "--backend",
+            "dflash",
+            "--target",
+            "fresh-target",
+            "--draft",
+            "fresh-draft",
+            "--out-root",
+            str(tmp_path),
+            "--label",
+            "serve-default-cache",
+        ]
+    )
+
+    assert rc == 0
+    run_dir = next(tmp_path.glob("*-replay-serve-default-cache"))
+    server_cmd = json.loads((run_dir / "metadata.json").read_text())["server_cmd"]
+    assert "--prefix-cache" not in server_cmd
+    assert "--no-prefix-cache" not in server_cmd
+    assert "--prefix-cache-max-entries" not in server_cmd
+    assert "--prefix-cache-max-bytes" not in server_cmd
+    assert "--prefix-cache-l2" not in server_cmd
+    assert "--no-prefix-cache-l2" not in server_cmd
+    assert "--prefix-cache-l2-dir" not in server_cmd
+    assert "--prefix-cache-l2-max-bytes" not in server_cmd
 
 def test_replay_terminates_server_when_sampler_stop_fails(tmp_path, monkeypatch):
     source = _write_source_trace(tmp_path)

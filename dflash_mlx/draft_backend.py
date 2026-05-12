@@ -110,7 +110,3 @@ class EagerDraftBackend:
         else:
             mx.eval(draft_logits)
         return drafted
-
-
-def make_draft_backend() -> DraftBackend:
-    return EagerDraftBackend()

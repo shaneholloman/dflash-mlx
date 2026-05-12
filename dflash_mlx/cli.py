@@ -9,8 +9,6 @@ import importlib
 import sys
 from collections.abc import Sequence
 
-_COMMANDS = ("serve", "generate", "benchmark", "doctor", "profiles", "models")
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dflash",
@@ -21,7 +19,6 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("generate", help="generate one prompt")
     subparsers.add_parser("benchmark", help="run the public baseline vs DFlash benchmark")
     subparsers.add_parser("doctor", help="run local runtime checks")
-    subparsers.add_parser("profiles", help="list runtime profiles")
     subparsers.add_parser("models", help="list supported draft mappings")
     return parser
 
@@ -43,8 +40,6 @@ def run(argv: Sequence[str] | None = None) -> int:
         return _run_module_main("dflash_mlx.benchmark", "dflash benchmark", args[1:])
     if command == "doctor":
         return _run_module_main("dflash_mlx.doctor", "dflash doctor", args[1:])
-    if command == "profiles":
-        return _print_profiles()
     if command == "models":
         return _print_models()
 
@@ -73,12 +68,6 @@ def _exit_code(exc: SystemExit) -> int:
         return exc.code
     print(exc.code, file=sys.stderr)
     return 1
-
-def _print_profiles() -> int:
-    from dflash_mlx.runtime.profiles import format_profiles
-
-    print(format_profiles())
-    return 0
 
 def _print_models() -> int:
     from dflash_mlx.runtime.registry import DRAFT_REGISTRY

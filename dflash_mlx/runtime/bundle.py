@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from dflash_mlx.draft_backend import DraftBackend, make_draft_backend
+from dflash_mlx.draft_backend import DraftBackend, EagerDraftBackend
 from dflash_mlx.engine.target_ops import TargetOps, bind_draft_to_target
 from dflash_mlx.runtime import VerifyConfig
 from dflash_mlx.runtime.loading import (
@@ -102,7 +102,7 @@ def load_runtime_bundle(
         if effective_draft_quant is not None
         else "none"
     )
-    draft_backend = make_draft_backend()
+    draft_backend = EagerDraftBackend()
     bind_draft_to_target(draft_model, target_model, target_ops=target_ops)
     return RuntimeBundle(
         target_model=target_model,

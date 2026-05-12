@@ -18,7 +18,6 @@ from dflash_mlx.cache.fingerprints import DFlashPrefixKey
 from dflash_mlx.cache.prefix_l2 import (
     DFlashPrefixL2Cache,
     _format_filename,
-    _token_hash,
 )
 from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
 
@@ -116,7 +115,9 @@ def bench_size(target_mb: int) -> dict:
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_dir, max_bytes=10 * 1024 * 1024 * 1024)
         try:
 
-            insert_ms, _ = time_block("insert_async", lambda: l2.insert_async(snap))
+            t_insert = time.perf_counter()
+            l2.insert_async(snap)
+            insert_ms = (time.perf_counter() - t_insert) * 1000
             rss_post_insert = rss_mb()
             mlx_post_insert = mlx_active_mb()
 

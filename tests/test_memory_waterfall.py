@@ -262,7 +262,6 @@ def test_darwin_task_vm_info_bytes_parses_footprint_ledgers(monkeypatch):
     assert payload["device"] == 3_000_000_000
     assert payload["internal"] == 1_000_000_000
     assert payload["compressed"] == 500_000_000
-    assert memory_obs.darwin_phys_footprint_bytes() == 5_000_000_000
 
 
 def test_mlx_memory_bytes_fallbacks_and_contract_errors(monkeypatch):

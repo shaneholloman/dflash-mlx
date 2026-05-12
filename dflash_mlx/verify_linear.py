@@ -274,30 +274,3 @@ def install_verify_linears(
     leaves = tree_map_with_path(_maybe_swap, leaves, is_leaf=nn.Module.is_module)
     model.update_modules(leaves)
     return count
-
-def uninstall_verify_linears(model: nn.Module) -> int:
-    count = 0
-
-    def _maybe_unswap(path, m):
-        nonlocal count
-        if isinstance(m, VerifyQuantizedLinear):
-            ql = nn.QuantizedLinear.__new__(nn.QuantizedLinear)
-            nn.Module.__init__(ql)
-            ql.group_size = m.group_size
-            ql.bits = m.bits
-            ql.mode = m.mode
-            ql.weight = m.weight
-            ql.scales = m.scales
-            if getattr(m, "biases", None) is not None:
-                ql.biases = m.biases
-            if "bias" in m:
-                ql.bias = m.bias
-            ql.freeze()
-            count += 1
-            return ql
-        return m
-
-    leaves = model.leaf_modules()
-    leaves = tree_map_with_path(_maybe_unswap, leaves, is_leaf=nn.Module.is_module)
-    model.update_modules(leaves)
-    return count

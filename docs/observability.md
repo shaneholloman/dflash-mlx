@@ -92,8 +92,7 @@ runtime config.
 : The resolved server invocation and diagnostics mode.
 
 `effective_config.json`
-: Runtime/profile/cache/verify settings after CLI/env/profile/default
-resolution.
+: Runtime/cache/verify settings after CLI/env/default resolution.
 
 `cache_events.jsonl`
 : Prefix-cache lookup, hit/miss, prune, eviction, and snapshot events.
@@ -142,7 +141,7 @@ For performance claims:
 - diagnostics should be `off` unless the claim is specifically about
   diagnostics;
 - full cycle tracing should not be used;
-- record the exact command, model refs, profile, prompt-token count, and output
+- record the exact command, model refs, runtime flags, prompt-token count, and output
   directory;
 - prefer `dflash benchmark` for public baseline-vs-DFlash numbers.
 

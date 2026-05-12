@@ -22,7 +22,7 @@ from dflash_mlx.server import request_loop as request_loop_mod
 from dflash_mlx.server import runtime as server_runtime_mod
 from dflash_mlx.server.metrics import (
     get_live_metrics_payload,
-    reset_live_metrics_for_tests,
+    _reset_live_metrics_state,
     start_live_request,
 )
 from dflash_mlx.server.request_loop import consume_dflash_events
@@ -120,7 +120,7 @@ def test_consume_dflash_events_streams_pending_token_and_summary():
 
 
 def test_consume_dflash_events_updates_live_metrics_from_engine_events(monkeypatch):
-    reset_live_metrics_for_tests()
+    _reset_live_metrics_state()
     monkeypatch.setattr(metrics_mod, "current_runtime_cache_manager", lambda: None)
     start_live_request(
         request_id=15,
@@ -266,7 +266,7 @@ def test_consume_dflash_events_rejects_stale_dict_events():
 
 
 def test_server_runtime_routes_tool_chat_generation_snapshot_policy(monkeypatch):
-    reset_live_metrics_for_tests()
+    _reset_live_metrics_state()
     monkeypatch.setattr(metrics_mod, "current_runtime_cache_manager", lambda: None)
     captured = {}
     runtime_context = SimpleNamespace(

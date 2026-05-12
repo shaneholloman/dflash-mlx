@@ -408,7 +408,7 @@ def _print_startup_banner(
         waterfall_enabled = bool(getattr(diagnostics_config, "memory_waterfall", False))
         raw_lines.extend(
             [
-                f"Profile:      {runtime_config.profile}",
+                "Runtime:      default",
                 f"Prefill step: {runtime_config.prefill_step_size}",
                 (
                     "Draft cache:  "

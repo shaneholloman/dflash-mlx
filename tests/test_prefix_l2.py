@@ -123,6 +123,11 @@ def _wait_writes(l2: DFlashPrefixL2Cache, expected: int, timeout_s: float = 5.0)
         f"L2 writer did not catch up: writes={l2.stats()['writes']} expected>={expected}"
     )
 
+def _insert_l2_sync(l2: DFlashPrefixL2Cache, snap) -> None:
+    expected = l2.stats()["writes"] + 1
+    assert l2.insert_async(snap) is True
+    _wait_writes(l2, expected=expected)
+
 class TestBfloat16RoundTrip:
     def test_bf16_arrays_preserved_through_save_load(self, tmp_path):
         from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
@@ -148,7 +153,7 @@ class TestBfloat16RoundTrip:
         )
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
-            l2._write_one(snap)
+            _insert_l2_sync(l2, snap)
             loaded = l2.lookup(tuple(range(seq)), snap.key)
             assert loaded is not None
             assert loaded.fa_states[0][0].dtype == mx.bfloat16
@@ -218,7 +223,7 @@ class TestSerializationRoundTrip:
         )
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
-            l2._write_one(snap)
+            _insert_l2_sync(l2, snap)
             loaded = l2.lookup(tuple(range(7)), snap.key)
             assert loaded is not None
             hydrated = hydrate_target_cache(
@@ -319,7 +324,7 @@ class TestL2Lifecycle:
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
             key = _make_key()
-            l2._write_one(_make_synthetic_snapshot([7, 8, 9, 10], key))
+            _insert_l2_sync(l2, _make_synthetic_snapshot([7, 8, 9, 10], key))
             cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
             matched, hydrated = cache.lookup([7, 8, 9, 10], key)
             assert matched == 4
@@ -335,7 +340,7 @@ class TestL2Lifecycle:
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
             key = _make_key()
-            l2._write_one(_make_synthetic_snapshot([7, 8, 9, 10], key))
+            _insert_l2_sync(l2, _make_synthetic_snapshot([7, 8, 9, 10], key))
             cache = PrefixSnapshotStore(
                 l1=DFlashPrefixCache(
                     max_entries=4,
@@ -364,7 +369,7 @@ class TestL2Lifecycle:
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
             key = _make_key()
-            l2._write_one(_make_synthetic_snapshot([7, 8, 9, 10], key))
+            _insert_l2_sync(l2, _make_synthetic_snapshot([7, 8, 9, 10], key))
             cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
 
             matched, hydrated = cache.lookup([7, 8, 9, 10, 11], key)
@@ -390,7 +395,7 @@ class TestL2Lifecycle:
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
             key = _make_key()
-            l2._write_one(_make_synthetic_snapshot([1, 2, 3, 4, 5], key))
+            _insert_l2_sync(l2, _make_synthetic_snapshot([1, 2, 3, 4, 5], key))
             cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
             cache.insert(_make_synthetic_snapshot([1, 2, 3], key))
 
@@ -410,7 +415,7 @@ class TestL2Lifecycle:
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
             key = _make_key()
-            l2._write_one(_make_synthetic_snapshot([1, 2, 3], key))
+            _insert_l2_sync(l2, _make_synthetic_snapshot([1, 2, 3], key))
             cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
             cache.insert(_make_synthetic_snapshot([1, 2, 3, 4], key))
 
@@ -431,7 +436,7 @@ class TestL2Lifecycle:
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
             key = _make_key()
-            l2._write_one(_make_synthetic_snapshot([1, 2, 3], key))
+            _insert_l2_sync(l2, _make_synthetic_snapshot([1, 2, 3], key))
             cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
             cache.insert(_make_synthetic_snapshot([1, 2, 3, 4], key))
 
@@ -490,7 +495,7 @@ class TestL2Lifecycle:
         try:
             trace_dir = tmp_path / "trace"
             key = _make_key()
-            l2._write_one(_make_synthetic_snapshot([7, 8, 9, 10], key))
+            _insert_l2_sync(l2, _make_synthetic_snapshot([7, 8, 9, 10], key))
             cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
             cache.set_trace_config(TraceConfig(log_dir=trace_dir))
 
@@ -512,7 +517,7 @@ class TestL2Lifecycle:
         try:
             key_a = _make_key(target_model_id="model-a")
             key_b = _make_key(target_model_id="model-b")
-            l2._write_one(_make_synthetic_snapshot([1, 2, 3], key_a))
+            _insert_l2_sync(l2, _make_synthetic_snapshot([1, 2, 3], key_a))
             cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
             matched, hydrated = cache.lookup([1, 2, 3], key_b)
             assert matched == 0
@@ -527,7 +532,7 @@ class TestL2Lifecycle:
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
             key = _make_key()
-            l2._write_one(_make_synthetic_snapshot([1, 2, 3, 4, 5], key))
+            _insert_l2_sync(l2, _make_synthetic_snapshot([1, 2, 3, 4, 5], key))
             cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
             matched, hydrated = cache.lookup([1, 2, 99, 4, 5], key)
             assert matched == 0
@@ -540,7 +545,7 @@ class TestL2Lifecycle:
         try:
             key = _make_key()
             for n in range(1, 33):
-                l2._write_one(_make_synthetic_snapshot([9000 + n] * n, key))
+                _insert_l2_sync(l2, _make_synthetic_snapshot([9000 + n] * n, key))
 
             assert l2.lookup(tuple([-1] * 33), key) is None
 
@@ -557,7 +562,7 @@ class TestL2Lifecycle:
             snap = _make_synthetic_snapshot([1, 2, 3], key)
             snap.kind = "generation"
             snap.last_logits = None
-            l2._write_one(snap)
+            _insert_l2_sync(l2, snap)
             res = l2.lookup((1, 2, 3), key)
             assert res is None
             assert l2.stats()["lookup_loads"] == 0
@@ -571,7 +576,7 @@ class TestL2Lifecycle:
             snap = _make_synthetic_snapshot([1, 2, 3], key)
             snap.kind = "generation"
             snap.last_logits = None
-            l2._write_one(snap)
+            _insert_l2_sync(l2, snap)
 
             res = l2.lookup((1, 2, 3, 4, 5), key)
             assert res is not None
@@ -605,43 +610,41 @@ class TestFailureModes:
         finally:
             l2.shutdown()
 
-    @pytest.mark.parametrize(
-        "field,value",
-        [
+    def test_metadata_version_mismatch_rejected(self, tmp_path):
+        cases = [
             ("schema_version", L2_SCHEMA_VERSION + 99),
             ("runtime_version", "0.0.0-not-a-real-version"),
-        ],
-    )
-    def test_metadata_version_mismatch_rejected(self, tmp_path, field, value):
-        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
-        try:
-            key = _make_key()
-            snap = _make_synthetic_snapshot([1, 2], key)
-            arrays, meta_dict = _serialize(snap)
-            tampered = json.loads(meta_dict["dflash_meta"])
-            tampered[field] = value
-            meta_dict["dflash_meta"] = json.dumps(tampered)
-            bucket = _bucket_dir(tmp_path, key)
-            bucket.mkdir(parents=True, exist_ok=True)
-            stale = bucket / _format_filename(
-                token_len=2,
-                token_hash=_token_hash([1, 2]),
-                kind="prefill",
-                fp_short="0" * 16,
-            )
-            mx.save_safetensors(str(stale), arrays, metadata=meta_dict)
-            cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
-            matched, _ = cache.lookup([1, 2], key)
-            assert matched == 0
-            assert not stale.exists()
-            stats = l2.stats()
-            assert stats["schema_rejects"] >= 1
-        finally:
-            l2.shutdown()
+        ]
+        for index, (field, value) in enumerate(cases):
+            cache_dir = tmp_path / f"case-{index}"
+            l2 = DFlashPrefixL2Cache(cache_dir=cache_dir, max_bytes=10**9)
+            try:
+                key = _make_key()
+                snap = _make_synthetic_snapshot([1, 2], key)
+                arrays, meta_dict = _serialize(snap)
+                tampered = json.loads(meta_dict["dflash_meta"])
+                tampered[field] = value
+                meta_dict["dflash_meta"] = json.dumps(tampered)
+                bucket = _bucket_dir(cache_dir, key)
+                bucket.mkdir(parents=True, exist_ok=True)
+                stale = bucket / _format_filename(
+                    token_len=2,
+                    token_hash=_token_hash([1, 2]),
+                    kind="prefill",
+                    fp_short="0" * 16,
+                )
+                mx.save_safetensors(str(stale), arrays, metadata=meta_dict)
+                cache = _store(max_entries=4, max_bytes=10**9, l2=l2)
+                matched, _ = cache.lookup([1, 2], key)
+                assert matched == 0
+                assert not stale.exists()
+                stats = l2.stats()
+                assert stats["schema_rejects"] >= 1
+            finally:
+                l2.shutdown()
 
-    @pytest.mark.parametrize(
-        "tamper",
-        [
+    def test_malformed_metadata_rejected(self, tmp_path):
+        cases = [
             _set_metadata_field("schema_version", "bad-int"),
             _set_metadata_field("schema_version", "1"),
             _set_metadata_field("schema_version", 1.0),
@@ -664,26 +667,26 @@ class TestFailureModes:
             _delete_key_metadata_field("prompt_policy_hash"),
             _set_key_metadata_field("target_fa_window", False),
             _set_key_metadata_field("format_version", True),
-        ],
-    )
-    def test_malformed_metadata_rejected(self, tmp_path, tamper):
-        l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
-        try:
-            key = _make_key()
-            bad = _write_tampered_snapshot_file(
-                tmp_path,
-                key,
-                [1, 2],
-                tamper,
-            )
+        ]
+        for index, tamper in enumerate(cases):
+            cache_dir = tmp_path / f"case-{index}"
+            l2 = DFlashPrefixL2Cache(cache_dir=cache_dir, max_bytes=10**9)
+            try:
+                key = _make_key()
+                bad = _write_tampered_snapshot_file(
+                    cache_dir,
+                    key,
+                    [1, 2],
+                    tamper,
+                )
 
-            res = l2.lookup((1, 2), key)
+                res = l2.lookup((1, 2), key)
 
-            assert res is None
-            assert not bad.exists()
-            assert l2.stats()["schema_rejects"] >= 1
-        finally:
-            l2.shutdown()
+                assert res is None
+                assert not bad.exists()
+                assert l2.stats()["schema_rejects"] >= 1
+            finally:
+                l2.shutdown()
 
     def test_snapshot_serialization_bug_propagates(self, tmp_path, monkeypatch):
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
@@ -699,8 +702,6 @@ class TestFailureModes:
             assert l2._writer_slots.acquire(blocking=False)
             l2._writer_slots.release()
 
-            with pytest.raises(TypeError, match="broken serializer"):
-                l2._write_one(snap)
         finally:
             l2.shutdown()
 
@@ -759,7 +760,7 @@ class TestEvictionAndStats:
     def test_byte_budget_evicts_oldest(self, tmp_path):
         probe_l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
-            probe_l2._write_one(_make_synthetic_snapshot([0, 0, 0], _make_key()))
+            _insert_l2_sync(probe_l2, _make_synthetic_snapshot([0, 0, 0], _make_key()))
             probe_files = _all_snapshot_files(tmp_path)
             on_disk = probe_files[0].stat().st_size
         finally:
@@ -771,7 +772,7 @@ class TestEvictionAndStats:
         try:
             for i in range(4):
                 tokens = list(range(i * 10 + 1, i * 10 + 4))
-                l2._write_one(_make_synthetic_snapshot(tokens, _make_key()))
+                _insert_l2_sync(l2, _make_synthetic_snapshot(tokens, _make_key()))
             files = _all_snapshot_files(tmp_path)
             assert len(files) <= 2
             stats = l2.stats()
@@ -793,7 +794,7 @@ class TestEvictionAndStats:
             )
             external.write_bytes(b"x" * 5000)
 
-            l2._write_one(_make_synthetic_snapshot([3, 4, 5], key))
+            _insert_l2_sync(l2, _make_synthetic_snapshot([3, 4, 5], key))
 
             on_disk = sum(p.stat().st_size for p in _all_snapshot_files(tmp_path))
             stats = l2.stats()
@@ -835,7 +836,7 @@ class TestAtomicity:
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
             key = _make_key()
-            l2._write_one(_make_synthetic_snapshot([1, 2, 3], key))
+            _insert_l2_sync(l2, _make_synthetic_snapshot([1, 2, 3], key))
             tmp_files = list((tmp_path / L2_LAYOUT_ROOT).rglob("*.tmp.safetensors"))
             assert tmp_files == []
             assert len(_all_snapshot_files(tmp_path)) == 1
@@ -852,7 +853,7 @@ class TestConcurrency:
                 assert not second.writable
                 assert second._writer_thread is None
                 key = _make_key()
-                first._write_one(_make_synthetic_snapshot([1, 2, 3], key))
+                _insert_l2_sync(first, _make_synthetic_snapshot([1, 2, 3], key))
                 snap = second.lookup((1, 2, 3), key)
                 assert snap is not None
                 assert snap.token_ids == (1, 2, 3)
@@ -920,7 +921,7 @@ class TestLookupHotPath:
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
             key = _make_key()
-            l2._write_one(_make_synthetic_snapshot([5, 6, 7, 8], key))
+            _insert_l2_sync(l2, _make_synthetic_snapshot([5, 6, 7, 8], key))
             bucket = _bucket_dir(tmp_path, key)
             import secrets
             for _ in range(50):
@@ -981,11 +982,11 @@ class TestEpochInvalidation:
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
             key = _make_key()
-            l2._write_one(_make_synthetic_snapshot([1, 2, 3], key))
+            _insert_l2_sync(l2, _make_synthetic_snapshot([1, 2, 3], key))
             assert len(_all_snapshot_files(tmp_path)) == 1
             l2.clear()
             assert _all_snapshot_files(tmp_path) == []
-            l2._write_one(_make_synthetic_snapshot([7, 8, 9], key))
+            _insert_l2_sync(l2, _make_synthetic_snapshot([7, 8, 9], key))
             assert len(_all_snapshot_files(tmp_path)) == 1
         finally:
             l2.shutdown()
@@ -1040,7 +1041,7 @@ class TestQueueBackpressure:
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
             snap = _make_synthetic_snapshot([1, 2, 3], _make_key())
-            l2._write_one(snap)
+            _insert_l2_sync(l2, snap)
             before_files = set(_all_snapshot_files(tmp_path))
 
             def _fail_serialize(_snapshot):
@@ -1058,8 +1059,8 @@ class TestStatsHotPath:
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
             key = _make_key()
-            l2._write_one(_make_synthetic_snapshot([1, 2, 3], key))
-            l2._write_one(_make_synthetic_snapshot([4, 5, 6], key))
+            _insert_l2_sync(l2, _make_synthetic_snapshot([1, 2, 3], key))
+            _insert_l2_sync(l2, _make_synthetic_snapshot([4, 5, 6], key))
 
             calls = {"n": 0}
             real_walk = l2._walk_snapshots
@@ -1090,7 +1091,7 @@ class TestStatsHotPath:
 
             l2._snapshot_disk_bytes = _fail_snapshot_disk_bytes
 
-            l2._write_one(_make_synthetic_snapshot([1, 2, 3], _make_key()))
+            _insert_l2_sync(l2, _make_synthetic_snapshot([1, 2, 3], _make_key()))
 
             assert l2.stats()["evictions"] >= 1
             assert calls["n"] == 0
@@ -1101,9 +1102,9 @@ class TestStatsHotPath:
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
             key = _make_key()
-            l2._write_one(_make_synthetic_snapshot([1, 2, 3], key))
-            l2._write_one(_make_synthetic_snapshot([4, 5, 6], key))
-            l2._write_one(_make_synthetic_snapshot([7, 8, 9], key))
+            _insert_l2_sync(l2, _make_synthetic_snapshot([1, 2, 3], key))
+            _insert_l2_sync(l2, _make_synthetic_snapshot([4, 5, 6], key))
+            _insert_l2_sync(l2, _make_synthetic_snapshot([7, 8, 9], key))
             on_disk = sum(p.stat().st_size for p in _all_snapshot_files(tmp_path))
             assert l2.stats()["current_bytes"] == on_disk
             l2.clear()
@@ -1115,8 +1116,8 @@ class TestStatsHotPath:
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
             key = _make_key()
-            l2._write_one(_make_synthetic_snapshot([1, 2, 3], key))
-            l2._write_one(_make_synthetic_snapshot([4, 5, 6], key))
+            _insert_l2_sync(l2, _make_synthetic_snapshot([1, 2, 3], key))
+            _insert_l2_sync(l2, _make_synthetic_snapshot([4, 5, 6], key))
             before = l2.stats()["current_bytes"]
             assert before > 0
             assert len(_all_snapshot_files(tmp_path)) == 2
@@ -1144,7 +1145,7 @@ class TestStatsHotPath:
         l2 = DFlashPrefixL2Cache(cache_dir=tmp_path, max_bytes=10**9)
         try:
             key = _make_key()
-            l2._write_one(_make_synthetic_snapshot([1, 2, 3], key))
+            _insert_l2_sync(l2, _make_synthetic_snapshot([1, 2, 3], key))
             initial = l2.stats()["current_bytes"]
             assert initial > 0
             assert initial == sum(p.stat().st_size for p in _all_snapshot_files(tmp_path))

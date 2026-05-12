@@ -92,23 +92,6 @@ def _build_target_hidden_chunks(
         total_len,
     )
 
-def target_cache_is_serializable(
-    target_cache: list[Any],
-    *,
-    allow_rotating: bool = False,
-) -> bool:
-    for entry in target_cache:
-        if isinstance(entry, RecurrentRollbackCache):
-            continue
-        if isinstance(entry, RotatingKVCache):
-            if allow_rotating:
-                continue
-            return False
-        if isinstance(entry, KVCache):
-            continue
-        return False
-    return True
-
 def serialize_target_cache(
     target_cache: list[Any],
 ) -> tuple[

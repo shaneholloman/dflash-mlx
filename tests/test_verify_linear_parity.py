@@ -8,7 +8,6 @@ import os
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 import pytest
 
 os.environ.setdefault("DFLASH_VERIFY_QMM", "1")
@@ -60,7 +59,7 @@ def test_parity_verify_M16(small_ql):
     mx.eval(y_direct, y_verify)
     assert mx.allclose(y_direct, y_verify, atol=0, rtol=0).item()
 
-def test_swap_and_unswap(small_ql):
+def test_install_verify_linears_swaps_eligible_modules(small_ql):
     class Tiny(nn.Module):
         def __init__(self):
             super().__init__()
@@ -72,7 +71,6 @@ def test_swap_and_unswap(small_ql):
                 _mk_linear(512, 150_000), group_size=64, bits=4)
 
     m = Tiny()
-    from dflash_mlx.verify_linear import uninstall_verify_linears
     n = install_verify_linears(m)
     assert n == 2, f"expected 2 swaps, got {n}"
     assert isinstance(m.proj_a, VerifyQuantizedLinear)
@@ -81,8 +79,6 @@ def test_swap_and_unswap(small_ql):
 
     x = mx.random.normal((16, 512)).astype(mx.bfloat16) * 0.5
     y = m.proj_a(x); mx.eval(y); assert y.shape == (16, 1024)
-    n2 = uninstall_verify_linears(m)
-    assert n2 == 2
 
 def _mk_linear(in_dims, out_dims):
     lin = nn.Linear(in_dims, out_dims, bias=False)

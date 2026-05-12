@@ -12,7 +12,7 @@ the serving baseline.
 
 `dflash serve`
 : OpenAI-compatible server. It loads the target, resolves a supported DFlash
-draft, applies the runtime profile, and serves requests through `mlx_lm.server`
+draft, applies the runtime config, and serves requests through `mlx_lm.server`
 with a DFlash request path for supported requests.
 
 `dflash generate`
@@ -25,11 +25,8 @@ first, runs DFlash second with the same token ids, and writes self-contained
 artifacts.
 
 `dflash doctor`
-: Local environment and config check. It resolves the same runtime profile and
+: Local environment and config check. It resolves the same runtime config and
 can optionally load a model.
-
-`dflash profiles`
-: Prints the runtime presets.
 
 `dflash models`
 : Prints the currently registered target-to-draft mappings.
@@ -78,29 +75,22 @@ The runtime config is resolved once at startup into `RuntimeContext`.
 For server/doctor config:
 
 1. explicit CLI flags win;
-2. startup env vars win over profiles;
-3. profile values win over product defaults.
+2. startup env vars win;
+3. product defaults fill the rest.
 
 After resolution, engine code consumes typed config instead of rereading product
 env vars. A small set of `DFLASH_VERIFY_*` env vars remains internal kernel-debug
 surface only.
 
-The main runtime presets are:
-
-| Profile | Intent |
-| --- | --- |
-| `balanced` | default for normal coding sessions |
-| `fast` | larger prefill chunks and larger L1 budget |
-| `low-memory` | smaller prefill chunks and smaller L1 budget |
-| `long-session` | larger L1 plus SSD L2 for revisited prefixes |
-
-Use `dflash profiles` for the exact active numbers.
+`dflash serve` has one product default policy. Expert behavior is expressed with
+explicit flags such as `--prefill-step-size`, `--no-prefix-cache-l2`, and
+`--cache-limit auto`.
 
 ## Server Request Flow
 
 The server wraps `mlx_lm.server` rather than replacing it.
 
-1. `dflash_mlx.server.config` parses CLI flags, resolves profiles, diagnostics,
+1. `dflash_mlx.server.config` parses CLI flags, resolves runtime config, diagnostics,
    and Metal limits.
 2. `dflash_mlx.server.runtime.ServerRuntime` owns the server lifecycle, live
    metrics setup, DFlash request orchestration, and shutdown.
@@ -243,10 +233,8 @@ Runtime/config:
   target optimization;
 - `dflash_mlx/runtime/bundle.py` - shared target/draft/TargetOps/draft-backend
   binding;
-- `dflash_mlx/runtime/config.py` - `RuntimeConfigSpec`, runtime profiles,
-  resolver, validation, source reporting, docs tables, and offline command
-  projections;
-- `dflash_mlx/runtime/profiles.py` - `dflash profiles` display formatting;
+- `dflash_mlx/runtime/config.py` - `RuntimeConfigSpec`, product defaults,
+  resolver, validation, source reporting, and offline command projections;
 - `dflash_mlx/runtime/context.py` - typed runtime context carrier;
 - `dflash_mlx/diagnostics.py` - diagnostics config;
 - `dflash_mlx/metal_limits.py` - MLX wired/cache limit application;

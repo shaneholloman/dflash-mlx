@@ -179,9 +179,6 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                    help="Subprocess wall timeout (default: 1800).")
     p.add_argument("--client-bin", default=None,
                    help="Path to the CLI binary (default: which(<client>)).")
-    p.add_argument("--append-status", action="store_true",
-                   help="Append the run's STATUS snippet to ./STATUS.md.")
-
     g_oc = p.add_argument_group("opencode-specific")
     g_oc.add_argument("--opencode-thinking", action=argparse.BooleanOptionalAction, default=True,
                       help="Pass opencode --thinking. Default: on.")
@@ -305,9 +302,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     snippet = _status_snippet(summary)
     (run_dir / "STATUS_SNIPPET.md").write_text(snippet)
-    if args.append_status:
-        with Path("STATUS.md").open("a") as f:
-            f.write("\n" + snippet)
 
     print(f"Run directory: {run_dir}")
     print(f"Exit code    : {proc.returncode}")

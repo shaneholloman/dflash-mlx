@@ -14,7 +14,6 @@ from dflash_mlx.runtime.config import EffectiveRuntimeConfig
 from dflash_mlx.server.config import build_parser as build_server_parser
 
 _DOCTOR_ENV_KEYS = (
-    "DFLASH_RUNTIME_PROFILE",
     "DFLASH_PREFILL_STEP_SIZE",
     "DFLASH_DRAFT_SINK_SIZE",
     "DFLASH_DRAFT_WINDOW_SIZE",
@@ -59,8 +58,8 @@ def test_doctor_json_stable(monkeypatch, capsys):
         "python",
         "summary",
     }
-    assert report["effective_config"]["values"]["profile"] == "balanced"
-    assert report["effective_config"]["sources"]["profile"] == "default"
+    assert report["effective_config"]["values"]["prefill_step_size"] == 2048
+    assert report["effective_config"]["sources"]["prefill_step_size"] == "default"
 
 def test_doctor_does_not_expose_internal_diagnostics_aliases():
     parser = doctor.build_parser()
@@ -73,9 +72,7 @@ def test_doctor_does_not_expose_internal_diagnostics_aliases():
 
 
 def test_doctor_and_serve_share_runtime_config_flags():
-    runtime_dests = set(EffectiveRuntimeConfig.__dataclass_fields__) | {
-        "list_profiles",
-    }
+    runtime_dests = set(EffectiveRuntimeConfig.__dataclass_fields__)
 
     def runtime_actions(parser):
         return {
@@ -95,11 +92,11 @@ def test_doctor_invalid_bool_env_is_fatal(monkeypatch, capsys):
 
     assert code == 1
     assert report["effective_config"]["resolved"] is False
-    profile_check = next(
-        check for check in report["checks"] if check["name"] == "profile_resolver"
+    config_check = next(
+        check for check in report["checks"] if check["name"] == "runtime_config"
     )
-    assert profile_check["status"] == "fatal"
-    assert "DFLASH_PREFIX_CACHE" in profile_check["details"]["error"]
+    assert config_check["status"] == "fatal"
+    assert "DFLASH_PREFIX_CACHE" in config_check["details"]["error"]
 
 
 def test_doctor_model_draft_resolution(monkeypatch, capsys):
@@ -215,12 +212,10 @@ def test_doctor_strict_promotes_warnings(monkeypatch, capsys):
     assert code == 1
     assert report["summary"]["warnings"] >= 1
 
-def test_doctor_profile_precedence(monkeypatch, capsys):
+def test_doctor_runtime_flag_precedence(monkeypatch, capsys):
     _clear_doctor_env(monkeypatch)
     monkeypatch.setenv("DFLASH_PREFILL_STEP_SIZE", "2048")
-    code, report = _json_run(
-        ["--profile", "fast", "--prefill-step-size", "1024"], capsys
-    )
+    code, report = _json_run(["--prefill-step-size", "1024"], capsys)
     assert code in (0, 2)
     assert report["effective_config"]["values"]["prefill_step_size"] == 1024
     assert report["effective_config"]["sources"]["prefill_step_size"] == "cli"

@@ -18,7 +18,6 @@ import signal
 import socket
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import urllib.error
@@ -137,8 +136,19 @@ def _verify_ready_model(url: str, expected_model: str) -> None:
 
 def _validate_l2_flags(args) -> None:
     has_l2_options = args.prefix_cache_l2_dir is not None or args.prefix_cache_l2_max_bytes is not None
-    if has_l2_options and not bool(args.prefix_cache_l2):
-        raise SystemExit("--prefix-cache-l2-dir/--prefix-cache-l2-max-bytes require --prefix-cache-l2")
+    if has_l2_options and args.prefix_cache_l2 is False:
+        raise SystemExit("--prefix-cache-l2-dir/--prefix-cache-l2-max-bytes conflict with --no-prefix-cache-l2")
+
+def _append_dflash_cache_flags(server_cmd: list[str], args) -> None:
+    if args.prefix_cache is not None:
+        server_cmd.append("--prefix-cache" if args.prefix_cache else "--no-prefix-cache")
+    if args.prefix_cache_l2 is not None:
+        server_cmd.append("--prefix-cache-l2" if args.prefix_cache_l2 else "--no-prefix-cache-l2")
+    if args.prefix_cache_l2_dir is not None:
+        Path(args.prefix_cache_l2_dir).mkdir(parents=True, exist_ok=True)
+        server_cmd.extend(["--prefix-cache-l2-dir", str(args.prefix_cache_l2_dir)])
+    if args.prefix_cache_l2_max_bytes is not None:
+        server_cmd.extend(["--prefix-cache-l2-max-bytes", str(int(args.prefix_cache_l2_max_bytes))])
 
 def _patch_opencode_config(target: str, proxy_port: int) -> dict[str, Any]:
     raw = OPENCODE_CONFIG.read_text()
@@ -685,36 +695,6 @@ def _apply_dflash_stderr_totals(totals: dict[str, Any], server_stderr_text: str)
     if prefill_saved:
         totals["prefill_tokens_saved_cumulative"] = max(prefill_saved)
 
-def attach_dflash_metrics_to_posts(events: list[dict[str, Any]], n_posts: int) -> list[dict[str, Any]]:
-    buckets: list[dict[str, Any]] = []
-    pending: dict[str, Any] = {"hit": None, "stats": None, "all": []}
-    for ev in events:
-        pending["all"].append(ev)
-        if ev["kind"] == "hit":
-            pending["hit"] = ev
-        elif ev["kind"] == "stats":
-            pending["stats"] = ev
-        elif ev["kind"] == "tps":
-            buckets.append({
-                "tps": ev["tps"],
-                "accept": ev["accept"],
-                "tokens": ev["tokens"],
-                "wall_s": ev["wall_s"],
-                "prompt_tokens": ev["prompt_tokens"],
-                "cache_hit_tokens": pending["hit"]["hit"] if pending["hit"] else None,
-                "stable_prefix": pending["hit"]["stable"] if pending["hit"] else None,
-                "prefill_tokens_saved_cumulative": pending["stats"]["prefill_tokens_saved"] if pending["stats"] else None,
-            })
-            pending = {"hit": None, "stats": None, "all": []}
-
-    merged: list[dict[str, Any]] = []
-    for b in buckets:
-        if merged and merged[-1]["prompt_tokens"] == b["prompt_tokens"] and b["tokens"] >= merged[-1]["tokens"]:
-            merged[-1] = b
-        else:
-            merged.append(b)
-    return merged
-
 def _delta_text(delta: dict[str, Any]) -> str:
     if not isinstance(delta, dict):
         return ""
@@ -756,7 +736,6 @@ def derive_post_landmarks(sse_path: Path) -> dict[str, Any]:
         "end_t_ms": None,
         "tool_calls": [],
     }
-    accumulated_tool_call_args: list[str] = []
     tool_call_indices = set()
     in_think = False
 
@@ -1047,8 +1026,6 @@ def _build_server_cmd(args) -> tuple[list[str], int, str]:
             cmd.extend(["--wired-limit", args.wired_limit])
         if args.cache_limit:
             cmd.extend(["--cache-limit", args.cache_limit])
-        if args.profile:
-            cmd.extend(["--profile", args.profile])
         if args.prefill_step_size is not None:
             cmd.extend(["--prefill-step-size", str(int(args.prefill_step_size))])
         if args.draft_sink_size is not None:
@@ -1515,7 +1492,6 @@ def replay_main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--draft-quant", default=None)
     p.add_argument("--wired-limit", default=None, help="dflash only: forward --wired-limit to serve.")
     p.add_argument("--cache-limit", default=None, help="dflash only: forward --cache-limit to serve.")
-    p.add_argument("--profile", default=None)
     p.add_argument("--prefill-step-size", type=int, default=None)
     p.add_argument("--draft-sink-size", type=int, default=None)
     p.add_argument("--draft-window-size", type=int, default=None)
@@ -1545,7 +1521,6 @@ def replay_main(argv: Sequence[str] | None = None) -> int:
             "--draft-quant": args.draft_quant,
             "--wired-limit": args.wired_limit,
             "--cache-limit": args.cache_limit,
-            "--profile": args.profile,
             "--prefill-step-size": args.prefill_step_size,
             "--draft-sink-size": args.draft_sink_size,
             "--draft-window-size": args.draft_window_size,
@@ -1580,12 +1555,10 @@ def replay_main(argv: Sequence[str] | None = None) -> int:
     if args.backend == "dflash":
         _validate_l2_flags(args)
     if args.backend == "dflash":
-        args.prefix_cache = True if args.prefix_cache is None else bool(args.prefix_cache)
-        args.prefix_cache_l2 = False if args.prefix_cache_l2 is None else bool(args.prefix_cache_l2)
+        args.prefix_cache = None if args.prefix_cache is None else bool(args.prefix_cache)
+        args.prefix_cache_l2 = None if args.prefix_cache_l2 is None else bool(args.prefix_cache_l2)
         args.prefix_cache_l2_max_bytes = (
-            50 * 1024**3
-            if args.prefix_cache_l2_max_bytes is None
-            else int(args.prefix_cache_l2_max_bytes)
+            None if args.prefix_cache_l2_max_bytes is None else int(args.prefix_cache_l2_max_bytes)
         )
         args.diagnostics = "basic" if args.diagnostics is None else args.diagnostics
         args.fastpath_max_tokens = (
@@ -1618,36 +1591,7 @@ def replay_main(argv: Sequence[str] | None = None) -> int:
                     str(events_dir),
                 ]
             )
-        if args.prefix_cache:
-            server_cmd.extend(
-                [
-                    "--prefix-cache",
-                    "--prefix-cache-max-entries",
-                    "8",
-                    "--prefix-cache-max-bytes",
-                    "10737418240",
-                ]
-            )
-        else:
-            server_cmd.append("--no-prefix-cache")
-        if args.prefix_cache_l2:
-            l2_dir = (
-                Path(args.prefix_cache_l2_dir)
-                if args.prefix_cache_l2_dir
-                else run_dir / "l2_cache"
-            )
-            l2_dir.mkdir(parents=True, exist_ok=True)
-            server_cmd.extend(
-                [
-                    "--prefix-cache-l2",
-                    "--prefix-cache-l2-dir",
-                    str(l2_dir),
-                    "--prefix-cache-l2-max-bytes",
-                    str(int(args.prefix_cache_l2_max_bytes)),
-                ]
-            )
-        else:
-            server_cmd.append("--no-prefix-cache-l2")
+        _append_dflash_cache_flags(server_cmd, args)
 
     metadata = {
         "started_at": _iso_now(),
@@ -1682,7 +1626,6 @@ def replay_main(argv: Sequence[str] | None = None) -> int:
             "draft_quant": args.draft_quant,
             "wired_limit": args.wired_limit,
             "cache_limit": args.cache_limit,
-            "profile": args.profile,
             "prefill_step_size": args.prefill_step_size,
             "draft_sink_size": args.draft_sink_size,
             "draft_window_size": args.draft_window_size,
@@ -1922,11 +1865,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="dflash only: pass --cache-limit to dflash serve.",
     )
     p.add_argument(
-        "--profile",
-        default=None,
-        help="dflash only: pass --profile to dflash serve.",
-    )
-    p.add_argument(
         "--prefill-step-size",
         type=int,
         default=None,
@@ -1978,7 +1916,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--target-fa-window",
         type=int,
         default=None,
-        help="dflash only: pass --target-fa-window to dflash_mlx.serve",
+        help="dflash only: pass --target-fa-window to dflash serve.",
     )
     p.add_argument(
         "--chat-template-args",
@@ -2009,7 +1947,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--draft-quant": args.draft_quant,
             "--wired-limit": args.wired_limit,
             "--cache-limit": args.cache_limit,
-            "--profile": args.profile,
             "--prefill-step-size": args.prefill_step_size,
             "--draft-sink-size": args.draft_sink_size,
             "--draft-window-size": args.draft_window_size,
@@ -2043,12 +1980,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.backend == "dflash":
         _validate_l2_flags(args)
     if args.backend == "dflash":
-        args.prefix_cache = True if args.prefix_cache is None else bool(args.prefix_cache)
-        args.prefix_cache_l2 = False if args.prefix_cache_l2 is None else bool(args.prefix_cache_l2)
+        args.prefix_cache = None if args.prefix_cache is None else bool(args.prefix_cache)
+        args.prefix_cache_l2 = None if args.prefix_cache_l2 is None else bool(args.prefix_cache_l2)
         args.prefix_cache_l2_max_bytes = (
-            50 * 1024**3
-            if args.prefix_cache_l2_max_bytes is None
-            else int(args.prefix_cache_l2_max_bytes)
+            None if args.prefix_cache_l2_max_bytes is None else int(args.prefix_cache_l2_max_bytes)
         )
         args.diagnostics = "basic" if args.diagnostics is None else args.diagnostics
         args.fastpath_max_tokens = (
@@ -2100,28 +2035,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "--diagnostics-dir",
                 str(events_dir),
             ])
-        if args.prefix_cache:
-            server_cmd.extend([
-                "--prefix-cache",
-                "--prefix-cache-max-entries",
-                "8",
-                "--prefix-cache-max-bytes",
-                "10737418240",
-            ])
-        else:
-            server_cmd.append("--no-prefix-cache")
-        if args.prefix_cache_l2:
-            l2_dir = Path(args.prefix_cache_l2_dir) if args.prefix_cache_l2_dir else (run_dir / "l2_cache")
-            l2_dir.mkdir(parents=True, exist_ok=True)
-            server_cmd.extend([
-                "--prefix-cache-l2",
-                "--prefix-cache-l2-dir",
-                str(l2_dir),
-                "--prefix-cache-l2-max-bytes",
-                str(int(args.prefix_cache_l2_max_bytes)),
-            ])
-        else:
-            server_cmd.append("--no-prefix-cache-l2")
+        _append_dflash_cache_flags(server_cmd, args)
 
     (run_dir / "server" / "cmd.txt").write_text(shlex.join(server_cmd) + "\n")
     (run_dir / "proxy" / "cmd.txt").write_text(shlex.join(proxy_cmd) + "\n")
@@ -2168,7 +2082,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             "draft_quant": args.draft_quant,
             "wired_limit": args.wired_limit,
             "cache_limit": args.cache_limit,
-            "profile": args.profile,
             "prefill_step_size": args.prefill_step_size,
             "draft_sink_size": args.draft_sink_size,
             "draft_window_size": args.draft_window_size,
@@ -2288,7 +2201,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         (run_dir / "server" / "metrics.jsonl").write_text("")
 
     request_files = sorted((run_dir / "requests").glob("*.json"))
-    sse_files = sorted((run_dir / "sse").glob("*.jsonl"))
     prompt_transitions = summarize_prompt_transitions(request_files, cache_summary)
 
     posts: list[dict[str, Any]] = []

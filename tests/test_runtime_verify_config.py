@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import dflash_mlx.runtime.config as runtime_config
 from dflash_mlx.runtime import loading as runtime_loading
 from dflash_mlx.engine.config import (
     resolve_speculative_cycle_config,
@@ -24,9 +25,9 @@ from dflash_mlx.runtime.config import (
     add_offline_runtime_arguments,
     offline_runtime_error_message,
     offline_runtime_kwargs,
-    PROFILES,
+    runtime_config_from_defaults,
 )
-from dflash_mlx.runtime.context import build_offline_runtime_config, runtime_config_from_profile
+from dflash_mlx.runtime.context import build_offline_runtime_config
 
 def _large_dense_config() -> dict:
     return {
@@ -234,28 +235,27 @@ def test_target_capability_can_disable_verify_linear_before_parity(monkeypatch):
     assert meta["verify_linear_enabled"] is False
     assert calls == []
 
-def test_runtime_config_from_profile_uses_canonical_l2_default():
-    cfg = runtime_config_from_profile(profile="long-session")
+def test_runtime_config_from_defaults_uses_canonical_l2_default():
+    cfg = runtime_config_from_defaults()
 
     assert cfg.prefix_cache_l2 is True
     assert cfg.prefix_cache_l2_dir == os.path.expanduser("~/.cache/dflash/prefix_l2")
 
 
-def test_runtime_config_from_profile_ignores_runtime_env(monkeypatch):
+def test_runtime_config_from_defaults_ignores_runtime_env(monkeypatch):
     monkeypatch.setenv("DFLASH_PREFIX_CACHE_L2_DIR", "/tmp/dflash-other-l2")
 
-    cfg = runtime_config_from_profile(profile="long-session")
+    cfg = runtime_config_from_defaults()
 
     assert cfg.prefix_cache_l2_dir == os.path.expanduser("~/.cache/dflash/prefix_l2")
 
 
-def test_offline_runtime_config_uses_balanced_defaults_without_cache(monkeypatch):
+def test_offline_runtime_config_uses_default_runtime_without_cache(monkeypatch):
     monkeypatch.setenv("DFLASH_DRAFT_WINDOW_SIZE", "2048")
 
     cfg = build_offline_runtime_config(target_fa_window=0)
 
-    assert cfg.profile == "balanced"
-    assert cfg.prefill_step_size == 4096
+    assert cfg.prefill_step_size == 2048
     assert cfg.draft_sink_size == 64
     assert cfg.draft_window_size == 1024
     assert cfg.verify_len_cap == 0
@@ -277,6 +277,7 @@ def test_offline_runtime_arguments_project_from_shared_runtime_schema():
     )
 
     assert offline_runtime_kwargs(args, BENCHMARK_RUNTIME_FIELDS) == {
+        "prefill_step_size": 2048,
         "target_fa_window": 2048,
         "draft_sink_size": 64,
         "draft_window_size": 512,
@@ -285,11 +286,11 @@ def test_offline_runtime_arguments_project_from_shared_runtime_schema():
     assert not hasattr(args, "verify_mode")
 
 
-def test_offline_runtime_argument_defaults_follow_balanced_profile(monkeypatch, capsys):
-    monkeypatch.setitem(
-        PROFILES,
-        "balanced",
-        replace(PROFILES["balanced"], draft_window_size=1536),
+def test_offline_runtime_argument_defaults_follow_single_runtime_default(monkeypatch):
+    monkeypatch.setattr(
+        runtime_config,
+        "DEFAULT_RUNTIME_CONFIG",
+        replace(runtime_config.DEFAULT_RUNTIME_CONFIG, draft_window_size=1536),
     )
     parser = argparse.ArgumentParser()
     add_offline_runtime_arguments(parser, BENCHMARK_RUNTIME_FIELDS)
@@ -297,9 +298,6 @@ def test_offline_runtime_argument_defaults_follow_balanced_profile(monkeypatch, 
     args = parser.parse_args([])
 
     assert args.draft_window_size == 1536
-    with pytest.raises(SystemExit):
-        parser.parse_args(["--help"])
-    assert "1536." in capsys.readouterr().out
 
 
 def test_offline_runtime_error_message_removes_internal_field_labels():
@@ -484,7 +482,7 @@ def test_runtime_loader_records_unsupported_split_sdpa_as_not_applied(monkeypatc
 
 
 def test_runtime_verify_len_cap_limits_verify_token_count():
-    cfg = runtime_config_from_profile(profile="balanced", verify_len_cap=4)
+    cfg = runtime_config_from_defaults(verify_len_cap=4)
     cap = resolve_verify_len_cap(cfg, block_tokens=16)
 
     assert cap == 4
@@ -492,7 +490,7 @@ def test_runtime_verify_len_cap_limits_verify_token_count():
     assert verify_token_count_for_block(block_len=2, verify_len_cap=cap) == 2
 
 def test_runtime_verify_len_cap_zero_uses_block_size():
-    cfg = runtime_config_from_profile(profile="balanced", verify_len_cap=0)
+    cfg = runtime_config_from_defaults(verify_len_cap=0)
     cap = resolve_verify_len_cap(cfg, block_tokens=16)
 
     assert cap == 16
@@ -500,7 +498,7 @@ def test_runtime_verify_len_cap_zero_uses_block_size():
 
 
 def test_speculative_cycle_config_defaults_to_draft_block_size():
-    cfg = runtime_config_from_profile(profile="balanced", verify_len_cap=0)
+    cfg = runtime_config_from_defaults(verify_len_cap=0)
     draft = SimpleNamespace(block_size=16)
 
     cycle = resolve_speculative_cycle_config(cfg, draft, block_tokens=None)
@@ -512,7 +510,7 @@ def test_speculative_cycle_config_defaults_to_draft_block_size():
 
 
 def test_speculative_cycle_config_clamps_requested_block_size():
-    cfg = runtime_config_from_profile(profile="balanced", verify_len_cap=0)
+    cfg = runtime_config_from_defaults(verify_len_cap=0)
     draft = SimpleNamespace(block_size=16)
 
     high = resolve_speculative_cycle_config(cfg, draft, block_tokens=64)
@@ -525,7 +523,7 @@ def test_speculative_cycle_config_clamps_requested_block_size():
 
 
 def test_speculative_cycle_config_threads_verify_cap_after_block_clamp():
-    cfg = runtime_config_from_profile(profile="balanced", verify_len_cap=4)
+    cfg = runtime_config_from_defaults(verify_len_cap=4)
     draft = SimpleNamespace(block_size=16)
 
     cycle = resolve_speculative_cycle_config(cfg, draft, block_tokens=12)

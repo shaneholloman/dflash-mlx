@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from dflash_mlx.runtime import bundle as runtime_bundle
+from dflash_mlx.runtime import stream_dflash_generate
 from dflash_mlx.runtime.registry import (
     DRAFT_REGISTRY,
     resolve_effective_draft_quant,
@@ -111,6 +112,21 @@ def test_runtime_registry_explicit_draft_wins():
     assert resolve_optional_draft_ref("unknown/model", "manual/draft") == "manual/draft"
 
 
+def test_runtime_stream_requires_owned_dependencies():
+    cases = [
+        ({}, "runtime_context is required"),
+        ({"runtime_context": object()}, "target_ops is required"),
+        (
+            {"runtime_context": object(), "target_ops": object()},
+            "draft_backend is required",
+        ),
+    ]
+    for kwargs, message in cases:
+        stream = stream_dflash_generate(**kwargs)
+        with pytest.raises(ValueError, match=message):
+            next(stream)
+
+
 def test_runtime_bundle_unknown_target_without_draft_fails_clearly(monkeypatch):
     monkeypatch.setattr(
         runtime_bundle,
@@ -163,7 +179,7 @@ def test_runtime_bundle_loads_and_binds_draft(monkeypatch):
         return target_ops
 
     monkeypatch.setattr(runtime_bundle, "bind_draft_to_target", fake_bind)
-    monkeypatch.setattr(runtime_bundle, "make_draft_backend", lambda: draft_backend)
+    monkeypatch.setattr(runtime_bundle, "EagerDraftBackend", lambda: draft_backend)
 
     bundle = runtime_bundle.load_runtime_bundle(
         model_ref="Qwen/Qwen3.5-9B",
@@ -220,7 +236,7 @@ def test_runtime_bundle_applies_model_default_draft_quant(monkeypatch):
         or (draft_model, {"resolved_model_ref": draft_ref}),
     )
     monkeypatch.setattr(runtime_bundle, "bind_draft_to_target", lambda *args, **kwargs: None)
-    monkeypatch.setattr(runtime_bundle, "make_draft_backend", lambda: draft_backend)
+    monkeypatch.setattr(runtime_bundle, "EagerDraftBackend", lambda: draft_backend)
 
     bundle = runtime_bundle.load_runtime_bundle(
         model_ref="Qwen/Qwen3.5-9B",
@@ -259,7 +275,7 @@ def test_runtime_bundle_applies_model_default_split_sdpa(monkeypatch):
         lambda draft_ref, **kwargs: (draft_model, {"resolved_model_ref": draft_ref}),
     )
     monkeypatch.setattr(runtime_bundle, "bind_draft_to_target", lambda *args, **kwargs: None)
-    monkeypatch.setattr(runtime_bundle, "make_draft_backend", lambda: draft_backend)
+    monkeypatch.setattr(runtime_bundle, "EagerDraftBackend", lambda: draft_backend)
 
     bundle = runtime_bundle.load_runtime_bundle(
         model_ref="mlx-community/Qwen3.6-35B-A3B-4bit",
@@ -297,7 +313,7 @@ def test_runtime_bundle_draft_quant_none_disables_model_default(monkeypatch):
         or (draft_model, {"resolved_model_ref": draft_ref}),
     )
     monkeypatch.setattr(runtime_bundle, "bind_draft_to_target", lambda *args, **kwargs: None)
-    monkeypatch.setattr(runtime_bundle, "make_draft_backend", lambda: draft_backend)
+    monkeypatch.setattr(runtime_bundle, "EagerDraftBackend", lambda: draft_backend)
 
     bundle = runtime_bundle.load_runtime_bundle(
         model_ref="Qwen/Qwen3.5-9B",
@@ -333,7 +349,7 @@ def test_runtime_bundle_draft_override_still_exposes_support_spec(monkeypatch):
         lambda draft_ref, **kwargs: (object(), {"resolved_model_ref": draft_ref}),
     )
     monkeypatch.setattr(runtime_bundle, "bind_draft_to_target", lambda *args, **kwargs: None)
-    monkeypatch.setattr(runtime_bundle, "make_draft_backend", lambda: draft_backend)
+    monkeypatch.setattr(runtime_bundle, "EagerDraftBackend", lambda: draft_backend)
 
     bundle = runtime_bundle.load_runtime_bundle(
         model_ref="Qwen/Qwen3.5-9B",

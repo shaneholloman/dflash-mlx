@@ -27,10 +27,8 @@ from dflash_mlx.engine.events import (
 )
 from dflash_mlx.engine import spec_epoch
 from dflash_mlx.diagnostics import DiagnosticsConfig, TraceConfig
-from dflash_mlx.runtime.context import (
-    build_runtime_context,
-    runtime_config_from_profile,
-)
+from dflash_mlx.runtime.config import runtime_config_from_defaults
+from dflash_mlx.runtime.context import build_runtime_context
 
 
 class _FakeTargetOps:
@@ -147,8 +145,7 @@ def _runtime_context(
     verify_mode: str | None = None,
 ):
     return build_runtime_context(
-        runtime_config_from_profile(
-            profile="balanced",
+        runtime_config_from_defaults(
             prefill_step_size=4,
             prefix_cache=False,
             prefix_cache_l2=False,
@@ -219,8 +216,7 @@ def _frontier_snapshot_setup(
     prefill_step_size: int = 4,
 ):
     context = build_runtime_context(
-        runtime_config_from_profile(
-            profile="balanced",
+        runtime_config_from_defaults(
             prefill_step_size=prefill_step_size,
             prefix_cache=True,
             prefix_cache_l2=True,
@@ -347,8 +343,7 @@ def test_dflash_max_ctx_fallback_skips_session_request_materialization(monkeypat
             return mx.zeros((batch, seq_len, 8), dtype=mx.float32)
 
     context = build_runtime_context(
-        runtime_config_from_profile(
-            profile="balanced",
+        runtime_config_from_defaults(
             prefill_step_size=4,
             prefix_cache=False,
             prefix_cache_l2=False,
@@ -396,8 +391,7 @@ def test_dflash_max_ctx_fallback_accounts_for_requested_generation(monkeypatch):
             return mx.zeros((batch, seq_len, 8), dtype=mx.float32)
 
     context = build_runtime_context(
-        runtime_config_from_profile(
-            profile="balanced",
+        runtime_config_from_defaults(
             prefill_step_size=4,
             prefix_cache=False,
             prefix_cache_l2=False,
@@ -482,8 +476,7 @@ def test_runtime_prefill_chunks_use_configured_step_size():
     draft_backend = _FakeDraftBackend()
 
     context = build_runtime_context(
-        runtime_config_from_profile(
-            profile="balanced",
+        runtime_config_from_defaults(
             prefill_step_size=4,
             prefix_cache=False,
             prefix_cache_l2=False,
@@ -543,8 +536,7 @@ def test_clear_cache_boundaries_false_skips_mlx_clear_cache(monkeypatch):
     )
 
     context = build_runtime_context(
-        runtime_config_from_profile(
-            profile="balanced",
+        runtime_config_from_defaults(
             prefill_step_size=4,
             clear_cache_boundaries=False,
             prefix_cache=False,
@@ -589,8 +581,7 @@ def test_clear_cache_boundaries_true_clears_safe_boundaries(monkeypatch):
     )
 
     context = build_runtime_context(
-        runtime_config_from_profile(
-            profile="balanced",
+        runtime_config_from_defaults(
             prefill_step_size=4,
             clear_cache_boundaries=True,
             prefix_cache=False,
@@ -644,8 +635,7 @@ def test_clear_cache_boundaries_true_clears_during_long_decode(monkeypatch):
     )
 
     context = build_runtime_context(
-        runtime_config_from_profile(
-            profile="balanced",
+        runtime_config_from_defaults(
             prefill_step_size=4,
             clear_cache_boundaries=True,
             prefix_cache=False,
@@ -677,8 +667,7 @@ def test_runtime_prefill_accounting_reports_warm_restore():
     draft_backend = _FakeDraftBackend()
 
     context = build_runtime_context(
-        runtime_config_from_profile(
-            profile="balanced",
+        runtime_config_from_defaults(
             prefill_step_size=4,
             prefix_cache=False,
             prefix_cache_l2=False,
@@ -746,8 +735,7 @@ def test_warm_exact_hit_skips_prefill_republish():
     cache = DFlashPrefixCache(max_entries=4)
     snapshot_service = _snapshot_service(draft_model, cache=cache)
     context = build_runtime_context(
-        runtime_config_from_profile(
-            profile="balanced",
+        runtime_config_from_defaults(
             prefill_step_size=4,
             prefix_cache=True,
             prefix_cache_l2=False,
@@ -817,8 +805,7 @@ def test_prefill_snapshot_event_carries_snapshot_not_live_arrays():
     draft_backend = _FakeDraftBackend()
 
     context = build_runtime_context(
-        runtime_config_from_profile(
-            profile="balanced",
+        runtime_config_from_defaults(
             prefill_step_size=4,
             prefix_cache=False,
             prefix_cache_l2=False,
@@ -1645,8 +1632,7 @@ def test_prefill_snapshot_publication_skips_without_snapshot_service():
     draft_backend = _FakeDraftBackend()
 
     context = build_runtime_context(
-        runtime_config_from_profile(
-            profile="balanced",
+        runtime_config_from_defaults(
             prefill_step_size=4,
             prefix_cache=False,
             prefix_cache_l2=False,
@@ -1681,8 +1667,7 @@ def test_active_prefix_cache_requires_snapshot_service():
     draft_backend = _FakeDraftBackend()
 
     context = build_runtime_context(
-        runtime_config_from_profile(
-            profile="balanced",
+        runtime_config_from_defaults(
             prefill_step_size=4,
             prefix_cache=False,
             prefix_cache_l2=False,

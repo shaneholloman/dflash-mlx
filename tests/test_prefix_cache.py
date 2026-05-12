@@ -18,7 +18,6 @@ from dflash_mlx.cache.codecs import (
     build_snapshot,
     hydrate_target_cache,
     serialize_target_cache,
-    target_cache_is_serializable,
 )
 from dflash_mlx.cache.fingerprints import DFlashPrefixKey
 from dflash_mlx.cache.prefix_l1 import DFlashPrefixCache
@@ -380,7 +379,6 @@ def test_prefix_snapshot_builder_matches_build_snapshot_shape():
 class TestSerializeHydrate:
     def test_kv_only_round_trip(self):
         src = [_make_kv_cache_populated(n_tokens=5)]
-        assert target_cache_is_serializable(src)
         fa, gdn = serialize_target_cache(src)
         assert fa[0] is not None
         assert gdn[0] is None
@@ -407,8 +405,6 @@ class TestSerializeHydrate:
 
     def test_rotating_kv_round_trip_uses_temporal_order(self):
         src = [_make_rotating_cache_populated(n_tokens=7, max_size=4, keep=1)]
-        assert target_cache_is_serializable(src) is False
-        assert target_cache_is_serializable(src, allow_rotating=True)
         fa, gdn = serialize_target_cache(src)
         assert fa[0] is not None
         assert gdn[0] is None
@@ -678,7 +674,6 @@ class TestSerializeHydrate:
 
     def test_gdn_only_round_trip(self):
         src = [_make_gdn_cache_populated(size=3, conv_k=4)]
-        assert target_cache_is_serializable(src)
         fa, gdn = serialize_target_cache(src)
         assert fa[0] is None
         assert gdn[0] is not None
@@ -703,7 +698,6 @@ class TestSerializeHydrate:
 
     def test_mixed_round_trip(self):
         src = _make_mixed_template(n_fa=2, n_gdn=2)
-        assert target_cache_is_serializable(src)
         fa, gdn = serialize_target_cache(src)
 
         assert fa[0] is not None and gdn[0] is None
@@ -731,7 +725,6 @@ class TestSerializeHydrate:
         class WeirdCache:
             pass
         src = [WeirdCache()]
-        assert target_cache_is_serializable(src) is False
         with pytest.raises(TypeError):
             serialize_target_cache(src)
 

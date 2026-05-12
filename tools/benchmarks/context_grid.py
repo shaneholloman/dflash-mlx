@@ -26,7 +26,8 @@ from dflash_mlx.benchmark import (
 from dflash_mlx.observability.memory import process_memory_snapshot
 from dflash_mlx.runtime import get_stop_token_ids
 from dflash_mlx.runtime.bundle import load_runtime_bundle
-from dflash_mlx.runtime.context import build_runtime_context, runtime_config_from_profile
+from dflash_mlx.runtime.config import runtime_config_from_defaults
+from dflash_mlx.runtime.context import build_runtime_context
 
 GB = 1_000_000_000.0
 DEFAULT_CONTEXTS = "512,1k,2k,4k,8k,16k,32k"
@@ -136,7 +137,6 @@ def run_grid(args: argparse.Namespace, argv: Sequence[str]) -> dict[str, Any]:
         argv=list(argv),
         model=args.target,
         draft=args.draft,
-        profile=args.profile,
         effective_config=_effective_config(args, contexts),
     )
 
@@ -197,8 +197,7 @@ def run_grid(args: argparse.Namespace, argv: Sequence[str]) -> dict[str, Any]:
 
     if args.backend in ("both", "dflash"):
         runtime_context = build_runtime_context(
-            runtime_config_from_profile(
-                profile=args.profile,
+            runtime_config_from_defaults(
                 prefix_cache=False,
                 prefix_cache_l2=False,
                 clear_cache_boundaries=args.clear_cache_boundaries,
@@ -694,7 +693,6 @@ def _effective_config(args: argparse.Namespace, contexts: list[int]) -> dict[str
         "backend": args.backend,
         "max_tokens": int(args.max_tokens),
         "cooldown": float(args.cooldown),
-        "profile": args.profile,
         "draft_quant": args.draft_quant,
         "block_tokens": args.block_tokens,
         "prefill_step_size": args.prefill_step_size,
@@ -724,7 +722,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cooldown", type=float, default=180.0)
     p.add_argument("--label", default=None)
     p.add_argument("--out", default=None, help="Output run directory")
-    p.add_argument("--profile", default="balanced")
     p.add_argument("--draft-quant", default=None)
     p.add_argument("--block-tokens", type=int, default=None)
     p.add_argument("--prefill-step-size", type=int, default=None)

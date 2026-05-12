@@ -25,7 +25,8 @@ from dflash_mlx.model import (
     DFlashDraftModelArgs,
     FullContextDraftKVCache,
 )
-from dflash_mlx.runtime.context import build_runtime_context, runtime_config_from_profile
+from dflash_mlx.runtime.config import runtime_config_from_defaults
+from dflash_mlx.runtime.context import build_runtime_context
 
 
 def _args(**overrides):
@@ -120,8 +121,7 @@ class _EmptyDraftBackend:
 
 def _tiny_runtime_context():
     return build_runtime_context(
-        runtime_config_from_profile(
-            profile="balanced",
+        runtime_config_from_defaults(
             prefix_cache=False,
             prefix_cache_l2=False,
         )

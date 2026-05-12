@@ -63,9 +63,7 @@ class BenchmarkPrompt:
 
 def ctx_tokens(args: argparse.Namespace) -> int:
     value = getattr(args, "ctx_tokens", None)
-    if value is not None:
-        return int(value)
-    return int(getattr(args, "ctx", 0) or 0)
+    return int(value or 0)
 
 def default_limit_for_suite(suite: str) -> int:
     return int(DEFAULT_SUITE_LIMITS.get(suite, 1))

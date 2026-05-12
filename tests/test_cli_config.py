@@ -20,8 +20,7 @@ from dflash_mlx.server.config import (
     normalize_cli_args,
 )
 
-_PROFILE_ENV_KEYS = (
-    "DFLASH_RUNTIME_PROFILE",
+_RUNTIME_ENV_KEYS = (
     "DFLASH_PREFILL_STEP_SIZE",
     "DFLASH_DRAFT_SINK_SIZE",
     "DFLASH_DRAFT_WINDOW_SIZE",
@@ -39,15 +38,14 @@ _PROFILE_ENV_KEYS = (
     "DFLASH_VERIFY_MODE",
     "DFLASH_VERIFY_LINEAR",
     "DFLASH_VERIFY_QMM",
-    "DFLASH_DIAGNOSTICS_DIR",
 )
 
-def _clear_profile_env(monkeypatch):
-    for key in _PROFILE_ENV_KEYS:
+def _clear_runtime_env(monkeypatch):
+    for key in _RUNTIME_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
 
 def test_serve_cli_wires_runtime_env_flags(monkeypatch):
-    _clear_profile_env(monkeypatch)
+    _clear_runtime_env(monkeypatch)
 
     args = build_parser().parse_args(
         [
@@ -64,33 +62,33 @@ def test_serve_cli_wires_runtime_env_flags(monkeypatch):
     assert args.runtime_config.clear_cache_boundaries is True
 
 def test_serve_cli_thinking_default_is_disabled(monkeypatch):
-    _clear_profile_env(monkeypatch)
+    _clear_runtime_env(monkeypatch)
+    parser = build_parser()
 
-    args = build_parser().parse_args(["--model", "m"])
+    args = parser.parse_args(["--model", "m"])
     normalize_cli_args(args)
 
     assert args.enable_thinking is False
     assert args.chat_template_args == {"enable_thinking": False}
     assert args.fastpath_max_tokens == 256
 
+    args = parser.parse_args(["--model", "m", "--enable-thinking"])
+    normalize_cli_args(args)
+    assert args.chat_template_args["enable_thinking"] is True
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--model", "m", "--disable-thinking"])
+
 def test_serve_cli_fastpath_max_tokens_zero_is_accepted(monkeypatch):
-    _clear_profile_env(monkeypatch)
+    _clear_runtime_env(monkeypatch)
 
     args = build_parser().parse_args(["--model", "m", "--fastpath-max-tokens", "0"])
     normalize_cli_args(args)
 
     assert args.fastpath_max_tokens == 0
 
-def test_serve_cli_enable_thinking_sets_chat_template_arg(monkeypatch):
-    _clear_profile_env(monkeypatch)
-
-    args = build_parser().parse_args(["--model", "m", "--enable-thinking"])
-    normalize_cli_args(args)
-
-    assert args.chat_template_args["enable_thinking"] is True
-
 def test_serve_cli_chat_template_args_can_enable_thinking(monkeypatch):
-    _clear_profile_env(monkeypatch)
+    _clear_runtime_env(monkeypatch)
 
     args = build_parser().parse_args(
         ["--model", "m", "--chat-template-args", '{"enable_thinking":true}']
@@ -98,34 +96,6 @@ def test_serve_cli_chat_template_args_can_enable_thinking(monkeypatch):
     normalize_cli_args(args)
 
     assert args.chat_template_args["enable_thinking"] is True
-
-def test_serve_cli_enable_thinking_overrides_chat_template_args(monkeypatch):
-    _clear_profile_env(monkeypatch)
-
-    args = build_parser().parse_args(
-        [
-            "--model",
-            "m",
-            "--chat-template-args",
-            '{"enable_thinking":false}',
-            "--enable-thinking",
-        ]
-    )
-    normalize_cli_args(args)
-
-    assert args.chat_template_args["enable_thinking"] is True
-
-def test_serve_help_documents_enable_thinking(capsys):
-    parser = build_parser()
-    with pytest.raises(SystemExit) as exc:
-        parser.parse_args(["--help"])
-
-    assert exc.value.code == 0
-    out = capsys.readouterr().out
-    assert "--enable-thinking" in out
-    assert "--fastpath-max-tokens" in out
-    assert "--memory-waterfall" not in out
-    assert "--bench-log-dir" not in out
 
 @pytest.mark.parametrize(
     "argv",
@@ -152,7 +122,7 @@ def test_serve_rejects_removed_diagnostics_aliases(argv):
     ],
 )
 def test_runtime_bool_env_rejects_invalid_values(monkeypatch, env_key):
-    _clear_profile_env(monkeypatch)
+    _clear_runtime_env(monkeypatch)
     monkeypatch.setenv(env_key, "maybe")
     args = build_parser().parse_args(["--model", "m"])
 
@@ -163,7 +133,7 @@ def test_runtime_bool_env_rejects_invalid_values(monkeypatch, env_key):
 
 
 def test_model_provider_adds_mlx_lm_server_boundary_defaults(monkeypatch):
-    _clear_profile_env(monkeypatch)
+    _clear_runtime_env(monkeypatch)
     target_ops = object()
     draft_backend = object()
     load_calls: list[dict] = []
@@ -212,7 +182,7 @@ def test_model_provider_adds_mlx_lm_server_boundary_defaults(monkeypatch):
 
 
 def test_serve_split_sdpa_cli_is_tri_state(monkeypatch):
-    _clear_profile_env(monkeypatch)
+    _clear_runtime_env(monkeypatch)
     parser = build_parser()
 
     args = parser.parse_args(["--model", "m"])
@@ -236,7 +206,7 @@ def test_serve_split_sdpa_cli_is_tri_state(monkeypatch):
     ],
 )
 def test_model_provider_forwards_explicit_split_sdpa(monkeypatch, argv, expected):
-    _clear_profile_env(monkeypatch)
+    _clear_runtime_env(monkeypatch)
     load_calls: list[dict] = []
 
     class FakeGroup:
@@ -270,7 +240,7 @@ def test_model_provider_forwards_explicit_split_sdpa(monkeypatch, argv, expected
 
 
 def test_model_provider_preserves_dflash_fields_if_parent_preloads(monkeypatch):
-    _clear_profile_env(monkeypatch)
+    _clear_runtime_env(monkeypatch)
     target_ops = object()
     draft_backend = object()
 
@@ -311,7 +281,7 @@ def test_model_provider_preserves_dflash_fields_if_parent_preloads(monkeypatch):
 
 
 def test_model_provider_materialization_failure_does_not_publish_loaded_state(monkeypatch):
-    _clear_profile_env(monkeypatch)
+    _clear_runtime_env(monkeypatch)
 
     class FakeGroup:
         def size(self):
@@ -377,7 +347,7 @@ def test_wait_for_initial_model_load_requires_complete_runtime_bundle():
         )
 
 def test_serve_cli_prefill_step_size_is_not_decorative(monkeypatch):
-    _clear_profile_env(monkeypatch)
+    _clear_runtime_env(monkeypatch)
     monkeypatch.setenv("DFLASH_PREFILL_STEP_SIZE", "8192")
     args = build_parser().parse_args(["--model", "m"])
     normalize_cli_args(args)
@@ -388,7 +358,7 @@ def test_serve_cli_prefill_step_size_is_not_decorative(monkeypatch):
     assert args.runtime_config.prefill_step_size == 2048
 
 def test_serve_cli_threads_draft_and_verify_runtime_flags(monkeypatch):
-    _clear_profile_env(monkeypatch)
+    _clear_runtime_env(monkeypatch)
     args = build_parser().parse_args(
         [
             "--model",
@@ -411,7 +381,7 @@ def test_serve_cli_threads_draft_and_verify_runtime_flags(monkeypatch):
     assert args.runtime_context.runtime.verify_len_cap == 8
 
 def test_diagnostics_basic_resolves_default_artifact_dir(monkeypatch, tmp_path):
-    _clear_profile_env(monkeypatch)
+    _clear_runtime_env(monkeypatch)
     monkeypatch.chdir(tmp_path)
 
     args = build_parser().parse_args(["--model", "m", "--diagnostics", "basic"])
@@ -430,8 +400,8 @@ def test_diagnostics_basic_resolves_default_artifact_dir(monkeypatch, tmp_path):
     assert (out / "cache_events.jsonl").exists()
     assert not (out / "cycle_events.jsonl").exists()
 
-def test_diagnostics_full_enables_profile_memory_and_cycle_log(monkeypatch, tmp_path):
-    _clear_profile_env(monkeypatch)
+def test_diagnostics_full_enables_memory_and_cycle_log(monkeypatch, tmp_path):
+    _clear_runtime_env(monkeypatch)
     monkeypatch.chdir(tmp_path)
 
     args = build_parser().parse_args(["--model", "m", "--diagnostics", "full"])
@@ -448,7 +418,7 @@ def test_diagnostics_full_enables_profile_memory_and_cycle_log(monkeypatch, tmp_
     assert (out / "cycle_events.jsonl").exists()
 
 def test_diagnostics_off_creates_no_artifact_dir(monkeypatch, tmp_path):
-    _clear_profile_env(monkeypatch)
+    _clear_runtime_env(monkeypatch)
     monkeypatch.chdir(tmp_path)
 
     args = build_parser().parse_args(["--model", "m"])
@@ -460,7 +430,7 @@ def test_diagnostics_off_creates_no_artifact_dir(monkeypatch, tmp_path):
     assert args.diagnostics_config.trace.log_dir is None
 
 def test_diagnostics_dir_override_is_exact(monkeypatch, tmp_path):
-    _clear_profile_env(monkeypatch)
+    _clear_runtime_env(monkeypatch)
     out = tmp_path / "custom-diagnostics"
 
     args = build_parser().parse_args(
@@ -474,7 +444,7 @@ def test_diagnostics_dir_override_is_exact(monkeypatch, tmp_path):
     assert (out / "manifest.json").exists()
 
 def test_diagnostics_manifest_contains_required_fields(monkeypatch, tmp_path):
-    _clear_profile_env(monkeypatch)
+    _clear_runtime_env(monkeypatch)
     monkeypatch.chdir(tmp_path)
 
     args = build_parser().parse_args(["--model", "m", "--draft", "d", "--diagnostics", "basic"])
@@ -546,23 +516,23 @@ def _install_metal_limit_probe(monkeypatch):
     )
     return calls, recommended
 
-def test_configure_metal_limits_preserves_current_default(monkeypatch):
+def test_configure_metal_limits_uses_bounded_default(monkeypatch):
     calls, recommended = _install_metal_limit_probe(monkeypatch)
 
     args = build_parser().parse_args(["--model", "m"])
     limits = configure_metal_limits(args)
 
-    assert calls == [("wired", recommended), ("cache", recommended // 4)]
+    assert calls == [("wired", recommended), ("cache", 4 * 1024**3)]
     assert limits.wired_request == "auto"
     assert limits.wired_bytes == recommended
-    assert limits.cache_request == "auto"
-    assert limits.cache_bytes == recommended // 4
+    assert limits.cache_request == 4 * 1024**3
+    assert limits.cache_bytes == 4 * 1024**3
 
-def test_long_session_profile_sets_tighter_default_cache_limit(monkeypatch):
-    _clear_profile_env(monkeypatch)
+def test_serve_default_uses_bounded_cache_limit(monkeypatch):
+    _clear_runtime_env(monkeypatch)
     calls, recommended = _install_metal_limit_probe(monkeypatch)
 
-    args = build_parser().parse_args(["--model", "m", "--profile", "long-session"])
+    args = build_parser().parse_args(["--model", "m"])
     normalize_cli_args(args)
     limits = configure_metal_limits(args)
 
@@ -571,13 +541,11 @@ def test_long_session_profile_sets_tighter_default_cache_limit(monkeypatch):
     assert limits.cache_request == 4 * 1024**3
     assert limits.cache_bytes == 4 * 1024**3
 
-def test_explicit_auto_cache_limit_overrides_long_session_profile(monkeypatch):
-    _clear_profile_env(monkeypatch)
+def test_explicit_auto_cache_limit_overrides_serve_default(monkeypatch):
+    _clear_runtime_env(monkeypatch)
     calls, recommended = _install_metal_limit_probe(monkeypatch)
 
-    args = build_parser().parse_args(
-        ["--model", "m", "--profile", "long-session", "--cache-limit", "auto"]
-    )
+    args = build_parser().parse_args(["--model", "m", "--cache-limit", "auto"])
     normalize_cli_args(args)
     limits = configure_metal_limits(args)
 
@@ -585,13 +553,11 @@ def test_explicit_auto_cache_limit_overrides_long_session_profile(monkeypatch):
     assert limits.cache_request == "auto"
     assert limits.cache_bytes == recommended // 4
 
-def test_explicit_none_cache_limit_overrides_long_session_profile(monkeypatch):
-    _clear_profile_env(monkeypatch)
+def test_explicit_none_cache_limit_overrides_serve_default(monkeypatch):
+    _clear_runtime_env(monkeypatch)
     calls, recommended = _install_metal_limit_probe(monkeypatch)
 
-    args = build_parser().parse_args(
-        ["--model", "m", "--profile", "long-session", "--cache-limit", "none"]
-    )
+    args = build_parser().parse_args(["--model", "m", "--cache-limit", "none"])
     normalize_cli_args(args)
     limits = configure_metal_limits(args)
 
@@ -600,13 +566,11 @@ def test_explicit_none_cache_limit_overrides_long_session_profile(monkeypatch):
     assert limits.cache_bytes is None
     assert limits.cache_applied is False
 
-def test_explicit_byte_cache_limit_overrides_long_session_profile(monkeypatch):
-    _clear_profile_env(monkeypatch)
+def test_explicit_byte_cache_limit_overrides_serve_default(monkeypatch):
+    _clear_runtime_env(monkeypatch)
     calls, recommended = _install_metal_limit_probe(monkeypatch)
 
-    args = build_parser().parse_args(
-        ["--model", "m", "--profile", "long-session", "--cache-limit", "8GB"]
-    )
+    args = build_parser().parse_args(["--model", "m", "--cache-limit", "8GB"])
     normalize_cli_args(args)
     limits = configure_metal_limits(args)
 
@@ -695,89 +659,55 @@ def test_serve_cli_rejects_invalid_runtime_flags(argv, error):
     with pytest.raises(SystemExit, match=error):
         normalize_cli_args(args)
 
-def test_profile_balanced_sets_product_defaults(monkeypatch):
-    _clear_profile_env(monkeypatch)
+def test_serve_default_sets_product_runtime(monkeypatch):
+    _clear_runtime_env(monkeypatch)
     args = build_parser().parse_args(["--model", "m"])
     normalize_cli_args(args)
     cfg = args.runtime_config
-    assert cfg.profile == "balanced"
-    assert cfg.prefill_step_size == 4096
+    assert cfg.prefill_step_size == 2048
     assert cfg.draft_sink_size == 64
     assert cfg.draft_window_size == 1024
     assert cfg.verify_len_cap == 0
     assert cfg.prefix_cache is True
-    assert cfg.prefix_cache_max_entries == 4
+    assert cfg.prefix_cache_max_entries == 8
     assert cfg.prefix_cache_max_bytes == 8 * 1024**3
-    assert cfg.clear_cache_boundaries is False
+    assert cfg.clear_cache_boundaries is True
     assert cfg.max_snapshot_tokens == 32000
-    assert cfg.prefix_cache_l2 is False
+    assert cfg.prefix_cache_l2 is True
     assert cfg.verify_mode == "auto"
 
-@pytest.mark.parametrize(
-    "profile,prefill,l2,clear",
-    [
-        ("fast", "8192", "0", "0"),
-        ("low-memory", "1024", "0", "0"),
-        ("long-session", "4096", "1", "1"),
-    ],
-)
-def test_profiles_set_expected_values(monkeypatch, profile, prefill, l2, clear):
-    _clear_profile_env(monkeypatch)
-    args = build_parser().parse_args(["--model", "m", "--profile", profile])
+def test_cli_explicit_overrides_default_runtime(monkeypatch):
+    _clear_runtime_env(monkeypatch)
+    args = build_parser().parse_args(["--model", "m", "--prefill-step-size", "2048"])
     normalize_cli_args(args)
-    assert args.runtime_config.profile == profile
-    assert args.runtime_config.prefill_step_size == int(prefill)
-    assert args.runtime_config.prefix_cache_l2 is (l2 == "1")
-    assert args.runtime_config.clear_cache_boundaries is (clear == "1")
-
-def test_cli_explicit_overrides_profile(monkeypatch):
-    _clear_profile_env(monkeypatch)
-    args = build_parser().parse_args(
-        ["--model", "m", "--profile", "fast", "--prefill-step-size", "2048"]
-    )
-    normalize_cli_args(args)
-    assert args.runtime_config.profile == "fast"
     assert args.runtime_config.prefill_step_size == 2048
 
-def test_env_overrides_profile(monkeypatch):
-    _clear_profile_env(monkeypatch)
+def test_env_overrides_default_runtime(monkeypatch):
+    _clear_runtime_env(monkeypatch)
     monkeypatch.setenv("DFLASH_PREFILL_STEP_SIZE", "2048")
     monkeypatch.setenv("DFLASH_DRAFT_WINDOW_SIZE", "512")
     monkeypatch.setenv("DFLASH_VERIFY_LEN_CAP", "4")
-    args = build_parser().parse_args(["--model", "m", "--profile", "fast"])
+    args = build_parser().parse_args(["--model", "m"])
     normalize_cli_args(args)
     assert args.runtime_config.prefill_step_size == 2048
     assert args.runtime_config.draft_window_size == 512
     assert args.runtime_config.verify_len_cap == 4
 
 def test_cli_overrides_env(monkeypatch):
-    _clear_profile_env(monkeypatch)
+    _clear_runtime_env(monkeypatch)
     monkeypatch.setenv("DFLASH_PREFILL_STEP_SIZE", "1024")
     args = build_parser().parse_args(["--model", "m", "--prefill-step-size", "8192"])
     normalize_cli_args(args)
     assert args.runtime_config.prefill_step_size == 8192
 
 def test_verify_mode_off_disables_custom_verify(monkeypatch):
-    _clear_profile_env(monkeypatch)
+    _clear_runtime_env(monkeypatch)
     args = build_parser().parse_args(["--model", "m", "--verify-mode", "off"])
     normalize_cli_args(args)
     assert "DFLASH_VERIFY_LINEAR" not in os.environ
     assert "DFLASH_VERIFY_QMM" not in os.environ
     assert args.runtime_config.verify_mode == "off"
     assert args.runtime_context.verify.mode == "off"
-
-def test_list_profiles_output_stable(capsys):
-    args = build_parser().parse_args(["--list-profiles"])
-    with pytest.raises(SystemExit) as exc:
-        normalize_cli_args(args)
-    assert exc.value.code == 0
-    out = capsys.readouterr().out
-    assert "profile      prefill" in out
-    assert "draft_window" in out and "verify_cap" in out
-    assert "balanced" in out and "4096" in out and "64+1024" in out and "4x8GiB" in out
-    assert "fast" in out and "8192" in out and "4x16GiB" in out
-    assert "low-memory" in out and "1024" in out and "2x2GiB" in out
-    assert "long-session" in out and "on/50GiB" in out
 
 @pytest.mark.parametrize(
     "argv,error",
@@ -791,13 +721,13 @@ def test_list_profiles_output_stable(capsys):
         ),
     ],
 )
-def test_profile_validation_errors(argv, error):
+def test_runtime_validation_errors(argv, error):
     args = build_parser().parse_args(argv)
     with pytest.raises(SystemExit, match=error):
         normalize_cli_args(args)
 
 def test_target_fa_window_disables_prefix_cache(monkeypatch):
-    _clear_profile_env(monkeypatch)
+    _clear_runtime_env(monkeypatch)
     args = build_parser().parse_args(["--model", "m", "--target-fa-window", "2048"])
     normalize_cli_args(args)
     assert args.runtime_config.target_fa_window == 2048
@@ -805,7 +735,7 @@ def test_target_fa_window_disables_prefix_cache(monkeypatch):
     assert args.runtime_config.prefix_cache_l2 is False
 
 def test_prefix_cache_disabled_disables_l2(monkeypatch):
-    _clear_profile_env(monkeypatch)
+    _clear_runtime_env(monkeypatch)
     args = build_parser().parse_args(
         ["--model", "m", "--no-prefix-cache", "--prefix-cache-l2"]
     )

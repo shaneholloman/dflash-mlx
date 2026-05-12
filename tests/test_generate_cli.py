@@ -10,9 +10,9 @@ from types import SimpleNamespace
 import pytest
 
 from dflash_mlx import generate
+import dflash_mlx.runtime.config as runtime_config
 from dflash_mlx.engine.events import PrefillCompleteEvent, SummaryEvent
 from dflash_mlx.runtime.loading import parse_draft_quant_spec
-from dflash_mlx.runtime.config import PROFILES
 
 
 def test_decode_token_prefers_list_decode():
@@ -104,24 +104,11 @@ def test_generate_cli_passes_verify_mode(monkeypatch):
     ]
 
 
-def test_generate_help_documents_prefill_default(monkeypatch, capsys):
-    monkeypatch.setattr(generate, "apply_metal_limits", lambda: None)
-
-    with pytest.raises(SystemExit) as exc:
-        generate.main(["--help"])
-
-    out = capsys.readouterr().out
-    assert exc.value.code == 0
-    assert "--prefill-step-size INT" in out
-    assert "Default: profile balanced" in out
-    assert "value, 4096." in out
-
-
-def test_run_generate_defaults_follow_balanced_profile(monkeypatch):
-    monkeypatch.setitem(
-        PROFILES,
-        "balanced",
-        replace(PROFILES["balanced"], draft_window_size=1536),
+def test_run_generate_defaults_follow_single_runtime_default(monkeypatch):
+    monkeypatch.setattr(
+        runtime_config,
+        "DEFAULT_RUNTIME_CONFIG",
+        replace(runtime_config.DEFAULT_RUNTIME_CONFIG, draft_window_size=1536),
     )
     captured = []
 

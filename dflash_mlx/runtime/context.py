@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 from dflash_mlx.diagnostics import DiagnosticsConfig
 from dflash_mlx.runtime.config import (
     EffectiveRuntimeConfig,
-    runtime_config_from_profile_values,
+    runtime_config_from_defaults as _runtime_config_from_defaults,
     validate_runtime_config,
 )
 
@@ -24,44 +24,6 @@ class RuntimeContext:
     diagnostics: DiagnosticsConfig
     verify: VerifyConfig
     metal_limits: MetalLimitConfig | None = None
-
-def runtime_config_from_profile(
-    profile: str = "balanced",
-    *,
-    prefill_step_size: int | None = None,
-    draft_sink_size: int | None = None,
-    draft_window_size: int | None = None,
-    verify_len_cap: int | None = None,
-    prefix_cache: bool | None = None,
-    prefix_cache_max_entries: int | None = None,
-    prefix_cache_max_bytes: int | None = None,
-    clear_cache_boundaries: bool | None = None,
-    max_snapshot_tokens: int | None = None,
-    prefix_cache_l2: bool | None = None,
-    prefix_cache_l2_dir: str | None = None,
-    prefix_cache_l2_max_bytes: int | None = None,
-    target_fa_window: int = 0,
-    dflash_max_ctx: int = 0,
-    verify_mode: str | None = None,
-) -> EffectiveRuntimeConfig:
-    return runtime_config_from_profile_values(
-        profile=profile,
-        prefill_step_size=prefill_step_size,
-        draft_sink_size=draft_sink_size,
-        draft_window_size=draft_window_size,
-        verify_len_cap=verify_len_cap,
-        prefix_cache=prefix_cache,
-        prefix_cache_max_entries=prefix_cache_max_entries,
-        prefix_cache_max_bytes=prefix_cache_max_bytes,
-        clear_cache_boundaries=clear_cache_boundaries,
-        max_snapshot_tokens=max_snapshot_tokens,
-        prefix_cache_l2=prefix_cache_l2,
-        prefix_cache_l2_dir=prefix_cache_l2_dir,
-        prefix_cache_l2_max_bytes=prefix_cache_l2_max_bytes,
-        target_fa_window=target_fa_window,
-        dflash_max_ctx=dflash_max_ctx,
-        verify_mode=verify_mode,
-    )
 
 def build_runtime_context(
     runtime_config: EffectiveRuntimeConfig,
@@ -87,8 +49,7 @@ def build_offline_runtime_config(
     verify_len_cap: int | None = None,
     verify_mode: str | None = None,
 ) -> EffectiveRuntimeConfig:
-    runtime_config = runtime_config_from_profile(
-        profile="balanced",
+    runtime_config = _runtime_config_from_defaults(
         prefix_cache=False,
         prefix_cache_l2=False,
         target_fa_window=0 if target_fa_window is None else int(target_fa_window),

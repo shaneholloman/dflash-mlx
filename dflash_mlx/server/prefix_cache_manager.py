@@ -63,12 +63,6 @@ def build_prefix_key(
         target_fa_window=int(target_fa_window),
     )
 
-def chat_template_marker_ids(
-    tokenizer: Any,
-) -> tuple[int | None, int | None]:
-    marker_start, marker_role, _boundary_offset = chat_template_stable_marker(tokenizer)
-    return marker_start, marker_role
-
 def chat_template_stable_marker(
     tokenizer: Any,
 ) -> tuple[int | None, int | None, int]:

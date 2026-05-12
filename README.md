@@ -133,7 +133,8 @@ per-process wired-memory source is available.
 The endpoint is for live debugging and benchmark visibility; it does not create
 benchmark artifacts.
 
-Enable Qwen reasoning mode when needed:
+Qwen reasoning mode is disabled by default for chat templates. Enable it when a
+client or model requires the thinking template path:
 
 ```bash
 dflash serve --model mlx-community/Qwen3.6-27B-4bit --enable-thinking
@@ -154,17 +155,17 @@ Validated large DFlash drafts default to `w4` in memory. Current Qwen3.5,
 Qwen3.6, and Gemma4 probes showed this is the best practical memory/throughput
 tradeoff; pass `--draft-quant none` when you need a bf16/non-quant draft A/B.
 
-For Gemma4 long-context memory pressure, use `--profile low-memory` or keep your
-current profile and set `--prefill-step-size 1024` explicitly. For Gemma4 31B
-under tighter long-context memory limits, `--prefill-step-size 512` reduced peak
-memory and TTFT in local `dflash serve` probes, but it is prompt-sensitive and
-not a public benchmark throughput claim. The balanced default remains `4096`.
+For Gemma4 long-context memory pressure, set `--prefill-step-size 1024`
+explicitly. For Gemma4 31B under tighter long-context memory limits,
+`--prefill-step-size 512` reduced peak memory and TTFT in local `dflash serve`
+probes, but it is prompt-sensitive and not a public benchmark throughput claim.
+The default is `2048`.
 
-For Qwen3.6 27B long OpenCode sessions, `dflash serve --profile long-session`
-now applies a `4GB` MLX cache limit by default. That keeps the validated `w4`
-draft path and lowers process physical footprint on long-context rows without a
-measured decode regression in local first56 replay. Pass `--cache-limit auto`
-to restore the generic wired-limit/4 MLX policy.
+`dflash serve` uses the product session policy by default: prefix cache
+enabled, L2 snapshots enabled, boundary cache clears enabled, and a `4GB` MLX
+cache limit. Pass explicit flags such as `--no-prefix-cache-l2`,
+`--no-clear-cache-boundaries`, or `--cache-limit auto` only when you want to
+override that policy.
 
 | Target | Draft |
 |--------|-------|
@@ -192,26 +193,7 @@ dflash serve      # OpenAI-compatible server
 dflash generate   # one-shot local generation
 dflash benchmark  # baseline-vs-DFlash runtime benchmark
 dflash doctor     # environment and config checks
-dflash profiles   # list runtime presets
 dflash models     # list supported target/draft pairs
-```
-
-## Profiles
-
-Readable defaults. Explicit CLI flags override them.
-
-| Profile | Prefill | Prefix cache | L1 budget | Clear cache | L2 | Intent |
-|---|---:|---|---|---|---|---|
-| `balanced` | 4096 | on | 4 / 8 GiB | off | off | default coding sessions |
-| `fast` | 8192 | on | 4 / 16 GiB | off | off | throughput first |
-| `low-memory` | 1024 | on | 2 / 2 GiB | off | off | lower memory pressure |
-| `long-session` | 4096 | on | 8 / 8 GiB | boundary | on / 50 GiB | prefix revisits; serve cache 4GB |
-
-```bash
-dflash profiles
-dflash serve --profile fast --model Qwen/Qwen3.5-9B
-dflash serve --profile long-session --model mlx-community/Qwen3.6-27B-4bit \
-  --prefix-cache-l2-dir .artifacts/dflash/l2
 ```
 
 ## Common server controls

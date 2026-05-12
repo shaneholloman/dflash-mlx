@@ -14,6 +14,7 @@ import pytest
 from dflash_mlx import benchmark
 from dflash_mlx import benchmark_report
 from dflash_mlx import benchmark_suites
+import dflash_mlx.runtime.config as runtime_config
 from dflash_mlx.engine.events import (
     CycleCompleteEvent,
     PrefillCompleteEvent,
@@ -22,7 +23,6 @@ from dflash_mlx.engine.events import (
 )
 from dflash_mlx.metal_limits import MetalLimitConfig
 from dflash_mlx.runtime.context import build_offline_runtime_context
-from dflash_mlx.runtime.config import PROFILES
 
 def test_prompt_slug_distinguishes_long_prompts_with_same_prefix():
     prefix = "same prefix " * 8
@@ -33,7 +33,7 @@ def test_prompt_slug_distinguishes_long_prompts_with_same_prefix():
     assert first.startswith("same-prefix")
     assert second.startswith("same-prefix")
 
-def test_benchmark_help_documents_public_flags(capsys):
+def test_benchmark_parser_exposes_public_flags(capsys):
     parser = benchmark.build_parser()
     with pytest.raises(SystemExit) as exc:
         parser.parse_args(["--help"])
@@ -55,7 +55,6 @@ def test_benchmark_help_documents_public_flags(capsys):
         "--prompt",
         "--max-tokens",
         "--block-tokens",
-        "--ctx",
         "--no-memory",
         "--repeat",
         "--cooldown",
@@ -74,19 +73,17 @@ def test_benchmark_help_documents_public_flags(capsys):
         "--verify-len-cap",
         "--out",
     } <= option_strings
-    assert "Target model. Required." in out
-    assert ".artifacts/dflash/benchmarks/<timestamp>-<suite>-<model>" in out
     assert "--matrix" not in out
     assert "--memory" not in out
     assert "--agentic" not in out
 
-@pytest.mark.parametrize("flag", ["--matrix", "--memory", "--agentic"])
-def test_benchmark_rejects_removed_public_flags(flag):
+def test_benchmark_rejects_removed_public_flags():
     parser = benchmark.build_parser()
-    with pytest.raises(SystemExit) as exc:
-        parser.parse_args([flag])
+    for flag in ("--matrix", "--memory", "--agentic"):
+        with pytest.raises(SystemExit) as exc:
+            parser.parse_args([flag])
 
-    assert exc.value.code == 2
+        assert exc.value.code == 2
 
 def test_benchmark_finalize_uses_offline_runtime_validation():
     parser = benchmark.build_parser()
@@ -209,7 +206,7 @@ def test_benchmark_invocation_records_explicit_and_effective_values():
             "draft-alias",
             "--max-tokens",
             "8",
-            "--ctx",
+            "--ctx-tokens",
             "65536",
             "--no-memory",
             "--out",
@@ -224,7 +221,10 @@ def test_benchmark_invocation_records_explicit_and_effective_values():
             "8",
         ]
     )
-    args = benchmark._finalize_benchmark_args(args, ["--suite", "longctx", "--limit", "1", "--ctx", "65536"])
+    args = benchmark._finalize_benchmark_args(
+        args,
+        ["--suite", "longctx", "--limit", "1", "--ctx-tokens", "65536"],
+    )
     config = {
         "model": "resolved-target",
         "draft": "resolved-draft",
@@ -253,7 +253,7 @@ def test_benchmark_invocation_records_explicit_and_effective_values():
             "draft-alias",
             "--max-tokens",
             "8",
-            "--ctx",
+            "--ctx-tokens",
             "65536",
             "--no-memory",
             "--out",
@@ -281,7 +281,7 @@ def test_benchmark_invocation_records_explicit_and_effective_values():
     assert invocation["explicit_flags"]["suite"] == "longctx"
     assert invocation["explicit_flags"]["limit"] == 1
     assert invocation["explicit_flags"]["max_tokens"] == 8
-    assert invocation["explicit_flags"]["ctx"] == 65536
+    assert invocation["explicit_flags"]["ctx_tokens"] == 65536
     assert invocation["explicit_flags"]["no_memory"] is True
     assert invocation["explicit_flags"]["cooldown"] == 120
     assert invocation["explicit_flags"]["wired_limit"] == 48 * 1024**3
@@ -791,33 +791,16 @@ def test_benchmark_prefill_step_size_cli_reaches_invocation(tmp_path):
     assert invocation["explicit_flags"]["prefill_step_size"] == 2048
     assert invocation["effective"]["prefill_step_size"] == 2048
 
-def test_benchmark_direct_defaults_follow_balanced_profile(monkeypatch):
-    monkeypatch.setitem(
-        PROFILES,
-        "balanced",
-        replace(PROFILES["balanced"], draft_window_size=1536),
+def test_benchmark_direct_defaults_follow_runtime_default(monkeypatch):
+    monkeypatch.setattr(
+        runtime_config,
+        "DEFAULT_RUNTIME_CONFIG",
+        replace(runtime_config.DEFAULT_RUNTIME_CONFIG, draft_window_size=1536),
     )
 
     values = benchmark._offline_runtime_values()
 
     assert values["draft_window_size"] == 1536
-
-def test_benchmark_runtime_context_is_required():
-    stream = benchmark.stream_dflash_generate()
-    with pytest.raises(ValueError, match="runtime_context is required"):
-        next(stream)
-
-def test_dflash_stream_target_ops_is_required():
-    stream = benchmark.stream_dflash_generate(runtime_context=object())
-    with pytest.raises(ValueError, match="target_ops is required"):
-        next(stream)
-
-
-def test_dflash_stream_draft_backend_is_required():
-    stream = benchmark.stream_dflash_generate(runtime_context=object(), target_ops=object())
-    with pytest.raises(ValueError, match="draft_backend is required"):
-        next(stream)
-
 
 class _BenchmarkTokenizer:
     eos_token_ids = []

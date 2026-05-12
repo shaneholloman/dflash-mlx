@@ -32,7 +32,8 @@ from dflash_mlx.engine.events import (
 )
 from dflash_mlx.runtime import stream_dflash_generate
 from dflash_mlx.runtime.bundle import load_runtime_bundle
-from dflash_mlx.runtime.context import build_runtime_context, runtime_config_from_profile
+from dflash_mlx.runtime.config import runtime_config_from_defaults
+from dflash_mlx.runtime.context import build_runtime_context
 
 def rss_mb() -> float:
     ru = resource.getrusage(resource.RUSAGE_SELF)
@@ -321,7 +322,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     draft_model = bundle.draft_model
     draft_backend = bundle.draft_backend
     resolved_draft = bundle.resolved_draft_ref
-    runtime_context = build_runtime_context(runtime_config_from_profile(profile="balanced"))
+    runtime_context = build_runtime_context(runtime_config_from_defaults())
     print(f"Loaded. resolved_draft={resolved_draft}")
 
     prompts = [_make_long_prompt(tokenizer, sys_tokens, f"P{i:02d}") for i in range(1, n_turns + 1)]

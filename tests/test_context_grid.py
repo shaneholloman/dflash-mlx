@@ -15,7 +15,6 @@ from tools.benchmarks.context_grid import (
     build_context_prompt_tokens,
     format_context,
     parse_contexts,
-    render_markdown,
     run_grid,
 )
 
@@ -57,61 +56,6 @@ def test_build_context_prompt_tokens_hits_target_and_preserves_final_task():
     assert tokens[-len(tokenizer.encode(DEFAULT_FINAL_REQUEST)) :] == tokenizer.encode(
         DEFAULT_FINAL_REQUEST
     )
-
-
-def test_render_markdown_emits_comparison_and_raw_rows():
-    summary = {
-        "metadata": {
-            "label": "test-grid",
-            "target": "target",
-            "draft": "draft",
-            "backend": "both",
-            "max_tokens": 128,
-            "cooldown_s": 180.0,
-            "prompt_format": "chat",
-        },
-        "comparison": [
-            {
-                "context_tokens": 512,
-                "mlxlm_prompt_tps": 800.0,
-                "dflash_prompt_tps": 900.0,
-                "mlxlm_generation_tps": 40.0,
-                "dflash_generation_tps": 44.0,
-                "mlxlm_mlx_peak_gb": 18.0,
-                "mlxlm_phys_footprint_peak_gb": 30.0,
-                "dflash_mlx_peak_gb": 20.0,
-                "dflash_phys_footprint_peak_gb": 50.0,
-                "dflash_phys_footprint_delta_gb": 10.0,
-                "dflash_sampled_mlx_cache_peak_gb": 15.0,
-                "compare_status": "ok",
-                "dflash_wall_ratio": 0.92,
-            }
-        ],
-        "rows": [
-            {
-                "backend": "dflash",
-                "context_tokens": 512,
-                "prompt_tokens": 512,
-                "generated_tokens": 128,
-                "wall_s": 3.0,
-                "ttft_ms": 100.0,
-                "prompt_tps": 900.0,
-                "generation_tps": 44.0,
-                "mlx_peak_gb": 20.0,
-                "phys_footprint_start_gb": 40.0,
-                "phys_footprint_peak_gb": 50.0,
-                "phys_footprint_delta_gb": 10.0,
-                "sampled_mlx_cache_peak_gb": 15.0,
-                "acceptance_ratio": 0.75,
-                "cycles": 12,
-            }
-        ],
-    }
-
-    rendered = render_markdown(summary)
-
-    assert "| 0.5k | 800.0 | 900.0 | 40.0 | 44.0 | 18.0 | 30.0 | 20.0 | 50.0 | 10.0 | 15.0 | ok | 0.920 |" in rendered
-    assert "| dflash | 0.5k | 512 | 128 | 3.000 |" in rendered
 
 
 def test_run_grid_writes_incremental_rows_and_gates_diverged_compare(monkeypatch, tmp_path):
