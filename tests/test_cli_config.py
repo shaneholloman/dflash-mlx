@@ -753,7 +753,7 @@ def test_serve_default_sets_product_runtime(monkeypatch):
     assert cfg.clear_cache_boundaries is True
     assert cfg.max_snapshot_tokens == 32000
     assert cfg.prefix_cache_l2 is True
-    assert cfg.verify_mode == "auto"
+    assert cfg.verify_mode == "adaptive"
 
 def test_cli_explicit_overrides_default_runtime(monkeypatch):
     _clear_runtime_env(monkeypatch)

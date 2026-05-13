@@ -20,6 +20,12 @@ REAL_MLP_SHAPES = [
     ("down_proj", 16, 17408, 5120),
 ]
 
+REAL_MLP_M4_SHAPES = [
+    ("gate_proj_m4", 4, 5120, 17408),
+    ("up_proj_m4", 4, 5120, 17408),
+    ("down_proj_m4", 4, 17408, 5120),
+]
+
 def _quantize_ref(w_fp, gs, bits):
     return mx.quantize(w_fp, group_size=gs, bits=bits)
 
@@ -71,6 +77,17 @@ def test_mlp_real_shapes(name, M, K, N, dtype):
     abs_tol = 8e-3 if dtype == mx.bfloat16 else 4e-3
     rel_tol = 2e-2
     max_abs, max_rel, shape = _run_case(name, M, K, N, dtype, GROUP_SIZE)
+    assert max_abs <= abs_tol, f"{name}[{dtype}] max_abs={max_abs:.4g} > {abs_tol}"
+    assert max_rel <= rel_tol, f"{name}[{dtype}] max_rel={max_rel:.4g} > {rel_tol}"
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("name,M,K,N", REAL_MLP_M4_SHAPES)
+def test_mlp_real_shapes_m4_ksplit_np(name, M, K, N, dtype, monkeypatch):
+    monkeypatch.setenv("DFLASH_VERIFY_QMM", "1")
+    abs_tol = 8e-3 if dtype == mx.bfloat16 else 4e-3
+    rel_tol = 2e-2
+    max_abs, max_rel, shape = _run_case(name, M, K, N, dtype, GROUP_SIZE)
+    assert shape == (M, N)
     assert max_abs <= abs_tol, f"{name}[{dtype}] max_abs={max_abs:.4g} > {abs_tol}"
     assert max_rel <= rel_tol, f"{name}[{dtype}] max_rel={max_rel:.4g} > {rel_tol}"
 

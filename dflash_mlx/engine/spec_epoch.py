@@ -22,6 +22,19 @@ from dflash_mlx.cache.snapshot import (
 from dflash_mlx.draft_backend import DraftBackend
 from dflash_mlx.engine.acceptance import match_acceptance_length as _match_acceptance_length
 from dflash_mlx.engine.copyspec import CopySpecIndex
+from dflash_mlx.engine.ddtree import (
+    build_flat_ddtree,
+    build_flat_tree_inputs,
+    branch_positions as ddtree_branch_positions,
+    candidate_token_ids as ddtree_candidate_token_ids,
+    clone_cache_for_batch as ddtree_clone_cache_for_batch,
+    copy_selected_cache as ddtree_copy_selected_cache,
+    follow_verified_tree,
+    restore_cache as ddtree_restore_cache,
+    select_tree_slots as ddtree_select_tree_slots,
+    snapshot_cache as ddtree_snapshot_cache,
+    verify_candidates_batch as ddtree_verify_candidates_batch,
+)
 from dflash_mlx.engine.fallback import stream_baseline_generate
 from dflash_mlx.engine.prefill import compute_snapshot_boundary
 from dflash_mlx.engine.sampling import (
@@ -56,6 +69,9 @@ from dflash_mlx.engine.memory_waterfall import (
 )
 
 _DECODE_CLEAR_CACHE_INTERVAL_TOKENS = 1024
+_DDTREE_TOP_WIDTH = 2
+_DDTREE_MAX_BRANCH_POSITIONS = 2
+_ADAPTIVE_REDUCED_BURST_CYCLES = 24
 
 
 @dataclass(frozen=True)
@@ -168,8 +184,10 @@ class _DecodeResult:
 class _AdaptiveBlockPolicy:
     full_block_tokens: int
     min_block_tokens: int = 4
-    window_size: int = 12
-    reduced_burst_cycles: int = 4
+    window_size: int = 4
+    reduced_burst_cycles: int = _ADAPTIVE_REDUCED_BURST_CYCLES
+    long_context_prompt_tokens: int = 32768
+    long_context_burst_cycles: int = 64
     low_commit_threshold: float = 3.0
     recent_low_commit_threshold: float = 2.75
     high_commit_guard: int = 5
@@ -180,7 +198,6 @@ class _AdaptiveBlockPolicy:
     reductions: int = 0
     reduced_cycles: int = 0
     min_seen: int | None = None
-    high_commit_seen: bool = False
     full_commits: deque[int] = field(default_factory=lambda: deque(maxlen=12))
     probe_commits: list[int] = field(default_factory=list)
 
@@ -191,6 +208,7 @@ class _AdaptiveBlockPolicy:
         runtime_config: Any,
         effective_block_tokens: int,
         verify_len_cap: int,
+        prompt_len: int = 0,
     ) -> "_AdaptiveBlockPolicy | None":
         if str(getattr(runtime_config, "verify_mode", "auto")) != "adaptive":
             return None
@@ -199,7 +217,12 @@ class _AdaptiveBlockPolicy:
             return None
         if int(verify_len_cap) < full_block_tokens:
             return None
-        return cls(full_block_tokens=full_block_tokens)
+        policy = cls(full_block_tokens=full_block_tokens)
+        if int(prompt_len) >= policy.long_context_prompt_tokens:
+            policy.mode = "reduced"
+            policy.reductions = 1
+            policy.reduced_burst_cycles = policy.long_context_burst_cycles
+        return policy
 
     def block_limit(self) -> int:
         if self.mode == "reduced":
@@ -222,14 +245,15 @@ class _AdaptiveBlockPolicy:
                 self.mode = "probe"
                 self.probe_cycles_remaining = 2
                 self.probe_commits.clear()
+                self.reduced_burst_cycles = _ADAPTIVE_REDUCED_BURST_CYCLES
             return
 
         if block_len < self.full_block_tokens:
             return
 
-        if commit_count > self.high_commit_guard:
-            self.high_commit_seen = True
         self.full_commits.append(commit_count)
+        while len(self.full_commits) > self.window_size:
+            self.full_commits.popleft()
         if self.mode == "probe":
             self.probe_commits.append(commit_count)
             self.probe_cycles_remaining = max(0, self.probe_cycles_remaining - 1)
@@ -238,11 +262,13 @@ class _AdaptiveBlockPolicy:
                 self.mode = "full"
                 self.cooldown_full_cycles = self.window_size
                 self.reduced_cycles_since_probe = 0
+                self.reduced_burst_cycles = _ADAPTIVE_REDUCED_BURST_CYCLES
                 self.probe_commits.clear()
                 self.probe_cycles_remaining = 0
             elif self.probe_cycles_remaining <= 0:
                 self.mode = "reduced"
                 self.reduced_cycles_since_probe = 0
+                self.reduced_burst_cycles = _ADAPTIVE_REDUCED_BURST_CYCLES
                 self.probe_commits.clear()
             return
 
@@ -253,17 +279,17 @@ class _AdaptiveBlockPolicy:
         if len(self.full_commits) < self.window_size:
             return
 
-        recent_commits = list(self.full_commits)[-4:]
+        recent_commits = list(self.full_commits)
         full_avg = sum(self.full_commits) / len(self.full_commits)
         recent_avg = sum(recent_commits) / len(recent_commits)
         if (
-            not self.high_commit_seen
-            and full_avg <= self.low_commit_threshold
+            full_avg <= self.low_commit_threshold
             and recent_avg <= self.recent_low_commit_threshold
             and max(recent_commits) <= self.high_commit_guard
         ):
             self.mode = "reduced"
             self.reduced_cycles_since_probe = 0
+            self.reduced_burst_cycles = _ADAPTIVE_REDUCED_BURST_CYCLES
             self.reductions += 1
 
 
@@ -792,6 +818,686 @@ class SpeculativeSession:
             yield evt
             yield_pause.done(_pre_yield)
 
+    def _run_ddtree_decode_events(
+        self,
+        *,
+        request: _SessionRequest,
+        state: "_RequestState",
+        prefill: _PrefillResult,
+        yield_pause: "_YieldPauseTracker",
+    ) -> Generator[EngineEvent, None, _DecodeResult]:
+        target_cache = self.target_cache
+        target_ops = self.target_ops
+        draft_cache = self.draft_cache
+        draft_backend = self.draft_backend
+        target_layer_id_list = self.target_layer_id_list
+        capture_layer_ids = self.capture_layer_ids
+        profile_cycles = self.profile_cycles
+        memory_waterfall = self.memory_waterfall
+        target_model = self.target_model
+        draft_model = self.draft_model
+        runtime_config = self.runtime_config
+        prompt_len = request.prompt_len
+        max_new_tokens = request.max_new_tokens
+        block_tokens = request.block_tokens
+        stop_token_array = request.stop_token_array
+        feature_store = prefill.feature_store
+        suppress_token_mask = prefill.suppress_token_mask
+        supports_prefix_snapshot = prefill.supports_prefix_snapshot
+        collect_generation_snapshot_hidden = (
+            request.should_collect_generation_snapshot_hidden(supports_prefix_snapshot)
+        )
+        supports_target_tree_verify = bool(
+            target_ops.capabilities_for(target_model).supports_tree_verify
+            and target_ops.supports_tree_cache(target_cache)
+        )
+        forbidden_copy_tokens = (
+            set(int(token) for token in request.suppress_token_ids)
+            if request.suppress_token_ids is not None
+            else None
+        )
+
+        def _copy_draft_for_block(
+            staged_first: mx.array,
+            block_len: int,
+            draft_context: mx.array,
+        ) -> mx.array | None:
+            if state.copyspec_disabled:
+                return None
+            candidate = self.copyspec_index.draft_after(
+                int(staged_first.item()),
+                max_tokens=max(0, int(block_len) - 1),
+                forbidden_tokens=forbidden_copy_tokens,
+            )
+            if candidate is None:
+                return None
+            draft_backend.advance_context(
+                draft_model=draft_model,
+                draft_cache=draft_cache,
+                draft_context=draft_context,
+            )
+            return mx.array(candidate, dtype=mx.uint32)
+
+        def _waterfall_event(
+            phase: str,
+            *,
+            target_hidden_value: Any = None,
+            gen_hidden_chunks_value: Any = None,
+            extra: Optional[dict[str, Any]] = None,
+        ) -> Optional[MemoryWaterfallEvent]:
+            return self.memory_waterfall_event(
+                phase,
+                target_hidden_value=target_hidden_value,
+                gen_hidden_chunks_value=gen_hidden_chunks_value,
+                extra=extra,
+            )
+
+        first_token_yielded = False
+        if max_new_tokens > 0:
+            first_token_yielded = True
+            assert state.staged_first is not None
+            _pre_yield = yield_pause.mark()
+            yield TokenEvent(
+                token_id=int(state.staged_first.item()),
+                generated_tokens=1,
+                acceptance_ratio=0.0,
+                cycles_completed=0,
+            )
+            yield_pause.done(_pre_yield)
+
+        cycle_config = resolve_speculative_cycle_config(
+            runtime_config,
+            draft_model,
+            block_tokens,
+        )
+        effective_block_tokens = cycle_config.effective_block_tokens
+        verify_len_cap = cycle_config.verify_len_cap
+        state.start = prompt_len
+
+        draft_ns_total = 0
+        draft_prefill_ns = 0
+        draft_incremental_ns = 0
+        verify_ns_total = 0
+        replay_ns_total = 0
+        commit_ns_total = 0
+        copyspec_hits_total = 0
+        copyspec_tokens_total = 0
+        seen_draft_cycle = False
+        cycle_profiles: list[CycleCompleteEvent] = []
+        profile_totals_ns = {
+            "draft": 0,
+            "verify": 0,
+            "acceptance": 0,
+            "hidden_extraction": 0,
+            "rollback": 0,
+            "other": 0,
+            "cycle_total": 0,
+        }
+        decode_clear_interval = (
+            _DECODE_CLEAR_CACHE_INTERVAL_TOKENS if self.clear_cache_boundaries else 0
+        )
+        next_decode_clear_at = decode_clear_interval
+
+        while len(state.generated_token_ids) < max_new_tokens:
+            cycle_start_ns = time.perf_counter_ns() if profile_cycles else 0
+            if (
+                decode_clear_interval > 0
+                and len(state.generated_token_ids) >= next_decode_clear_at
+            ):
+                self.clear_cache_boundary()
+                while next_decode_clear_at <= len(state.generated_token_ids):
+                    next_decode_clear_at += decode_clear_interval
+
+            draft_cycle_ns = 0
+            verify_cycle_ns = 0
+            replay_cycle_ns = 0
+            acceptance_cycle_ns = 0
+            hidden_extract_cycle_ns = 0
+            remaining = max_new_tokens - len(state.generated_token_ids)
+            block_len = max(1, min(effective_block_tokens, remaining))
+            verify_token_count = verify_token_count_for_block(block_len, verify_len_cap)
+            assert state.staged_first is not None
+            current_staged_first = state.staged_first.astype(mx.uint32)
+            copyspec_tokens_cycle = 0
+
+            if block_len <= 1:
+                candidate_ids_list = [current_staged_first[:1]]
+                candidate_sources = ["greedy"]
+            else:
+                draft_context = feature_store.require_current_hidden()
+                draft_start_ns = time.perf_counter_ns()
+                copied = _copy_draft_for_block(
+                    current_staged_first,
+                    block_len,
+                    draft_context,
+                )
+                if copied is not None:
+                    copied_ids = ddtree_candidate_token_ids(
+                        prefix_tokens=current_staged_first,
+                        suffix_tokens=copied,
+                        block_len=block_len,
+                    )
+                    candidate_ids_list = [copied_ids]
+                    candidate_sources = ["copyspec"]
+                    copyspec_tokens_cycle = int(copied.shape[0])
+                    draft_cycle_ns = time.perf_counter_ns() - draft_start_ns
+                    draft_ns_total += draft_cycle_ns
+                    if not seen_draft_cycle:
+                        draft_prefill_ns += draft_cycle_ns
+                        seen_draft_cycle = True
+                    else:
+                        draft_incremental_ns += draft_cycle_ns
+                else:
+                    copyspec_tokens_cycle = 0
+                    draft_prefix_snapshot = ddtree_snapshot_cache(draft_cache)
+                    topk_block_len = (
+                        verify_token_count
+                        if supports_target_tree_verify
+                        else block_len
+                    )
+                    drafted_all, top_ids, top_values = draft_backend.draft_with_topk(
+                        target_model=target_model,
+                        target_ops=target_ops,
+                        draft_model=draft_model,
+                        draft_cache=draft_cache,
+                        prefix_tokens=current_staged_first,
+                        draft_context=draft_context,
+                        block_len=topk_block_len,
+                        suppress_token_mask=suppress_token_mask,
+                        top_width=_DDTREE_TOP_WIDTH,
+                    )
+                    draft_after_greedy_snapshot = ddtree_snapshot_cache(draft_cache)
+                    if supports_target_tree_verify:
+                        ddtree_restore_cache(draft_after_greedy_snapshot)
+                        draft_cycle_ns = time.perf_counter_ns() - draft_start_ns
+                        draft_ns_total += draft_cycle_ns
+                        if not seen_draft_cycle:
+                            draft_prefill_ns += draft_cycle_ns
+                            seen_draft_cycle = True
+                        else:
+                            draft_incremental_ns += draft_cycle_ns
+
+                        tree_budget = max(0, int(verify_token_count) - 1)
+                        tree = build_flat_ddtree(
+                            top_token_ids_desc=top_ids[:tree_budget],
+                            top_scores_desc=top_values[:tree_budget],
+                            budget=tree_budget,
+                        )
+                        tree_inputs = build_flat_tree_inputs(
+                            tree,
+                            root_token_id=int(current_staged_first.item()),
+                            prefix_len=state.start,
+                        )
+                        sample_memory_cycle = memory_waterfall and _should_sample_memory_cycle(
+                            state.cycles_completed + 1
+                        )
+                        if sample_memory_cycle:
+                            evt = _waterfall_event(
+                                "before_verify_cycle",
+                                target_hidden_value=feature_store.current_hidden,
+                                gen_hidden_chunks_value=feature_store.generation_chunks,
+                                extra={
+                                    "cycle": int(state.cycles_completed + 1),
+                                    "start": int(state.start),
+                                    "ddtree_tree_size": int(tree_inputs.size),
+                                },
+                            )
+                            if evt is not None:
+                                _pre_yield = yield_pause.mark()
+                                yield evt
+                                yield_pause.done(_pre_yield)
+
+                        verify_start_ns = time.perf_counter_ns()
+                        logits, hidden_states = target_ops.verify_tree_block(
+                            target_model=target_model,
+                            tree_inputs=tree_inputs,
+                            target_cache=target_cache,
+                            capture_layer_ids=capture_layer_ids,
+                        )
+                        eval_logits_and_captured(logits, hidden_states)
+                        posterior = greedy_tokens_with_mask(logits, suppress_token_mask).squeeze(0)
+                        mx.eval(posterior)
+                        verify_cycle_ns = time.perf_counter_ns() - verify_start_ns
+                        verify_ns_total += verify_cycle_ns
+                        if sample_memory_cycle:
+                            evt = _waterfall_event(
+                                "after_verify_cycle",
+                                target_hidden_value=feature_store.current_hidden,
+                                gen_hidden_chunks_value=feature_store.generation_chunks,
+                                extra={
+                                    "cycle": int(state.cycles_completed + 1),
+                                    "start": int(state.start),
+                                    "ddtree_tree_size": int(tree_inputs.size),
+                                },
+                            )
+                            if evt is not None:
+                                _pre_yield = yield_pause.mark()
+                                yield evt
+                                yield_pause.done(_pre_yield)
+
+                        acceptance_start_ns = time.perf_counter_ns() if profile_cycles else 0
+                        accepted_slots, next_token_id = follow_verified_tree(
+                            tree,
+                            [int(token_id) for token_id in posterior.tolist()],
+                        )
+                        acceptance_len = max(0, len(accepted_slots) - 1)
+                        state.acceptance_history.append(acceptance_len)
+                        if profile_cycles:
+                            acceptance_cycle_ns = time.perf_counter_ns() - acceptance_start_ns
+
+                        hidden_extract_start_ns = time.perf_counter_ns() if profile_cycles else 0
+                        accepted_hidden_states = ddtree_select_tree_slots(
+                            hidden_states,
+                            accepted_slots,
+                        )
+                        committed_hidden = target_ops.extract_context_feature(
+                            accepted_hidden_states,
+                            target_layer_id_list,
+                        )
+                        if profile_cycles:
+                            mx.eval(committed_hidden, posterior)
+                        else:
+                            mx.async_eval(committed_hidden)
+                        if profile_cycles:
+                            hidden_extract_cycle_ns = (
+                                time.perf_counter_ns() - hidden_extract_start_ns
+                            )
+
+                        commit_count = len(accepted_slots)
+                        committed_segment = mx.take(
+                            tree_inputs.token_ids,
+                            mx.array(accepted_slots, dtype=mx.int32),
+                            axis=0,
+                        )
+                        commit_start_ns = time.perf_counter_ns()
+                        state.start += commit_count
+                        feature_store.commit_generation(
+                            committed_hidden,
+                            collect_snapshot=collect_generation_snapshot_hidden,
+                        )
+                        state.last_cycle_logits = logits[:, int(accepted_slots[-1]), :]
+                        replay_cycle_ns = target_ops.restore_after_tree_acceptance(
+                            target_cache,
+                            accepted_tree_indices=accepted_slots,
+                        )
+                        if sample_memory_cycle:
+                            evt = _waterfall_event(
+                                "after_rollback",
+                                target_hidden_value=feature_store.current_hidden,
+                                gen_hidden_chunks_value=feature_store.generation_chunks,
+                                extra={
+                                    "cycle": int(state.cycles_completed + 1),
+                                    "start": int(state.start),
+                                    "commit_count": int(commit_count),
+                                    "ddtree_tree_size": int(tree_inputs.size),
+                                },
+                            )
+                            if evt is not None:
+                                _pre_yield = yield_pause.mark()
+                                yield evt
+                                yield_pause.done(_pre_yield)
+                        replay_ns_total += replay_cycle_ns
+                        state.cycles_completed += 1
+                        commit_wall_ns = time.perf_counter_ns() - commit_start_ns
+                        commit_ns_total += commit_wall_ns
+
+                        state.accepted_from_draft += acceptance_len
+                        staged_first_next = mx.array([int(next_token_id)], dtype=mx.uint32)
+                        committed_ids = [int(token_id) for token_id in committed_segment.tolist()]
+                        self.copyspec_index.append_committed(committed_ids)
+                        for token_id in committed_ids:
+                            if len(state.generated_token_ids) >= max_new_tokens:
+                                break
+                            state.generated_token_ids.append(token_id)
+                            if first_token_yielded:
+                                first_token_yielded = False
+                                continue
+                            _pre_yield = yield_pause.mark()
+                            yield TokenEvent(
+                                token_id=int(token_id),
+                                generated_tokens=len(state.generated_token_ids),
+                                acceptance_ratio=(
+                                    state.accepted_from_draft / len(state.generated_token_ids)
+                                    if state.generated_token_ids
+                                    else 0.0
+                                ),
+                                cycles_completed=int(state.cycles_completed),
+                            )
+                            yield_pause.done(_pre_yield)
+
+                        stop_hit = False
+                        if stop_token_array is not None:
+                            stop_hit = bool(
+                                mx.any(
+                                    mx.equal(
+                                        committed_segment[:, None],
+                                        stop_token_array[None, :],
+                                    )
+                                ).item()
+                            )
+                        if stop_hit:
+                            break
+
+                        state.staged_first = staged_first_next
+
+                        if profile_cycles:
+                            cycle_total_ns = time.perf_counter_ns() - cycle_start_ns
+                            named_ns = (
+                                draft_cycle_ns
+                                + verify_cycle_ns
+                                + acceptance_cycle_ns
+                                + hidden_extract_cycle_ns
+                                + replay_cycle_ns
+                            )
+                            other_cycle_ns = max(0, cycle_total_ns - named_ns)
+                            cycle_profile_entry = CycleCompleteEvent(
+                                cycle=int(state.cycles_completed),
+                                block_len=int(block_len),
+                                commit_count=int(commit_count),
+                                acceptance_len=int(acceptance_len),
+                                draft_us=ns_to_us(draft_cycle_ns),
+                                verify_us=ns_to_us(verify_cycle_ns),
+                                acceptance_us=ns_to_us(acceptance_cycle_ns),
+                                hidden_extraction_us=ns_to_us(hidden_extract_cycle_ns),
+                                rollback_us=ns_to_us(replay_cycle_ns),
+                                other_us=ns_to_us(other_cycle_ns),
+                                cycle_total_us=ns_to_us(cycle_total_ns),
+                                verify_token_count=int(tree_inputs.size),
+                            )
+                            cycle_profiles.append(cycle_profile_entry)
+                            _pre_yield = yield_pause.mark()
+                            yield cycle_profile_entry
+                            yield_pause.done(_pre_yield)
+                            profile_totals_ns["draft"] += draft_cycle_ns
+                            profile_totals_ns["verify"] += verify_cycle_ns
+                            profile_totals_ns["acceptance"] += acceptance_cycle_ns
+                            profile_totals_ns["hidden_extraction"] += hidden_extract_cycle_ns
+                            profile_totals_ns["rollback"] += replay_cycle_ns
+                            profile_totals_ns["other"] += other_cycle_ns
+                            profile_totals_ns["cycle_total"] += cycle_total_ns
+                        continue
+
+                    greedy_ids = ddtree_candidate_token_ids(
+                        prefix_tokens=current_staged_first,
+                        suffix_tokens=drafted_all,
+                        block_len=block_len,
+                    )
+                    branch_prefixes: list[mx.array] = []
+                    branch_sources: list[str] = []
+                    for branch_pos in ddtree_branch_positions(
+                        top_values_desc=top_values,
+                        block_len=block_len,
+                        max_branch_positions=_DDTREE_MAX_BRANCH_POSITIONS,
+                        strategy="first",
+                    ):
+                        greedy_token = int(greedy_ids[1 + branch_pos].item())
+                        seen_branch_tokens = {greedy_token}
+                        for branch_token in top_ids[branch_pos][:_DDTREE_TOP_WIDTH]:
+                            branch_token = int(branch_token)
+                            if branch_token in seen_branch_tokens:
+                                continue
+                            seen_branch_tokens.add(branch_token)
+                            branch_prefixes.append(
+                                mx.concatenate(
+                                    [
+                                        greedy_ids[: 1 + branch_pos],
+                                        mx.array([branch_token], dtype=mx.uint32),
+                                    ],
+                                    axis=0,
+                                )
+                            )
+                            branch_sources.append(f"ddtree:p{branch_pos}:t{branch_token}")
+
+                    candidate_ids_list = [greedy_ids]
+                    candidate_sources = ["greedy"]
+                    if branch_prefixes:
+                        ddtree_restore_cache(draft_prefix_snapshot)
+                        branch_cache = ddtree_clone_cache_for_batch(
+                            draft_cache,
+                            len(branch_prefixes),
+                        )
+                        branch_ids_list = draft_backend.draft_branch_blocks_batch(
+                            target_model=target_model,
+                            target_ops=target_ops,
+                            draft_model=draft_model,
+                            draft_cache=branch_cache,
+                            branch_prefixes=branch_prefixes,
+                            draft_context=draft_context,
+                            block_len=block_len,
+                            suppress_token_mask=suppress_token_mask,
+                        )
+                        candidate_ids_list.extend(branch_ids_list)
+                        candidate_sources.extend(branch_sources)
+                    ddtree_restore_cache(draft_after_greedy_snapshot)
+                    draft_cycle_ns = time.perf_counter_ns() - draft_start_ns
+                    draft_ns_total += draft_cycle_ns
+                    if not seen_draft_cycle:
+                        draft_prefill_ns += draft_cycle_ns
+                        seen_draft_cycle = True
+                    else:
+                        draft_incremental_ns += draft_cycle_ns
+
+
+            if verify_token_count < block_len:
+                candidate_ids_list = [
+                    candidate_ids[:verify_token_count]
+                    for candidate_ids in candidate_ids_list
+                ]
+
+            sample_memory_cycle = memory_waterfall and _should_sample_memory_cycle(
+                state.cycles_completed + 1
+            )
+            if sample_memory_cycle:
+                evt = _waterfall_event(
+                    "before_verify_cycle",
+                    target_hidden_value=feature_store.current_hidden,
+                    gen_hidden_chunks_value=feature_store.generation_chunks,
+                    extra={
+                        "cycle": int(state.cycles_completed + 1),
+                        "start": int(state.start),
+                    },
+                )
+                if evt is not None:
+                    _pre_yield = yield_pause.mark()
+                    yield evt
+                    yield_pause.done(_pre_yield)
+
+            verify_start_ns = time.perf_counter_ns()
+            batched_cache = ddtree_clone_cache_for_batch(
+                target_cache,
+                len(candidate_ids_list),
+            )
+            candidate_results, _verify_us = ddtree_verify_candidates_batch(
+                target_model=target_model,
+                target_ops=target_ops,
+                target_cache=batched_cache,
+                capture_layer_ids=capture_layer_ids,
+                candidate_ids=candidate_ids_list,
+                candidate_sources=candidate_sources,
+                suppress_token_mask=suppress_token_mask,
+                prefix_len=state.start,
+            )
+            verify_cycle_ns = time.perf_counter_ns() - verify_start_ns
+            verify_ns_total += verify_cycle_ns
+            if sample_memory_cycle:
+                evt = _waterfall_event(
+                    "after_verify_cycle",
+                    target_hidden_value=feature_store.current_hidden,
+                    gen_hidden_chunks_value=feature_store.generation_chunks,
+                    extra={
+                        "cycle": int(state.cycles_completed + 1),
+                        "start": int(state.start),
+                    },
+                )
+                if evt is not None:
+                    _pre_yield = yield_pause.mark()
+                    yield evt
+                    yield_pause.done(_pre_yield)
+
+            acceptance_start_ns = time.perf_counter_ns() if profile_cycles else 0
+            best_index, best = max(
+                enumerate(candidate_results),
+                key=lambda pair: (
+                    pair[1].commit_count,
+                    1 if pair[1].source == "greedy" else 0,
+                ),
+            )
+            acceptance_len = int(best.acceptance_len)
+            state.acceptance_history.append(acceptance_len)
+            if best.source == "copyspec":
+                copyspec_hits_total += 1
+                copyspec_tokens_total += copyspec_tokens_cycle or max(0, int(block_len) - 1)
+                if acceptance_len == 0:
+                    state.copyspec_disabled = True
+            if profile_cycles:
+                acceptance_cycle_ns = time.perf_counter_ns() - acceptance_start_ns
+
+            ddtree_copy_selected_cache(
+                dst_entries=target_cache,
+                src_entries=batched_cache,
+                batch_index=best_index,
+            )
+
+            hidden_extract_start_ns = time.perf_counter_ns() if profile_cycles else 0
+            committed_hidden = target_ops.extract_context_feature(
+                best.hidden_states,
+                target_layer_id_list,
+            )[:, : best.commit_count, :]
+            if profile_cycles:
+                mx.eval(committed_hidden, best.posterior)
+            else:
+                mx.async_eval(committed_hidden)
+            if profile_cycles:
+                hidden_extract_cycle_ns = time.perf_counter_ns() - hidden_extract_start_ns
+
+            commit_count = int(best.commit_count)
+            committed_segment = best.ids[:commit_count]
+            commit_start_ns = time.perf_counter_ns()
+            state.start += commit_count
+            feature_store.commit_generation(
+                committed_hidden,
+                collect_snapshot=collect_generation_snapshot_hidden,
+            )
+            state.last_cycle_logits = best.logits[:, acceptance_len, :]
+            replay_cycle_ns = target_ops.restore_after_acceptance(
+                target_cache,
+                target_len=state.start,
+                acceptance_length=acceptance_len,
+                drafted_tokens=max(0, int(best.ids.shape[0]) - 1),
+            )
+            if sample_memory_cycle:
+                evt = _waterfall_event(
+                    "after_rollback",
+                    target_hidden_value=feature_store.current_hidden,
+                    gen_hidden_chunks_value=feature_store.generation_chunks,
+                    extra={
+                        "cycle": int(state.cycles_completed + 1),
+                        "start": int(state.start),
+                        "commit_count": int(commit_count),
+                    },
+                )
+                if evt is not None:
+                    _pre_yield = yield_pause.mark()
+                    yield evt
+                    yield_pause.done(_pre_yield)
+            replay_ns_total += replay_cycle_ns
+            state.cycles_completed += 1
+            commit_wall_ns = time.perf_counter_ns() - commit_start_ns
+            commit_ns_total += commit_wall_ns
+
+            state.accepted_from_draft += acceptance_len
+            staged_first_next = best.posterior[acceptance_len : acceptance_len + 1]
+            committed_ids = [int(token_id) for token_id in committed_segment.tolist()]
+            self.copyspec_index.append_committed(committed_ids)
+            for token_id in committed_ids:
+                if len(state.generated_token_ids) >= max_new_tokens:
+                    break
+                state.generated_token_ids.append(token_id)
+                if first_token_yielded:
+                    first_token_yielded = False
+                    continue
+                _pre_yield = yield_pause.mark()
+                yield TokenEvent(
+                    token_id=int(token_id),
+                    generated_tokens=len(state.generated_token_ids),
+                    acceptance_ratio=(
+                        state.accepted_from_draft / len(state.generated_token_ids)
+                        if state.generated_token_ids
+                        else 0.0
+                    ),
+                    cycles_completed=int(state.cycles_completed),
+                )
+                yield_pause.done(_pre_yield)
+
+            stop_hit = False
+            if stop_token_array is not None:
+                stop_hit = bool(
+                    mx.any(
+                        mx.equal(
+                            committed_segment[:, None],
+                            stop_token_array[None, :],
+                        )
+                    ).item()
+                )
+            if stop_hit:
+                break
+
+            state.staged_first = staged_first_next
+
+            if profile_cycles:
+                cycle_total_ns = time.perf_counter_ns() - cycle_start_ns
+                named_ns = (
+                    draft_cycle_ns
+                    + verify_cycle_ns
+                    + acceptance_cycle_ns
+                    + hidden_extract_cycle_ns
+                    + replay_cycle_ns
+                )
+                other_cycle_ns = max(0, cycle_total_ns - named_ns)
+                cycle_profile_entry = CycleCompleteEvent(
+                    cycle=int(state.cycles_completed),
+                    block_len=int(block_len),
+                    commit_count=int(commit_count),
+                    acceptance_len=int(acceptance_len),
+                    draft_us=ns_to_us(draft_cycle_ns),
+                    verify_us=ns_to_us(verify_cycle_ns),
+                    acceptance_us=ns_to_us(acceptance_cycle_ns),
+                    hidden_extraction_us=ns_to_us(hidden_extract_cycle_ns),
+                    rollback_us=ns_to_us(replay_cycle_ns),
+                    other_us=ns_to_us(other_cycle_ns),
+                    cycle_total_us=ns_to_us(cycle_total_ns),
+                    verify_token_count=int(verify_token_count),
+                )
+                cycle_profiles.append(cycle_profile_entry)
+                _pre_yield = yield_pause.mark()
+                yield cycle_profile_entry
+                yield_pause.done(_pre_yield)
+                profile_totals_ns["draft"] += draft_cycle_ns
+                profile_totals_ns["verify"] += verify_cycle_ns
+                profile_totals_ns["acceptance"] += acceptance_cycle_ns
+                profile_totals_ns["hidden_extraction"] += hidden_extract_cycle_ns
+                profile_totals_ns["rollback"] += replay_cycle_ns
+                profile_totals_ns["other"] += other_cycle_ns
+                profile_totals_ns["cycle_total"] += cycle_total_ns
+
+        return _DecodeResult(
+            effective_block_tokens=effective_block_tokens,
+            verify_len_cap=verify_len_cap,
+            adaptive_block_reductions=0,
+            adaptive_block_cycles=0,
+            adaptive_block_min=None,
+            draft_ns_total=draft_ns_total,
+            draft_prefill_ns=draft_prefill_ns,
+            draft_incremental_ns=draft_incremental_ns,
+            verify_ns_total=verify_ns_total,
+            replay_ns_total=replay_ns_total,
+            commit_ns_total=commit_ns_total,
+            cycle_profiles=tuple(cycle_profiles),
+            profile_totals_ns=profile_totals_ns,
+            copyspec_hits=int(copyspec_hits_total),
+            copyspec_tokens=int(copyspec_tokens_total),
+        )
+
     def _run_decode_events(
         self,
         *,
@@ -800,6 +1506,16 @@ class SpeculativeSession:
         prefill: _PrefillResult,
         yield_pause: "_YieldPauseTracker",
     ) -> Generator[EngineEvent, None, _DecodeResult]:
+        if str(getattr(self.runtime_config, "verify_mode", "auto")) == "ddtree":
+            return (
+                yield from self._run_ddtree_decode_events(
+                    request=request,
+                    state=state,
+                    prefill=prefill,
+                    yield_pause=yield_pause,
+                )
+            )
+
         target_cache = self.target_cache
         target_ops = self.target_ops
         draft_cache = self.draft_cache
@@ -859,6 +1575,7 @@ class SpeculativeSession:
             runtime_config=runtime_config,
             effective_block_tokens=effective_block_tokens,
             verify_len_cap=cycle_config.verify_len_cap,
+            prompt_len=request.prompt_len,
         )
         block_token_buffer = mx.full(
             (effective_block_tokens,),

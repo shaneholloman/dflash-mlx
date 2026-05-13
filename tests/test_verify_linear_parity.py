@@ -59,6 +59,84 @@ def test_parity_verify_M16(small_ql):
     mx.eval(y_direct, y_verify)
     assert mx.allclose(y_direct, y_verify, atol=0, rtol=0).item()
 
+def test_m16_wrapper_accepts_n16_not_n32():
+    ql = nn.QuantizedLinear.from_linear(_mk_linear(512, 16), group_size=64, bits=4)
+    verify = VerifyQuantizedLinear.from_quantized(ql)
+    x = mx.random.normal((16, 512)).astype(mx.bfloat16) * 0.5
+    y_direct = verify_matmul(
+        x, ql.weight, ql.scales, ql.biases,
+        transpose=True, group_size=ql.group_size, bits=ql.bits,
+    )
+    y_verify = verify(x)
+    mx.eval(y_direct, y_verify)
+    assert mx.allclose(y_direct, y_verify, atol=0, rtol=0).item()
+
+@pytest.mark.parametrize("variant", ["combo_ktmpl", "super_tree_fp16_ktmpl"])
+def test_m16_wrapper_honors_forced_variant(monkeypatch, variant):
+    monkeypatch.setenv("DFLASH_VERIFY_VARIANT", variant)
+    ql = nn.QuantizedLinear.from_linear(_mk_linear(512, 1024), group_size=64, bits=4)
+    verify = VerifyQuantizedLinear.from_quantized(ql)
+    x = mx.random.normal((16, 512)).astype(mx.bfloat16) * 0.5
+    y_direct = verify_matmul(
+        x, ql.weight, ql.scales, ql.biases,
+        transpose=True, group_size=ql.group_size, bits=ql.bits,
+    )
+    y_verify = verify(x)
+    mx.eval(y_direct, y_verify)
+    assert mx.allclose(y_direct, y_verify, atol=0, rtol=0).item()
+
+@pytest.mark.parametrize("variant", ["combo_ktmpl", "super_tree_fp16_ktmpl"])
+def test_m16_forced_variant_matches_stock(monkeypatch, variant):
+    monkeypatch.setenv("DFLASH_VERIFY_QMM", "1")
+    monkeypatch.setenv("DFLASH_VERIFY_VARIANT", variant)
+    ql = nn.QuantizedLinear.from_linear(_mk_linear(512, 1024), group_size=64, bits=4)
+    verify = VerifyQuantizedLinear.from_quantized(ql)
+    x = mx.random.normal((16, 512)).astype(mx.bfloat16) * 0.5
+    y_stock = mx.quantized_matmul(
+        x, ql.weight, scales=ql.scales, biases=ql.biases,
+        transpose=True, group_size=ql.group_size, bits=ql.bits,
+    )
+    y_direct = verify_matmul(
+        x, ql.weight, ql.scales, ql.biases,
+        transpose=True, group_size=ql.group_size, bits=ql.bits,
+    )
+    y_verify = verify(x)
+    mx.eval(y_stock, y_direct, y_verify)
+    y_stock_f = y_stock.astype(mx.float32)
+    y_direct_f = y_direct.astype(mx.float32)
+    y_verify_f = y_verify.astype(mx.float32)
+    direct_abs = float(mx.max(mx.abs(y_stock_f - y_direct_f)).item())
+    wrapper_abs = float(mx.max(mx.abs(y_stock_f - y_verify_f)).item())
+    ref_max = float(mx.max(mx.abs(y_stock_f)).item())
+    assert direct_abs <= 6e-2
+    assert wrapper_abs <= 6e-2
+    assert direct_abs / (ref_max + 1e-3) <= 5e-2
+    assert wrapper_abs / (ref_max + 1e-3) <= 5e-2
+
+def test_parity_verify_M4_product_path(small_ql):
+    verify = VerifyQuantizedLinear.from_quantized(small_ql)
+    x = mx.random.normal((4, 512)).astype(mx.bfloat16) * 0.5
+    y_direct = verify_matmul(
+        x, small_ql.weight, small_ql.scales, small_ql.biases,
+        transpose=True, group_size=small_ql.group_size, bits=small_ql.bits,
+    )
+    y_verify = verify(x)
+    mx.eval(y_direct, y_verify)
+    assert mx.allclose(y_direct, y_verify, atol=0, rtol=0).item()
+
+def test_m4_wrapper_accepts_n4_not_n32():
+    ql = nn.QuantizedLinear.from_linear(_mk_linear(64, 12), group_size=64, bits=4)
+    assert is_verify_eligible(ql)
+    verify = VerifyQuantizedLinear.from_quantized(ql)
+    x = mx.random.normal((4, 64)).astype(mx.bfloat16) * 0.5
+    y_direct = verify_matmul(
+        x, ql.weight, ql.scales, ql.biases,
+        transpose=True, group_size=ql.group_size, bits=ql.bits,
+    )
+    y_verify = verify(x)
+    mx.eval(y_direct, y_verify)
+    assert mx.allclose(y_direct, y_verify, atol=0, rtol=0).item()
+
 def test_install_verify_linears_swaps_eligible_modules(small_ql):
     class Tiny(nn.Module):
         def __init__(self):

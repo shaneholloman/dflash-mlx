@@ -48,7 +48,7 @@ DEFAULT_RUNTIME_CONFIG = EffectiveRuntimeConfig(
     prefix_cache_l2_max_bytes=50 * GiB,
     target_fa_window=0,
     dflash_max_ctx=0,
-    verify_mode="auto",
+    verify_mode="adaptive",
 )
 
 @dataclass(frozen=True)
@@ -163,9 +163,9 @@ RUNTIME_CONFIG_FIELDS: tuple[RuntimeConfigFieldSpec, ...] = (
         field="verify_mode",
         flags=("--verify-mode",),
         env="DFLASH_VERIFY_MODE",
-        choices=("auto", "adaptive", "off"),
-        help="Verify path mode. Use off only for debug/parity.",
-        surfaces=(SURFACE_SERVE_DOCTOR, SURFACE_GENERATE),
+        choices=("auto", "adaptive", "ddtree", "off"),
+        help="Verify path mode. Default adaptive shortens low-acceptance blocks; use off only for debug/parity.",
+        surfaces=(SURFACE_SERVE_DOCTOR, SURFACE_GENERATE, SURFACE_BENCHMARK),
     ),
     RuntimeConfigFieldSpec(
         field="max_snapshot_tokens",
@@ -314,6 +314,7 @@ _GENERATE_RUNTIME_FIELD_ORDER = (
 )
 
 _BENCHMARK_RUNTIME_FIELD_ORDER = (
+    "verify_mode",
     "prefill_step_size",
     "target_fa_window",
     "draft_sink_size",
@@ -525,8 +526,10 @@ def validate_runtime_config(cfg: EffectiveRuntimeConfig) -> EffectiveRuntimeConf
         raise ValueError("--target-fa-window / target_fa_window must be >= 0")
     if cfg.dflash_max_ctx < 0:
         raise ValueError("--dflash-max-ctx / dflash_max_ctx must be >= 0")
-    if cfg.verify_mode not in ("auto", "adaptive", "off"):
-        raise ValueError("--verify-mode / verify_mode must be auto, adaptive, or off")
+    if cfg.verify_mode not in ("auto", "adaptive", "ddtree", "off"):
+        raise ValueError(
+            "--verify-mode / verify_mode must be auto, adaptive, ddtree, or off"
+        )
     if not cfg.prefix_cache and cfg.prefix_cache_l2:
         return replace(cfg, prefix_cache_l2=False)
     if cfg.target_fa_window > 0 and cfg.prefix_cache:

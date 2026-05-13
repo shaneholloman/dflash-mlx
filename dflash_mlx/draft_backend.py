@@ -43,6 +43,35 @@ class DraftBackend(Protocol):
     ) -> mx.array:
         ...
 
+    def draft_with_topk(
+        self,
+        *,
+        target_model: Any,
+        target_ops: Any,
+        draft_model: DFlashDraftModel,
+        draft_cache: list[Any],
+        prefix_tokens: mx.array,
+        draft_context: mx.array,
+        block_len: int,
+        suppress_token_mask: Optional[mx.array],
+        top_width: int,
+    ) -> tuple[mx.array, list[list[int]], list[list[float]]]:
+        ...
+
+    def draft_branch_blocks_batch(
+        self,
+        *,
+        target_model: Any,
+        target_ops: Any,
+        draft_model: DFlashDraftModel,
+        draft_cache: list[Any],
+        branch_prefixes: list[mx.array],
+        draft_context: mx.array,
+        block_len: int,
+        suppress_token_mask: Optional[mx.array],
+    ) -> list[mx.array]:
+        ...
+
     def advance_context(
         self,
         *,
@@ -123,6 +152,60 @@ class EagerDraftBackend:
         else:
             mx.eval(draft_logits)
         return drafted
+
+    def draft_with_topk(
+        self,
+        *,
+        target_model: Any,
+        target_ops: Any,
+        draft_model: DFlashDraftModel,
+        draft_cache: list[Any],
+        prefix_tokens: mx.array,
+        draft_context: mx.array,
+        block_len: int,
+        suppress_token_mask: Optional[mx.array],
+        top_width: int,
+    ) -> tuple[mx.array, list[list[int]], list[list[float]]]:
+        from dflash_mlx.engine.ddtree import draft_block_with_topk
+
+        drafted, top_ids, top_values, _draft_us = draft_block_with_topk(
+            target_model=target_model,
+            target_ops=target_ops,
+            draft_model=draft_model,
+            draft_cache=draft_cache,
+            prefix_tokens=prefix_tokens,
+            draft_context=draft_context,
+            block_len=block_len,
+            suppress_token_mask=suppress_token_mask,
+            top_width=top_width,
+        )
+        return drafted, top_ids, top_values
+
+    def draft_branch_blocks_batch(
+        self,
+        *,
+        target_model: Any,
+        target_ops: Any,
+        draft_model: DFlashDraftModel,
+        draft_cache: list[Any],
+        branch_prefixes: list[mx.array],
+        draft_context: mx.array,
+        block_len: int,
+        suppress_token_mask: Optional[mx.array],
+    ) -> list[mx.array]:
+        from dflash_mlx.engine.ddtree import draft_branch_blocks_batch
+
+        candidate_ids, _draft_us = draft_branch_blocks_batch(
+            target_model=target_model,
+            target_ops=target_ops,
+            draft_model=draft_model,
+            draft_cache=draft_cache,
+            branch_prefixes=branch_prefixes,
+            draft_context=draft_context,
+            block_len=block_len,
+            suppress_token_mask=suppress_token_mask,
+        )
+        return candidate_ids
 
     def advance_context(
         self,

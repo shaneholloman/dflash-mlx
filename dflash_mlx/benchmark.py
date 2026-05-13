@@ -91,6 +91,7 @@ CONTROLLED_FLAG_NAMES = (
     "draft_sink_size",
     "draft_window_size",
     "verify_len_cap",
+    "verify_mode",
     "out",
 )
 
@@ -396,6 +397,7 @@ def _build_config(
     draft_sink_size: int,
     draft_window_size: int,
     verify_len_cap: int,
+    verify_mode: str,
 ) -> dict[str, Any]:
     return {
         "model": model,
@@ -419,6 +421,7 @@ def _build_config(
         "draft_sink_size": int(draft_sink_size),
         "draft_window_size": int(draft_window_size),
         "verify_len_cap": int(verify_len_cap),
+        "verify_mode": str(verify_mode),
         "prompt": prompt,
         "prompt_tokens": int(prompt_tokens),
         "prompt_id": slugify_prompt_id(prompt),
@@ -432,13 +435,15 @@ def _offline_runtime_values(
     draft_sink_size: int | None = None,
     draft_window_size: int | None = None,
     verify_len_cap: int | None = None,
-) -> dict[str, int]:
+    verify_mode: str | None = None,
+) -> dict[str, Any]:
     cfg = build_offline_runtime_config(
         prefill_step_size=prefill_step_size,
         target_fa_window=target_fa_window,
         draft_sink_size=draft_sink_size,
         draft_window_size=draft_window_size,
         verify_len_cap=verify_len_cap,
+        verify_mode=verify_mode,
     )
     return {
         "prefill_step_size": int(cfg.prefill_step_size),
@@ -446,6 +451,7 @@ def _offline_runtime_values(
         "draft_sink_size": int(cfg.draft_sink_size),
         "draft_window_size": int(cfg.draft_window_size),
         "verify_len_cap": int(cfg.verify_len_cap),
+        "verify_mode": str(cfg.verify_mode),
     }
 
 def _build_single_case_report(
@@ -472,6 +478,7 @@ def _build_single_case_report(
     draft_sink_size: int,
     draft_window_size: int,
     verify_len_cap: int,
+    verify_mode: str,
 ) -> dict[str, Any]:
     run_entries = [_format_run_entry(run) for run in runs]
     baseline_tps_values = [float(run["baseline_generation_tps"]) for run in runs]
@@ -519,6 +526,7 @@ def _build_single_case_report(
             draft_sink_size=draft_sink_size,
             draft_window_size=draft_window_size,
             verify_len_cap=verify_len_cap,
+            verify_mode=verify_mode,
         ),
         "runs": run_entries,
         "summary": {
@@ -837,6 +845,7 @@ def _run_once_sequential(
     draft_sink_size: int | None = None,
     draft_window_size: int | None = None,
     verify_len_cap: int | None = None,
+    verify_mode: str | None = None,
 ) -> dict[str, Any]:
     pristine_target_model, pristine_tokenizer, pristine_meta = _load_pristine_target_bundle(
         target_model_ref
@@ -877,6 +886,7 @@ def _run_once_sequential(
             draft_sink_size=draft_sink_size,
             draft_window_size=draft_window_size,
             verify_len_cap=verify_len_cap,
+            verify_mode=verify_mode,
         )
         bundle = load_runtime_bundle(
             model_ref=target_model_ref,
@@ -983,6 +993,7 @@ def benchmark_once(
     draft_sink_size: int | None = None,
     draft_window_size: int | None = None,
     verify_len_cap: int | None = None,
+    verify_mode: str | None = None,
     cooldown: int = 10,
 ) -> dict[str, Any]:
     runtime_values = _offline_runtime_values(
@@ -991,6 +1002,7 @@ def benchmark_once(
         draft_sink_size=draft_sink_size,
         draft_window_size=draft_window_size,
         verify_len_cap=verify_len_cap,
+        verify_mode=verify_mode,
     )
     thermal_pressure = _get_thermal_pressure()
     _warn_if_throttled(thermal_pressure)
@@ -1050,6 +1062,7 @@ def benchmark_repeated(
     draft_sink_size: int | None = None,
     draft_window_size: int | None = None,
     verify_len_cap: int | None = None,
+    verify_mode: str | None = None,
     cooldown: int = 10,
 ) -> dict[str, Any]:
     runtime_values = _offline_runtime_values(
@@ -1058,6 +1071,7 @@ def benchmark_repeated(
         draft_sink_size=draft_sink_size,
         draft_window_size=draft_window_size,
         verify_len_cap=verify_len_cap,
+        verify_mode=verify_mode,
     )
     target_meta: dict[str, Any] | None = None
     draft_meta: dict[str, Any] | None = None
@@ -1149,6 +1163,7 @@ def benchmark_suite(
         "draft_sink_size": args.draft_sink_size,
         "draft_window_size": args.draft_window_size,
         "verify_len_cap": args.verify_len_cap,
+        "verify_mode": args.verify_mode,
         "cooldown": args.cooldown,
     }
     for prompt in prompts:
@@ -1365,6 +1380,7 @@ def _controlled_flag_values(
         "draft_sink_size": int(args.draft_sink_size),
         "draft_window_size": int(args.draft_window_size),
         "verify_len_cap": int(args.verify_len_cap),
+        "verify_mode": str(args.verify_mode),
         "out": str(output_path),
     }
 
@@ -1401,6 +1417,7 @@ def _explicit_flag_values(
         "--draft-sink-size": "draft_sink_size",
         "--draft-window-size": "draft_window_size",
         "--verify-len-cap": "verify_len_cap",
+        "--verify-mode": "verify_mode",
         "--out": "out",
     }
     seen = {option_to_name[token] for token in argv if token in option_to_name}

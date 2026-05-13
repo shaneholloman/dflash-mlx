@@ -126,7 +126,12 @@ class Gemma4TargetOps:
             supports_target_hidden_capture=True,
             supports_verify_linear=True,
             supports_full_context_draft_layers=True,
+            supports_tree_verify=False,
         )
+
+    def supports_tree_cache(self, cache_entries: list[Any]) -> bool:
+        del cache_entries
+        return False
 
     def text_wrapper(self, target_model: Any) -> Any:
         if hasattr(target_model, "language_model"):
@@ -281,6 +286,26 @@ class Gemma4TargetOps:
             cache=target_cache,
             capture_layer_ids=capture_layer_ids,
         )
+
+    def verify_tree_block(
+        self,
+        *,
+        target_model: Any,
+        tree_inputs: Any,
+        target_cache: list[Any],
+        capture_layer_ids: Optional[set[int]] = None,
+    ) -> tuple[mx.array, list[mx.array] | dict[int, mx.array]]:
+        del target_model, tree_inputs, target_cache, capture_layer_ids
+        raise NotImplementedError("Gemma4 DDTree target-tree verification is not implemented")
+
+    def restore_after_tree_acceptance(
+        self,
+        cache_entries: list[Any],
+        *,
+        accepted_tree_indices: list[int],
+    ) -> int:
+        del cache_entries, accepted_tree_indices
+        raise NotImplementedError("Gemma4 DDTree target-tree cache commit is not implemented")
 
     def extract_context_feature(
         self,

@@ -1344,7 +1344,7 @@ def test_build_server_cmd_forwards_gemma_runtime_overrides():
             fastpath_max_tokens=0,
             verify_len_cap=8,
             max_snapshot_tokens=32000,
-            verify_mode="off",
+            verify_mode="ddtree",
             clear_cache_boundaries=True,
             target_fa_window=2048,
             chat_template_args='{"enable_thinking":false}',
@@ -1361,7 +1361,7 @@ def test_build_server_cmd_forwards_gemma_runtime_overrides():
     assert "--fastpath-max-tokens 0" in rendered
     assert "--verify-len-cap 8" in rendered
     assert "--max-snapshot-tokens 32000" in rendered
-    assert "--verify-mode off" in rendered
+    assert "--verify-mode ddtree" in rendered
     assert "--clear-cache-boundaries" in cmd
     assert "--target-fa-window 2048" in rendered
     idx = cmd.index("--chat-template-args")
@@ -1504,7 +1504,7 @@ def test_agentic_trace_metadata_records_dflash_runtime_overrides(tmp_path, monke
             "--max-snapshot-tokens",
             "32000",
             "--verify-mode",
-            "off",
+            "ddtree",
             "--clear-cache-boundaries",
             "--prefix-cache-l2",
             "--prefix-cache-l2-dir",
@@ -1531,7 +1531,7 @@ def test_agentic_trace_metadata_records_dflash_runtime_overrides(tmp_path, monke
     assert overrides["fastpath_max_tokens"] == 0
     assert overrides["verify_len_cap"] == 8
     assert overrides["max_snapshot_tokens"] == 32000
-    assert overrides["verify_mode"] == "off"
+    assert overrides["verify_mode"] == "ddtree"
     assert overrides["clear_cache_boundaries"] is True
     assert overrides["prefix_cache"] is None
     assert overrides["prefix_cache_l2"] is True
@@ -1546,7 +1546,7 @@ def test_agentic_trace_metadata_records_dflash_runtime_overrides(tmp_path, monke
     assert "--fastpath-max-tokens 0" in rendered
     assert "--verify-len-cap 8" in rendered
     assert "--max-snapshot-tokens 32000" in rendered
-    assert "--verify-mode off" in rendered
+    assert "--verify-mode ddtree" in rendered
     assert "--clear-cache-boundaries" in server_cmd
     assert "--prefix-cache" not in server_cmd
     assert "--prefix-cache-max-entries" not in server_cmd

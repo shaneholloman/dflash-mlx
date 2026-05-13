@@ -7,7 +7,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import mlx.core as mx
-from mlx_lm.models.cache import KVCache, RotatingKVCache
+from mlx_lm.models.cache import KVCache, QuantizedKVCache, RotatingKVCache
 
 from dflash_mlx.engine.target_ops import bind_draft_to_target, resolve_target_ops
 from dflash_mlx.engine.target_gemma4 import Gemma4TargetOps
@@ -217,12 +217,22 @@ def test_capabilities_for_distinguishes_hybrid_and_pure_attention():
     assert hybrid.supports_dflash is True
     assert hybrid.supports_prefix_snapshot is True
     assert hybrid.supports_full_attention_split is True
+    assert hybrid.supports_tree_verify is True
     assert pure.supports_recurrent_rollback is False
     assert pure.supports_dflash is True
     assert pure.supports_kv_trim is True
     assert pure.supports_rotating_cache_snapshot is False
     assert pure.supports_shared_kv is False
     assert pure.supports_full_attention_split is False
+    assert pure.supports_tree_verify is True
+
+
+def test_qwen_tree_cache_support_rejects_rotating_and_quantized_kv():
+    ops = QwenGdnTargetOps()
+
+    assert ops.supports_tree_cache([KVCache()]) is True
+    assert ops.supports_tree_cache([RotatingKVCache(max_size=4)]) is False
+    assert ops.supports_tree_cache([QuantizedKVCache(group_size=64, bits=8)]) is False
 
 
 def test_qwen_capabilities_own_qwen_shape_policy():
@@ -283,6 +293,7 @@ def test_gemma4_capabilities_enable_prefix_snapshot_without_shared_kv():
     assert caps.supports_target_hidden_capture is True
     assert caps.supports_verify_linear is True
     assert caps.supports_full_attention_split is False
+    assert caps.supports_tree_verify is False
 
 
 def test_gemma4_capabilities_disable_prefix_snapshot_with_shared_kv():

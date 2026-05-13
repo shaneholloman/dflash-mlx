@@ -22,6 +22,11 @@ from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
 
 _EXACT_SMALL_PROJ_PAD_M = 16
 _HYBRID_SDPA_EXACT_KV_THRESHOLD = 1024
+_TREE_POSITIONS_ATTR = "_dflash_tree_positions"
+_TREE_PARENT_IDS_ATTR = "_dflash_tree_parent_ids"
+_TREE_ATTENTION_MASK_ATTR = "_dflash_tree_attention_mask"
+_TREE_PREFIX_LEN_ATTR = "_dflash_tree_prefix_len"
+_TREE_SIZE_ATTR = "_dflash_tree_size"
 
 
 def _int_attr(obj: Any, name: str) -> int:
@@ -158,6 +163,315 @@ def _split_sdpa_output(
         )
     return mx.concatenate(outputs, axis=2)
 
+
+def _as_int_list(values: mx.array) -> list[int]:
+    return [int(value) for value in values.tolist()]
+
+
+def _apply_rope_positions(rope: Any, x: mx.array, positions: mx.array) -> mx.array:
+    pos = _as_int_list(positions)
+    if not pos:
+        return x
+    if len(pos) == 1:
+        return rope(x, offset=pos[0])
+    chunks = [rope(x[:, :, index : index + 1, :], offset=value) for index, value in enumerate(pos)]
+    return mx.concatenate(chunks, axis=2)
+
+
+def _tree_path_indices(parent_ids: list[int], slot_index: int) -> list[int]:
+    path: list[int] = []
+    cursor = int(slot_index)
+    while cursor >= 0:
+        path.append(cursor)
+        cursor = int(parent_ids[cursor])
+    return list(reversed(path))
+
+
+def _tree_conv_window_indices(
+    parent_ids: list[int],
+    *,
+    conv_kernel_size: int,
+) -> mx.array:
+    kernel = int(conv_kernel_size)
+    keep = kernel - 1
+    rows: list[list[int]] = []
+    for slot_index in range(len(parent_ids)):
+        path = _tree_path_indices(parent_ids, slot_index)
+        path_tail = path[-kernel:]
+        prefix_need = kernel - len(path_tail)
+        prefix_start = keep - prefix_need
+        rows.append(
+            list(range(prefix_start, keep))
+            + [keep + int(path_slot) for path_slot in path_tail]
+        )
+    return mx.array(rows, dtype=mx.int32)
+
+
+def _tree_conv1d(
+    linear_attn: Any,
+    *,
+    qkv: mx.array,
+    cache: RecurrentRollbackCache,
+    parent_ids: list[int],
+) -> mx.array:
+    batch_size = int(qkv.shape[0])
+    conv_dim = int(qkv.shape[-1])
+    kernel = int(linear_attn.conv_kernel_size)
+    keep = kernel - 1
+    prefix_state = cache[0]
+    if keep <= 0:
+        prefix_state = mx.zeros((batch_size, 0, conv_dim), dtype=qkv.dtype)
+    elif prefix_state is None:
+        prefix_state = mx.zeros((batch_size, keep, conv_dim), dtype=qkv.dtype)
+    cache._dflash_tree_prefix_conv_state = prefix_state
+    gather_indices = _tree_conv_window_indices(parent_ids, conv_kernel_size=kernel)
+    from dflash_mlx.kernels import tree_depthwise_conv1d
+
+    return tree_depthwise_conv1d(
+        qkv,
+        prefix_state,
+        linear_attn.conv1d.weight,
+        getattr(linear_attn.conv1d, "bias", None),
+        gather_indices,
+    )
+
+
+def _tree_recurrent_call(
+    linear_attn: Any,
+    inputs: mx.array,
+    *,
+    cache: RecurrentRollbackCache,
+) -> mx.array:
+    from mlx.nn.layers.distributed import sum_gradients
+
+    parent_ids = _as_int_list(getattr(cache, _TREE_PARENT_IDS_ATTR))
+    batch_size, tree_size, _ = inputs.shape
+    sharding_group = getattr(linear_attn, "sharding_group", None)
+
+    if sharding_group is not None:
+        inputs = sum_gradients(sharding_group)(inputs)
+
+    qkv = linear_attn.in_proj_qkv(inputs)
+    z_proj = linear_attn.in_proj_z(inputs)
+    z = z_proj.reshape(batch_size, tree_size, linear_attn.num_v_heads, linear_attn.head_v_dim)
+    b = linear_attn.in_proj_b(inputs)
+    a = linear_attn.in_proj_a(inputs)
+
+    conv_out = _tree_conv1d(linear_attn, qkv=qkv, cache=cache, parent_ids=parent_ids)
+    q, k, v = [
+        tensor.reshape(batch_size, tree_size, heads, dim)
+        for tensor, heads, dim in zip(
+            mx.split(conv_out, [linear_attn.key_dim, 2 * linear_attn.key_dim], -1),
+            [linear_attn.num_k_heads, linear_attn.num_k_heads, linear_attn.num_v_heads],
+            [linear_attn.head_k_dim, linear_attn.head_k_dim, linear_attn.head_v_dim],
+            strict=True,
+        )
+    ]
+
+    state = cache[1]
+    inv_scale = k.shape[-1] ** -0.5
+    q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
+    k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+    g = gated_delta_mod.compute_g(linear_attn.A_log, a, linear_attn.dt_bias)
+    beta = mx.sigmoid(b)
+
+    if state is None:
+        _, _, h_k, d_k = q.shape
+        h_v, d_v = v.shape[-2:]
+        state = mx.zeros((batch_size, h_v, d_v, d_k), dtype=mx.float32)
+    cache._dflash_tree_prefix_state = state
+
+    from dflash_mlx.kernels import gated_delta_tree_tape_kernel
+
+    out, tree_tape = gated_delta_tree_tape_kernel(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state,
+        mx.array(parent_ids, dtype=mx.int32),
+    )
+    cache._dflash_tree_tape = mx.contiguous(tree_tape)
+    cache._dflash_tree_k = mx.contiguous(k)
+    cache._dflash_tree_g = mx.contiguous(g)
+    cache._dflash_tree_qkv = mx.contiguous(qkv)
+    cache.advance(tree_size)
+    out = linear_attn.norm(out, z)
+    out_flat = out.reshape(batch_size, tree_size, -1)
+    out = linear_attn.out_proj(out_flat)
+
+    if sharding_group is not None:
+        out = mx.distributed.all_sum(out, group=sharding_group)
+
+    return out
+
+
+def _tree_attention_call(
+    attn: Any,
+    x: mx.array,
+    *,
+    mask: Optional[mx.array],
+    cache: Any,
+) -> Optional[mx.array]:
+    if cache is None or not hasattr(cache, _TREE_POSITIONS_ATTR):
+        return None
+
+    batch_size, seq_len, _ = x.shape
+    q_proj_output = attn.q_proj(x)
+    num_attention_heads = _attention_num_heads(attn)
+    num_key_value_heads = _attention_num_kv_heads(attn)
+    gate = None
+    if _attention_has_gated_q_proj(attn):
+        queries, gate = mx.split(
+            q_proj_output.reshape(batch_size, seq_len, num_attention_heads, -1),
+            2,
+            axis=-1,
+        )
+        gate = gate.reshape(batch_size, seq_len, -1)
+    else:
+        queries = q_proj_output.reshape(batch_size, seq_len, num_attention_heads, -1)
+
+    keys = attn.k_proj(x)
+    values = attn.v_proj(x)
+
+    queries = attn.q_norm(queries).transpose(0, 2, 1, 3)
+    keys = attn.k_norm(keys.reshape(batch_size, seq_len, num_key_value_heads, -1)).transpose(
+        0, 2, 1, 3
+    )
+    values = values.reshape(batch_size, seq_len, num_key_value_heads, -1).transpose(
+        0, 2, 1, 3
+    )
+
+    positions = getattr(cache, _TREE_POSITIONS_ATTR)
+    queries = _apply_rope_positions(attn.rope, queries, positions)
+    keys = _apply_rope_positions(attn.rope, keys, positions)
+    keys, values = cache.update_and_fetch(keys, values)
+    tree_mask = getattr(cache, _TREE_ATTENTION_MASK_ATTR, mask)
+    output = scaled_dot_product_attention(
+        queries,
+        keys,
+        values,
+        cache=cache,
+        scale=attn.scale,
+        mask=tree_mask,
+    )
+    output = output.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
+    if gate is not None:
+        output = output * mx.sigmoid(gate)
+    return attn.o_proj(output)
+
+
+def _set_tree_cache_context(cache_entries: list[Any], tree_inputs: Any) -> None:
+    tree_size = int(tree_inputs.token_ids.shape[0])
+    prefix_len = int(tree_inputs.attention_mask.shape[1]) - tree_size
+    for cache_entry in cache_entries:
+        if isinstance(cache_entry, cache_mod.QuantizedKVCache):
+            raise NotImplementedError("DDTree target-tree verify does not support quantized KV cache")
+        if isinstance(cache_entry, cache_mod.RotatingKVCache):
+            raise NotImplementedError("DDTree target-tree verify does not support rotating KV cache")
+        setattr(cache_entry, _TREE_POSITIONS_ATTR, tree_inputs.positions)
+        setattr(cache_entry, _TREE_PARENT_IDS_ATTR, tree_inputs.parent_ids)
+        setattr(cache_entry, _TREE_ATTENTION_MASK_ATTR, tree_inputs.attention_mask)
+        setattr(cache_entry, _TREE_PREFIX_LEN_ATTR, prefix_len)
+        setattr(cache_entry, _TREE_SIZE_ATTR, tree_size)
+
+
+def _clear_tree_cache_context(cache_entry: Any) -> None:
+    for attr_name in (
+        _TREE_POSITIONS_ATTR,
+        _TREE_PARENT_IDS_ATTR,
+        _TREE_ATTENTION_MASK_ATTR,
+        _TREE_PREFIX_LEN_ATTR,
+        _TREE_SIZE_ATTR,
+        "_dflash_tree_prefix_conv_state",
+        "_dflash_tree_prefix_state",
+        "_dflash_tree_states",
+        "_dflash_tree_tape",
+        "_dflash_tree_k",
+        "_dflash_tree_g",
+        "_dflash_tree_qkv",
+    ):
+        if hasattr(cache_entry, attr_name):
+            delattr(cache_entry, attr_name)
+
+
+def _commit_kv_tree_path(cache_entry: Any, accepted_tree_indices: list[int]) -> None:
+    if getattr(cache_entry, "keys", None) is None:
+        _clear_tree_cache_context(cache_entry)
+        return
+    prefix_len = int(getattr(cache_entry, _TREE_PREFIX_LEN_ATTR))
+    tree_size = int(getattr(cache_entry, _TREE_SIZE_ATTR))
+    if int(getattr(cache_entry, "offset", 0)) < prefix_len + tree_size:
+        raise RuntimeError("DDTree KV cache did not append the full tree")
+    gather_indices = list(range(prefix_len)) + [
+        prefix_len + int(slot_index) for slot_index in accepted_tree_indices
+    ]
+    gather = mx.array(gather_indices, dtype=mx.int32)
+    cache_entry.keys = mx.take(cache_entry.keys[..., : prefix_len + tree_size, :], gather, axis=2)
+    cache_entry.values = mx.take(cache_entry.values[..., : prefix_len + tree_size, :], gather, axis=2)
+    cache_entry.offset = len(gather_indices)
+    _clear_tree_cache_context(cache_entry)
+
+
+def _commit_recurrent_tree_path(
+    cache_entry: RecurrentRollbackCache,
+    accepted_tree_indices: list[int],
+) -> None:
+    tree_states = getattr(cache_entry, "_dflash_tree_states", None)
+    tree_tape = getattr(cache_entry, "_dflash_tree_tape", None)
+    tree_k = getattr(cache_entry, "_dflash_tree_k", None)
+    tree_g = getattr(cache_entry, "_dflash_tree_g", None)
+    tree_qkv = getattr(cache_entry, "_dflash_tree_qkv", None)
+    if tree_qkv is None or (tree_states is None and (tree_tape is None or tree_k is None or tree_g is None)):
+        _clear_tree_cache_context(cache_entry)
+        raise RuntimeError("DDTree recurrent cache missing tree intermediates")
+
+    last_slot = int(accepted_tree_indices[-1])
+    if tree_states is not None:
+        cache_entry[1] = mx.contiguous(tree_states[:, last_slot, ...])
+    else:
+        from dflash_mlx.kernels import tape_replay_kernel
+
+        gather = mx.array([int(slot_index) for slot_index in accepted_tree_indices], dtype=mx.int32)
+        prefix_state = getattr(cache_entry, "_dflash_tree_prefix_state", None)
+        if prefix_state is None:
+            prefix_state = cache_entry[1]
+        if prefix_state is None:
+            _clear_tree_cache_context(cache_entry)
+            raise RuntimeError("DDTree recurrent cache missing prefix state")
+        accepted_tape = mx.take(tree_tape, gather, axis=1)
+        accepted_k = mx.take(tree_k, gather, axis=1)
+        accepted_g = mx.take(tree_g, gather, axis=1)
+        cache_entry[1] = tape_replay_kernel(
+            accepted_tape,
+            accepted_k,
+            accepted_g,
+            prefix_state,
+            None,
+        )
+
+    keep = int(cache_entry.conv_kernel_size) - 1
+    if keep > 0:
+        prefix_state = getattr(cache_entry, "_dflash_tree_prefix_conv_state", None)
+        if prefix_state is None:
+            prefix_state = mx.zeros(
+                (tree_qkv.shape[0], keep, tree_qkv.shape[-1]),
+                dtype=tree_qkv.dtype,
+            )
+        accepted_qkv = mx.take(
+            tree_qkv,
+            mx.array([int(slot_index) for slot_index in accepted_tree_indices], dtype=mx.int32),
+            axis=1,
+        )
+        conv_source = mx.concatenate([prefix_state, accepted_qkv], axis=1)
+        cache_entry[0] = mx.contiguous(conv_source[:, -keep:, :])
+    else:
+        cache_entry[0] = None
+
+    _clear_tree_cache_context(cache_entry)
+
+
 def _install_speculative_linear_cache_hook(linear_attn: Any) -> None:
     cls = type(linear_attn)
     if getattr(cls, "_dflash_speculative_call_installed", False):
@@ -171,6 +485,8 @@ def _install_speculative_linear_cache_hook(linear_attn: Any) -> None:
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
+        if isinstance(cache, RecurrentRollbackCache) and hasattr(cache, _TREE_PARENT_IDS_ATTR):
+            return _tree_recurrent_call(self, inputs, cache=cache)
         if not isinstance(cache, RecurrentRollbackCache) or not getattr(cache, "_armed", False):
             return original_call(self, inputs, mask=mask, cache=cache)
 
@@ -285,6 +601,9 @@ def _install_split_full_attention_hook(attn: Any) -> None:
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
+        tree_output = _tree_attention_call(self, x, mask=mask, cache=cache)
+        if tree_output is not None:
+            return tree_output
         if not getattr(self, "_dflash_split_sdpa_enabled", False):
             return original_call(self, x, mask=mask, cache=cache)
         if not _attention_has_gated_q_proj(self):
@@ -451,6 +770,16 @@ class QwenGdnTargetOps:
             supports_target_hidden_capture=True,
             supports_verify_linear=self._supports_verify_linear(target_model),
             supports_full_attention_split=has_recurrent,
+            supports_tree_verify=True,
+        )
+
+    def supports_tree_cache(self, cache_entries: list[Any]) -> bool:
+        return all(
+            not isinstance(
+                cache_entry,
+                (cache_mod.QuantizedKVCache, cache_mod.RotatingKVCache),
+            )
+            for cache_entry in cache_entries
         )
 
     def _supports_verify_linear(self, target_model: Any) -> bool:
@@ -546,11 +875,60 @@ class QwenGdnTargetOps:
             capture_layer_ids=capture_layer_ids,
         )
 
+    def verify_tree_block(
+        self,
+        *,
+        target_model: Any,
+        tree_inputs: Any,
+        target_cache: list[Any],
+        capture_layer_ids: Optional[set[int]] = None,
+    ) -> tuple[mx.array, list[mx.array] | dict[int, mx.array]]:
+        tree_size = int(tree_inputs.token_ids.shape[0])
+        if tree_size <= 0:
+            raise ValueError("DDTree target tree must contain at least the root slot")
+        self.install_speculative_hooks(target_model)
+        _set_tree_cache_context(target_cache, tree_inputs)
+        try:
+            return self.forward_with_hidden_capture(
+                target_model,
+                input_ids=tree_inputs.token_ids[None],
+                cache=target_cache,
+                capture_layer_ids=capture_layer_ids,
+            )
+        except Exception as exc:
+            for cache_entry in target_cache:
+                _clear_tree_cache_context(cache_entry)
+            raise RuntimeError("DDTree target-tree verify failed") from exc
+
+    def restore_after_tree_acceptance(
+        self,
+        cache_entries: list[Any],
+        *,
+        accepted_tree_indices: list[int],
+    ) -> int:
+        if not accepted_tree_indices:
+            raise ValueError("accepted_tree_indices must not be empty")
+        replay_start_ns = time.perf_counter_ns()
+        for cache_entry in cache_entries:
+            if isinstance(cache_entry, RecurrentRollbackCache):
+                _commit_recurrent_tree_path(cache_entry, accepted_tree_indices)
+            elif hasattr(cache_entry, "keys") and hasattr(cache_entry, "values"):
+                _commit_kv_tree_path(cache_entry, accepted_tree_indices)
+            else:
+                _clear_tree_cache_context(cache_entry)
+                raise NotImplementedError(
+                    f"DDTree cache commit unsupported for {type(cache_entry).__name__}"
+                )
+        return time.perf_counter_ns() - replay_start_ns
+
     def install_speculative_hooks(self, target_model: Any) -> None:
         text_model = self.text_model(target_model)
         if getattr(text_model, "_dflash_speculative_hooks_installed", False):
             return
         if self.family(target_model) == "pure_attention":
+            for layer in text_model.layers:
+                if hasattr(layer, "self_attn"):
+                    _install_split_full_attention_hook(layer.self_attn)
             text_model._dflash_speculative_hooks_installed = True
             return
         for layer in text_model.layers:

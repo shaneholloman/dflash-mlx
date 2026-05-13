@@ -110,6 +110,7 @@ selected row indices, and selected prompt ids.
 | `--draft-sink-size INT` | draft cache sink tokens |
 | `--draft-window-size INT` | draft cache rolling window tokens |
 | `--verify-len-cap INT` | max tokens per verify forward |
+| `--verify-mode {auto,adaptive,ddtree,off}` | verifier path mode |
 | `--no-memory` | omit memory medians |
 | `--out PATH` | artifact directory |
 

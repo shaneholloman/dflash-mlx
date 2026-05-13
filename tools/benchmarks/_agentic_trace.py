@@ -1500,7 +1500,11 @@ def replay_main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--fastpath-max-tokens", type=int, default=None)
     p.add_argument("--verify-len-cap", type=int, default=None)
     p.add_argument("--max-snapshot-tokens", type=int, default=None)
-    p.add_argument("--verify-mode", choices=("auto", "adaptive", "off"), default=None)
+    p.add_argument(
+        "--verify-mode",
+        choices=("auto", "adaptive", "ddtree", "off"),
+        default=None,
+    )
     p.add_argument("--clear-cache-boundaries", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--target-fa-window", type=int, default=None)
     p.add_argument("--chat-template-args", default='{"enable_thinking":true}')
@@ -1904,7 +1908,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     p.add_argument(
         "--verify-mode",
-        choices=("auto", "adaptive", "off"),
+        choices=("auto", "adaptive", "ddtree", "off"),
         default=None,
         help="dflash only: pass --verify-mode to dflash serve.",
     )

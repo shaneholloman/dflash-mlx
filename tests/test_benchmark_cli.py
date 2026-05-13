@@ -71,6 +71,7 @@ def test_benchmark_parser_exposes_public_flags(capsys):
         "--draft-sink-size",
         "--draft-window-size",
         "--verify-len-cap",
+        "--verify-mode",
         "--out",
     } <= option_strings
     assert "--matrix" not in out
@@ -219,6 +220,8 @@ def test_benchmark_invocation_records_explicit_and_effective_values():
             "512",
             "--verify-len-cap",
             "8",
+            "--verify-mode",
+            "ddtree",
         ]
     )
     args = benchmark._finalize_benchmark_args(
@@ -266,6 +269,8 @@ def test_benchmark_invocation_records_explicit_and_effective_values():
             "512",
             "--verify-len-cap",
             "8",
+            "--verify-mode",
+            "ddtree",
         ],
         config,
     )
@@ -290,6 +295,7 @@ def test_benchmark_invocation_records_explicit_and_effective_values():
     assert invocation["explicit_flags"]["draft_sink_size"] == 32
     assert invocation["explicit_flags"]["draft_window_size"] == 512
     assert invocation["explicit_flags"]["verify_len_cap"] == 8
+    assert invocation["explicit_flags"]["verify_mode"] == "ddtree"
     assert invocation["effective"]["model"] == "resolved-target"
     assert invocation["effective"]["draft"] == "resolved-draft"
     assert invocation["effective"]["suite"] == "longctx"
@@ -544,6 +550,7 @@ def test_benchmark_summary_markdown_handles_missing_metrics():
         "n/a | n/a | n/a |"
     ) in text
     assert "- draft_quant: w4" in text
+    assert "- verify_mode: None" in text
 
 
 def test_benchmark_uses_effective_runtime_default_draft_quant_label():
@@ -666,9 +673,31 @@ def test_benchmark_runs_json_rows_keep_provenance():
     parser = benchmark.build_parser()
     args = benchmark._finalize_benchmark_args(
         parser.parse_args(
-            ["--suite", "smoke", "--model", "m", "--draft", "d", "--draft-quant", "w4"]
+            [
+                "--suite",
+                "smoke",
+                "--model",
+                "m",
+                "--draft",
+                "d",
+                "--draft-quant",
+                "w4",
+                "--verify-mode",
+                "ddtree",
+            ]
         ),
-        ["--suite", "smoke", "--model", "m", "--draft", "d", "--draft-quant", "w4"],
+        [
+            "--suite",
+            "smoke",
+            "--model",
+            "m",
+            "--draft",
+            "d",
+            "--draft-quant",
+            "w4",
+            "--verify-mode",
+            "ddtree",
+        ],
     )
     result = benchmark_report.suite_report(
         prompts=prompts,
@@ -708,6 +737,7 @@ def test_benchmark_runs_json_rows_keep_provenance():
     assert row["git_hash"] == "abc123"
     assert row["prompt_tokenization_mode"] == "chat_template"
     assert row["max_tokens"] == 64
+    assert row["verify_mode"] == "ddtree"
     assert result["config"]["split_sdpa"] is False
     assert result["config"]["split_sdpa_applied"] is False
     assert row["split_sdpa"] is False
@@ -765,6 +795,7 @@ def test_benchmark_runtime_context_uses_product_verify_config():
         draft_sink_size=32,
         draft_window_size=512,
         verify_len_cap=8,
+        verify_mode="adaptive",
     )
 
     assert context.runtime.prefill_step_size == 2048
@@ -773,7 +804,7 @@ def test_benchmark_runtime_context_uses_product_verify_config():
     assert context.runtime.draft_window_size == 512
     assert context.runtime.verify_len_cap == 8
     assert context.runtime.prefix_cache is False
-    assert context.verify.mode == "auto"
+    assert context.verify.mode == "adaptive"
     assert context.verify.enable_qmm is True
 
 

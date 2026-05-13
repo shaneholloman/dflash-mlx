@@ -142,6 +142,7 @@ def suite_report(
             "draft_sink_size": int(args.draft_sink_size),
             "draft_window_size": int(args.draft_window_size),
             "verify_len_cap": int(args.verify_len_cap),
+            "verify_mode": str(args.verify_mode),
             "prompt_tokenization_mode": "chat_template"
             if not bool(args.no_chat_template)
             else "raw",
@@ -185,6 +186,7 @@ def flatten_prompt_runs(
             row["draft_sink_size"] = suite_config.get("draft_sink_size")
             row["draft_window_size"] = suite_config.get("draft_window_size")
             row["verify_len_cap"] = suite_config.get("verify_len_cap")
+            row["verify_mode"] = suite_config.get("verify_mode")
             rows.append(row)
     return rows
 
@@ -295,6 +297,7 @@ def summary_markdown(result: dict[str, Any]) -> str:
         f"- target_fa_window: {config.get('target_fa_window')}",
         f"- draft_window: {config.get('draft_sink_size')}+{config.get('draft_window_size')}",
         f"- verify_len_cap: {config.get('verify_len_cap')}",
+        f"- verify_mode: {config.get('verify_mode')}",
         "",
         "## Per Prompt",
         "",

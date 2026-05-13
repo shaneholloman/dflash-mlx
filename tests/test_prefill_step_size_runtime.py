@@ -38,7 +38,10 @@ class _FakeTargetOps:
         self.cleanup_calls = 0
 
     def capabilities_for(self, _target_model):
-        return SimpleNamespace(supports_prefix_snapshot=True)
+        return SimpleNamespace(supports_prefix_snapshot=True, supports_tree_verify=False)
+
+    def supports_tree_cache(self, _target_cache):
+        return True
 
     def make_cache(self, *_args, **_kwargs):
         return []
@@ -105,6 +108,8 @@ class _RecordingDraftBackend(_FakeDraftBackend):
     def __init__(self) -> None:
         self.calls: list[tuple[int, bool]] = []
         self.advance_context_lengths: list[int] = []
+        self.ddtree_topk_calls: list[tuple[int, int]] = []
+        self.ddtree_branch_batch_calls: list[tuple[int, int]] = []
 
     def draft_greedy(self, **kwargs):
         block_len = int(kwargs["block_len"])
@@ -113,6 +118,24 @@ class _RecordingDraftBackend(_FakeDraftBackend):
 
     def advance_context(self, **kwargs) -> None:
         self.advance_context_lengths.append(int(kwargs["draft_context"].shape[1]))
+
+    def draft_with_topk(self, **kwargs):
+        from dflash_mlx.engine.ddtree import draft_block_with_topk
+
+        self.ddtree_topk_calls.append(
+            (int(kwargs["block_len"]), int(kwargs["top_width"]))
+        )
+        drafted, top_ids, top_values, _draft_us = draft_block_with_topk(**kwargs)
+        return drafted, top_ids, top_values
+
+    def draft_branch_blocks_batch(self, **kwargs):
+        from dflash_mlx.engine.ddtree import draft_branch_blocks_batch
+
+        self.ddtree_branch_batch_calls.append(
+            (len(kwargs["branch_prefixes"]), int(kwargs["block_len"]))
+        )
+        candidate_ids, _draft_us = draft_branch_blocks_batch(**kwargs)
+        return candidate_ids
 
 
 class _RecordingL2:
@@ -150,6 +173,7 @@ class _RecordingL2:
 def _runtime_context(
     diagnostics_config: DiagnosticsConfig | None = None,
     verify_mode: str | None = None,
+    verify_len_cap: int | None = None,
 ):
     return build_runtime_context(
         runtime_config_from_defaults(
@@ -157,6 +181,7 @@ def _runtime_context(
             prefix_cache=False,
             prefix_cache_l2=False,
             verify_mode=verify_mode,
+            verify_len_cap=0 if verify_len_cap is None else verify_len_cap,
         ),
         diagnostics_config=diagnostics_config,
     )
@@ -1417,6 +1442,127 @@ def test_copyspec_full_block_copy_skips_draft_backend():
     assert summary.copyspec_tokens == 3
 
 
+def test_ddtree_copyspec_full_block_copy_skips_ddtree_draft_backend():
+    target_ops = _FakeTargetOps()
+    draft_model = _draft_model()
+    draft_backend = _RecordingDraftBackend()
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=draft_model,
+            draft_backend=draft_backend,
+            prompt="unused",
+            max_new_tokens=4,
+            prompt_tokens_override=[1, 2, 3, 4, 5, 0, 0, 0, 0, 1, 2, 3, 4, 5],
+            runtime_context=_runtime_context(verify_mode="ddtree"),
+        )
+    )
+
+    summary = next(event for event in events if isinstance(event, SummaryEvent))
+
+    assert draft_backend.calls == []
+    assert draft_backend.ddtree_topk_calls == []
+    assert draft_backend.ddtree_branch_batch_calls == []
+    assert draft_backend.advance_context_lengths == [14]
+    assert summary.generated_token_ids == (0, 0, 0, 0)
+    assert summary.accepted_from_draft == 3
+    assert summary.acceptance_history == (3,)
+    assert summary.copyspec_hits == 1
+    assert summary.copyspec_tokens == 3
+
+
+def test_ddtree_copyspec_partial_acceptance_preserves_rollback_snapshot():
+    class _RollbackEntry:
+        def __init__(self) -> None:
+            self.value = mx.zeros((1, 1), dtype=mx.float32)
+            self._snapshot = None
+
+    class _RollbackTargetOps(_FakeTargetOps):
+        def __init__(self) -> None:
+            super().__init__()
+            self.restore_snapshot_shapes: list[tuple[int, ...] | None] = []
+            self.restore_acceptance_lengths: list[int] = []
+
+        def capabilities_for(self, _target_model):
+            return SimpleNamespace(
+                supports_prefix_snapshot=True,
+                supports_tree_verify=True,
+            )
+
+        def make_cache(self, *_args, **_kwargs):
+            return [_RollbackEntry()]
+
+        def arm_rollback(self, cache_entries, *, prefix_len: int) -> None:
+            del prefix_len
+            for cache_entry in cache_entries:
+                cache_entry._snapshot = cache_entry.value
+
+        def verify_block(
+            self,
+            *,
+            target_model,
+            verify_ids,
+            target_cache,
+            capture_layer_ids,
+        ):
+            del target_model, capture_layer_ids
+            batch, seq_len = verify_ids.shape
+            target_cache[0].value = mx.ones((batch, seq_len), dtype=mx.float32)
+            logits = mx.zeros((batch, seq_len, 8), dtype=mx.float32)
+            logits[:, 0, 0] = 1.0
+            if seq_len > 1:
+                logits[:, 1:, 7] = 1.0
+            hidden = {1: mx.zeros((batch, seq_len, 2), dtype=mx.float32)}
+            return logits, hidden
+
+        def restore_after_acceptance(
+            self,
+            cache_entries,
+            *,
+            target_len: int,
+            acceptance_length: int,
+            drafted_tokens: int = 0,
+        ) -> int:
+            del target_len, drafted_tokens
+            snapshot = cache_entries[0]._snapshot
+            self.restore_snapshot_shapes.append(
+                None if snapshot is None else tuple(int(dim) for dim in snapshot.shape)
+            )
+            self.restore_acceptance_lengths.append(int(acceptance_length))
+            return 0
+
+    target_ops = _RollbackTargetOps()
+    draft_model = _draft_model()
+    draft_backend = _RecordingDraftBackend()
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=draft_model,
+            draft_backend=draft_backend,
+            prompt="unused",
+            max_new_tokens=4,
+            stop_token_ids=[0],
+            prompt_tokens_override=[1, 2, 3, 4, 5, 0, 0, 0, 0, 1, 2, 3, 4, 5],
+            runtime_context=_runtime_context(verify_mode="ddtree"),
+        )
+    )
+
+    summary = next(event for event in events if isinstance(event, SummaryEvent))
+
+    assert draft_backend.ddtree_topk_calls == []
+    assert target_ops.restore_snapshot_shapes == [(1, 1)]
+    assert target_ops.restore_acceptance_lengths == [1]
+    assert summary.acceptance_history == (1,)
+    assert summary.copyspec_hits == 1
+    assert summary.copyspec_tokens == 3
+
+
 def test_copyspec_consecutive_hits_advance_draft_contexts():
     target_ops = _FakeTargetOps()
     draft_model = _draft_model()
@@ -1561,7 +1707,7 @@ def test_adaptive_verify_mode_drops_and_recovers_block_len():
             batch, seq_len = verify_ids.shape
             self.verify_lengths.append(int(seq_len))
             self._cycle += 1
-            if self._cycle <= 12:
+            if self._cycle <= 4:
                 pattern = [1] + [0] * (seq_len - 1)
             else:
                 pattern = [0] * seq_len
@@ -1582,7 +1728,7 @@ def test_adaptive_verify_mode_drops_and_recovers_block_len():
             draft_model=draft_model,
             draft_backend=draft_backend,
             prompt="unused",
-            max_new_tokens=48,
+            max_new_tokens=120,
             prompt_tokens_override=[1, 2],
             runtime_context=_runtime_context(verify_mode="adaptive"),
         )
@@ -1590,13 +1736,113 @@ def test_adaptive_verify_mode_drops_and_recovers_block_len():
 
     summary = next(event for event in events if isinstance(event, SummaryEvent))
 
-    assert draft_backend.calls[:17] == [(8, True)] * 12 + [(4, True)] * 4 + [(8, True)]
-    assert target_ops.verify_lengths[:17] == [8] * 12 + [4] * 4 + [8]
+    assert draft_backend.calls[:29] == [(8, True)] * 4 + [(4, True)] * 24 + [(8, True)]
+    assert target_ops.verify_lengths[:29] == [8] * 4 + [4] * 24 + [8]
     assert summary.block_tokens == 8
     assert summary.verify_len_cap == 8
-    assert summary.acceptance_history[:17] == (0,) * 12 + (3,) * 4 + (7,)
+    assert summary.acceptance_history[:29] == (0,) * 4 + (3,) * 24 + (7,)
     assert summary.adaptive_block_reductions == 1
-    assert summary.adaptive_block_cycles == 4
+    assert summary.adaptive_block_cycles == 24
+    assert summary.adaptive_block_min == 4
+
+
+def test_adaptive_verify_mode_starts_reduced_for_long_context():
+    short_policy = spec_epoch._AdaptiveBlockPolicy.from_runtime(
+        runtime_config=_runtime_context(verify_mode="adaptive").runtime,
+        effective_block_tokens=8,
+        verify_len_cap=8,
+        prompt_len=32767,
+    )
+    policy = spec_epoch._AdaptiveBlockPolicy.from_runtime(
+        runtime_config=_runtime_context(verify_mode="adaptive").runtime,
+        effective_block_tokens=8,
+        verify_len_cap=8,
+        prompt_len=32768,
+    )
+
+    assert short_policy is not None
+    assert short_policy.mode == "full"
+    assert short_policy.block_limit() == 8
+    assert short_policy.reductions == 0
+    assert short_policy.reduced_burst_cycles == 24
+    assert policy is not None
+    assert policy.mode == "reduced"
+    assert policy.block_limit() == 4
+    assert policy.reductions == 1
+    assert policy.reduced_burst_cycles == 64
+
+
+def test_adaptive_verify_mode_long_context_burst_is_initial_only():
+    policy = spec_epoch._AdaptiveBlockPolicy.from_runtime(
+        runtime_config=_runtime_context(verify_mode="adaptive").runtime,
+        effective_block_tokens=8,
+        verify_len_cap=8,
+        prompt_len=32768,
+    )
+    assert policy is not None
+
+    for _ in range(64):
+        policy.record(block_len=4, acceptance_len=3)
+
+    assert policy.mode == "probe"
+    assert policy.reduced_burst_cycles == 24
+
+    policy.record(block_len=8, acceptance_len=7)
+    assert policy.mode == "full"
+
+    for _ in range(5):
+        policy.record(block_len=8, acceptance_len=0)
+
+    assert policy.mode == "reduced"
+    assert policy.reductions == 2
+    assert policy.reduced_burst_cycles == 24
+
+
+def test_adaptive_verify_mode_long_context_handoff_starts_block4():
+    draft_model = _draft_model(block_size=8)
+
+    class _RecordingTargetOps(_FakeTargetOps):
+        def __init__(self) -> None:
+            super().__init__()
+            self.verify_lengths: list[int] = []
+
+        def verify_block(
+            self,
+            *,
+            target_model,
+            verify_ids,
+            target_cache,
+            capture_layer_ids,
+        ):
+            self.verify_lengths.append(int(verify_ids.shape[1]))
+            return super().verify_block(
+                target_model=target_model,
+                verify_ids=verify_ids,
+                target_cache=target_cache,
+                capture_layer_ids=capture_layer_ids,
+            )
+
+    target_ops = _RecordingTargetOps()
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=draft_model,
+            draft_backend=_FakeDraftBackend(),
+            prompt="unused",
+            max_new_tokens=4,
+            prompt_tokens_override=[1] * 32768,
+            runtime_context=_runtime_context(verify_mode="adaptive"),
+        )
+    )
+
+    summary = next(event for event in events if isinstance(event, SummaryEvent))
+
+    assert target_ops.verify_lengths[:1] == [4]
+    assert summary.adaptive_block_reductions == 1
+    assert summary.adaptive_block_cycles == 1
     assert summary.adaptive_block_min == 4
 
 
@@ -1652,6 +1898,214 @@ def test_adaptive_verify_mode_ignores_mixed_commit_windows():
     assert summary.adaptive_block_reductions == 0
     assert summary.adaptive_block_cycles == 0
     assert summary.adaptive_block_min is None
+
+
+def test_adaptive_verify_mode_recovers_after_isolated_high_commit():
+    policy = spec_epoch._AdaptiveBlockPolicy(full_block_tokens=8)
+
+    policy.record(block_len=8, acceptance_len=7)
+    for _ in range(3):
+        policy.record(block_len=8, acceptance_len=0)
+
+    assert policy.mode == "full"
+
+    policy.record(block_len=8, acceptance_len=0)
+
+    assert policy.mode == "reduced"
+    assert policy.reductions == 1
+
+
+def test_ddtree_verify_mode_selects_branch_candidate():
+    class _Embedding:
+        def __call__(self, input_ids):
+            return input_ids.astype(mx.float32)[..., None]
+
+    class _DDTreeTargetOps(_FakeTargetOps):
+        def __init__(self) -> None:
+            super().__init__()
+            self.verify_shapes: list[tuple[int, int]] = []
+
+        def embed_tokens(self, _target_model):
+            return _Embedding()
+
+        def logits_from_hidden(self, _target_model, hidden_states):
+            return hidden_states
+
+        def verify_block(
+            self,
+            *,
+            target_model,
+            verify_ids,
+            target_cache,
+            capture_layer_ids,
+        ):
+            del target_model, target_cache, capture_layer_ids
+            batch, seq_len = verify_ids.shape
+            self.verify_shapes.append((int(batch), int(seq_len)))
+            logits = mx.zeros((batch, seq_len, 4), dtype=mx.float32)
+            for pos in range(seq_len):
+                logits[:, pos, 2] = 1.0
+            hidden = {1: mx.zeros((batch, seq_len, 2), dtype=mx.float32)}
+            return logits, hidden
+
+    class _DDTreeDraftModel:
+        target_layer_ids = [0]
+        block_size = 4
+        mask_token_id = 0
+
+        def project_target_hidden(self, value):
+            return value
+
+        def forward_projected_context(
+            self,
+            *,
+            noise_embedding,
+            draft_context,
+            cache,
+        ):
+            del draft_context, cache
+            rows: list[list[list[float]]] = []
+            for row in noise_embedding[..., 0].tolist():
+                branch_mode = len(row) > 1 and int(row[1]) == 2
+                token = 2 if branch_mode else 1
+                row_logits: list[list[float]] = []
+                for _pos in row:
+                    logits = [0.0, 0.0, 0.0, 0.0]
+                    logits[token] = 2.0
+                    if not branch_mode:
+                        logits[2] = 1.0
+                    row_logits.append(logits)
+                rows.append(row_logits)
+            return mx.array(rows, dtype=mx.float32)
+
+    target_ops = _DDTreeTargetOps()
+    draft_backend = _RecordingDraftBackend()
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=_DDTreeDraftModel(),
+            draft_backend=draft_backend,
+            prompt="unused",
+            max_new_tokens=4,
+            prompt_tokens_override=[1, 2],
+            runtime_context=_runtime_context(verify_mode="ddtree"),
+        )
+    )
+
+    summary = next(event for event in events if isinstance(event, SummaryEvent))
+
+    assert draft_backend.calls == []
+    assert draft_backend.ddtree_topk_calls == [(4, 2)]
+    assert draft_backend.ddtree_branch_batch_calls == [(2, 4)]
+    assert target_ops.verify_shapes == [(3, 4)]
+    assert summary.generated_token_ids == (0, 2, 2, 2)
+    assert summary.acceptance_history == (3,)
+    assert summary.accepted_from_draft == 3
+    assert summary.cycles_completed == 1
+    assert summary.tokens_per_cycle == 4.0
+    assert summary.copyspec_hits == 0
+
+
+def test_ddtree_target_tree_topk_uses_verify_cap_not_full_block():
+    class _Embedding:
+        def __call__(self, input_ids):
+            return input_ids.astype(mx.float32)[..., None]
+
+    class _TargetTreeOps(_FakeTargetOps):
+        def __init__(self) -> None:
+            super().__init__()
+            self.tree_sizes: list[int] = []
+            self.accepted_slots: list[tuple[int, ...]] = []
+
+        def capabilities_for(self, _target_model):
+            return SimpleNamespace(
+                supports_prefix_snapshot=True,
+                supports_tree_verify=True,
+            )
+
+        def embed_tokens(self, _target_model):
+            return _Embedding()
+
+        def logits_from_hidden(self, _target_model, hidden_states):
+            return hidden_states
+
+        def verify_tree_block(
+            self,
+            *,
+            target_model,
+            tree_inputs,
+            target_cache,
+            capture_layer_ids,
+        ):
+            del target_model, target_cache, capture_layer_ids
+            tree_size = int(tree_inputs.size)
+            self.tree_sizes.append(tree_size)
+            logits = mx.zeros((1, tree_size, 4), dtype=mx.float32)
+            hidden = {1: mx.zeros((1, tree_size, 2), dtype=mx.float32)}
+            return logits, hidden
+
+        def restore_after_tree_acceptance(
+            self,
+            _target_cache,
+            *,
+            accepted_tree_indices,
+        ) -> int:
+            self.accepted_slots.append(tuple(int(idx) for idx in accepted_tree_indices))
+            return 0
+
+    class _DDTreeDraftModel:
+        target_layer_ids = [0]
+        block_size = 8
+        mask_token_id = 0
+
+        def project_target_hidden(self, value):
+            return value
+
+        def forward_projected_context(
+            self,
+            *,
+            noise_embedding,
+            draft_context,
+            cache,
+        ):
+            del draft_context, cache
+            rows: list[list[list[float]]] = []
+            for row in noise_embedding[..., 0].tolist():
+                row_logits: list[list[float]] = []
+                for _pos in row:
+                    logits = [0.0, 0.0, 0.0, 0.0]
+                    logits[1] = 2.0
+                    logits[2] = 1.0
+                    row_logits.append(logits)
+                rows.append(row_logits)
+            return mx.array(rows, dtype=mx.float32)
+
+    target_ops = _TargetTreeOps()
+    draft_backend = _RecordingDraftBackend()
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=_DDTreeDraftModel(),
+            draft_backend=draft_backend,
+            prompt="unused",
+            max_new_tokens=8,
+            prompt_tokens_override=[9, 8],
+            runtime_context=_runtime_context(verify_mode="ddtree", verify_len_cap=4),
+        )
+    )
+
+    summary = next(event for event in events if isinstance(event, SummaryEvent))
+
+    assert draft_backend.ddtree_topk_calls[0] == (4, 2)
+    assert target_ops.tree_sizes[0] == 4
+    assert summary.verify_len_cap == 4
+    assert summary.block_tokens == 8
 
 
 def test_memory_waterfall_decode_cycle_order_is_stable():

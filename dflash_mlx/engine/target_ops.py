@@ -22,6 +22,7 @@ class TargetCapabilities:
     supports_verify_linear: bool = False
     supports_full_context_draft_layers: bool = False
     supports_full_attention_split: bool = False
+    supports_tree_verify: bool = False
 
 class TargetOps(Protocol):
     backend_name: str
@@ -33,6 +34,8 @@ class TargetOps(Protocol):
     def family(self, target_model: Any) -> str: ...
 
     def capabilities_for(self, target_model: Any) -> TargetCapabilities: ...
+
+    def supports_tree_cache(self, cache_entries: list[Any]) -> bool: ...
 
     def text_model(self, target_model: Any) -> Any: ...
 
@@ -78,6 +81,22 @@ class TargetOps(Protocol):
         target_cache: list[Any],
         capture_layer_ids: Optional[set[int]] = None,
     ) -> tuple[mx.array, list[mx.array] | dict[int, mx.array]]: ...
+
+    def verify_tree_block(
+        self,
+        *,
+        target_model: Any,
+        tree_inputs: Any,
+        target_cache: list[Any],
+        capture_layer_ids: Optional[set[int]] = None,
+    ) -> tuple[mx.array, list[mx.array] | dict[int, mx.array]]: ...
+
+    def restore_after_tree_acceptance(
+        self,
+        cache_entries: list[Any],
+        *,
+        accepted_tree_indices: list[int],
+    ) -> int: ...
 
     def extract_context_feature(
         self,

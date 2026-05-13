@@ -273,6 +273,8 @@ def test_offline_runtime_arguments_project_from_shared_runtime_schema():
             "2048",
             "--draft-window-size",
             "512",
+            "--verify-mode",
+            "ddtree",
         ]
     )
 
@@ -282,8 +284,8 @@ def test_offline_runtime_arguments_project_from_shared_runtime_schema():
         "draft_sink_size": 64,
         "draft_window_size": 512,
         "verify_len_cap": 0,
+        "verify_mode": "ddtree",
     }
-    assert not hasattr(args, "verify_mode")
 
 
 def test_offline_runtime_argument_defaults_follow_single_runtime_default(monkeypatch):

@@ -139,7 +139,7 @@ def test_doctor_load_model_uses_runtime_bundle(monkeypatch, capsys):
     assert calls
     assert calls[0]["model_ref"] == "Qwen/Qwen3.5-9B"
     assert calls[0]["draft_ref"] == "manual/draft"
-    assert calls[0]["verify_config"].mode == "auto"
+    assert calls[0]["verify_config"].mode == "adaptive"
     load_check = next(check for check in report["checks"] if check["name"] == "load_model")
     assert load_check["status"] == "ok"
     assert load_check["message"] == "runtime bundle loads"
