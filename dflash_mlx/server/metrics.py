@@ -64,9 +64,10 @@ _LIVE_LAST_PREFIX: dict[str, Optional[int]] = {
     "restored": None,
     "computed": None,
 }
-_LIVE_TOTALS: dict[str, int] = {
+_LIVE_TOTALS: dict[str, Any] = {
     "requests": 0,
     "generated_tokens": 0,
+    "decode_s": 0.0,
     "prefill_tokens_physical": 0,
     "prefill_tokens_restored": 0,
     "cache_hits": 0,
@@ -287,7 +288,13 @@ class _RequestAccounting:
             prefill_tok_s_apparent=self.prefill_tok_s_apparent,
             decode_tok_s=self.decode_tok_s,
             acceptance_rate=self.acceptance_ratio,
+            tokens_per_cycle=self.tokens_per_cycle,
             cycles=self.cycles_completed,
+            adaptive_block_reductions=self.adaptive_block_reductions,
+            adaptive_block_cycles=self.adaptive_block_cycles,
+            adaptive_block_min=self.adaptive_block_min,
+            copyspec_hits=self.copyspec_hits,
+            copyspec_tokens=self.copyspec_tokens,
             finish_reason=self.finish_reason,
             cache_hit_tokens=self.cache_hit_tokens,
             prefill_phase_timings_us=self.prefill_phase_timings_us,
@@ -486,7 +493,13 @@ def start_live_request(
         "decode_s": None,
         "decode_tok_s": None,
         "acceptance_rate": None,
+        "tokens_per_cycle": None,
         "cycles": None,
+        "adaptive_block_reductions": 0,
+        "adaptive_block_cycles": 0,
+        "adaptive_block_min": None,
+        "copyspec_hits": 0,
+        "copyspec_tokens": 0,
         "finish_reason": None,
         "prefill_phase_timings_us": {},
         "phase_timings_us": {},
@@ -509,7 +522,13 @@ def update_live_request(
     prefill_done: bool = False,
     decode_tok_s: Optional[float] = None,
     acceptance_rate: Optional[float] = None,
+    tokens_per_cycle: Optional[float] = None,
     cycles: Optional[int] = None,
+    adaptive_block_reductions: Optional[int] = None,
+    adaptive_block_cycles: Optional[int] = None,
+    adaptive_block_min: Optional[int] = None,
+    copyspec_hits: Optional[int] = None,
+    copyspec_tokens: Optional[int] = None,
     finish_reason: Optional[str] = None,
     prefill_phase_timings_us: Optional[dict[str, float]] = None,
     phase_timings_us: Optional[dict[str, float]] = None,
@@ -536,8 +555,20 @@ def update_live_request(
             current["decode_tok_s"] = float(decode_tok_s)
         if acceptance_rate is not None:
             current["acceptance_rate"] = float(acceptance_rate)
+        if tokens_per_cycle is not None:
+            current["tokens_per_cycle"] = float(tokens_per_cycle)
         if cycles is not None:
             current["cycles"] = int(cycles)
+        if adaptive_block_reductions is not None:
+            current["adaptive_block_reductions"] = int(adaptive_block_reductions)
+        if adaptive_block_cycles is not None:
+            current["adaptive_block_cycles"] = int(adaptive_block_cycles)
+        if adaptive_block_min is not None:
+            current["adaptive_block_min"] = int(adaptive_block_min)
+        if copyspec_hits is not None:
+            current["copyspec_hits"] = int(copyspec_hits)
+        if copyspec_tokens is not None:
+            current["copyspec_tokens"] = int(copyspec_tokens)
         if finish_reason is not None:
             current["finish_reason"] = finish_reason
         if prefill_phase_timings_us is not None:
@@ -665,7 +696,7 @@ def _reset_live_metrics_state() -> None:
         _LIVE_REQUEST_FINISH_TIMES.clear()
         _LIVE_LAST_PREFIX.update({"restored": None, "computed": None})
         for key in _LIVE_TOTALS:
-            _LIVE_TOTALS[key] = 0
+            _LIVE_TOTALS[key] = 0.0 if key == "decode_s" else 0
 
 def _write_summary_line_from_accounting(accounting: _RequestAccounting) -> None:
     generation_tokens = int(accounting.generated_tokens or 0)
@@ -830,8 +861,15 @@ def _record_live_accounting(accounting: _RequestAccounting) -> None:
     last_request = accounting.last_request_payload()
     with _LIVE_LOCK:
         _LIVE_TOTALS["requests"] += 1
+        generated_tokens = int(accounting.generated_tokens or 0)
         if accounting.generated_tokens is not None:
-            _LIVE_TOTALS["generated_tokens"] += int(accounting.generated_tokens)
+            _LIVE_TOTALS["generated_tokens"] += generated_tokens
+        if (
+            generated_tokens > 0
+            and accounting.decode_ms is not None
+            and float(accounting.decode_ms) > 0.0
+        ):
+            _LIVE_TOTALS["decode_s"] += float(accounting.decode_ms) / 1_000.0
         if accounting.physical_prefill_tokens is not None:
             _LIVE_TOTALS["prefill_tokens_physical"] += int(
                 accounting.physical_prefill_tokens
@@ -866,7 +904,7 @@ def _finish_live_request_unlocked(last_request: dict[str, Any]) -> None:
 
 def _rates_payload(
     *,
-    totals: dict[str, int],
+    totals: dict[str, Any],
     current_request: Optional[dict[str, Any]],
     last_request: Optional[dict[str, Any]],
     finish_times: list[float],
@@ -885,6 +923,10 @@ def _rates_payload(
         "generated_tokens_per_s": _rate(
             int(totals.get("generated_tokens", 0) or 0),
             uptime_s,
+        ),
+        "average_decode_tok_s": _rate(
+            int(totals.get("generated_tokens", 0) or 0),
+            float(totals.get("decode_s", 0.0) or 0.0),
         ),
         "prefill_tokens_physical_per_s": _rate(
             int(totals.get("prefill_tokens_physical", 0) or 0),
@@ -930,7 +972,13 @@ def _last_request_payload(
     prefill_tok_s_apparent: Optional[float],
     decode_tok_s: Optional[float],
     acceptance_rate: Optional[float],
+    tokens_per_cycle: Optional[float],
     cycles: Optional[int],
+    adaptive_block_reductions: int,
+    adaptive_block_cycles: int,
+    adaptive_block_min: Optional[int],
+    copyspec_hits: int,
+    copyspec_tokens: int,
     finish_reason: Optional[str],
     cache_hit_tokens: int = 0,
     prefill_phase_timings_us: Optional[dict[str, float]] = None,
@@ -948,7 +996,13 @@ def _last_request_payload(
         "prefill_tok_s_apparent": _float_or_none(prefill_tok_s_apparent),
         "decode_tok_s": _float_or_none(decode_tok_s),
         "acceptance_rate": _float_or_none(acceptance_rate),
+        "tokens_per_cycle": _float_or_none(tokens_per_cycle),
         "cycles": _int_or_none(cycles),
+        "adaptive_block_reductions": int(adaptive_block_reductions),
+        "adaptive_block_cycles": int(adaptive_block_cycles),
+        "adaptive_block_min": _int_or_none(adaptive_block_min),
+        "copyspec_hits": int(copyspec_hits),
+        "copyspec_tokens": int(copyspec_tokens),
         "finish_reason": finish_reason,
         "cache_hit_tokens": int(cache_hit_tokens),
         "cache_status": _cache_status(cache_hit_tokens),

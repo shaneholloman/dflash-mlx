@@ -193,7 +193,13 @@ def consume_dflash_events(
                     state="finishing",
                     generated_tokens=int(event.generation_tokens),
                     acceptance_rate=float(event.acceptance_ratio),
+                    tokens_per_cycle=float(event.tokens_per_cycle),
                     cycles=int(event.cycles_completed),
+                    adaptive_block_reductions=int(event.adaptive_block_reductions),
+                    adaptive_block_cycles=int(event.adaptive_block_cycles),
+                    adaptive_block_min=event.adaptive_block_min,
+                    copyspec_hits=int(event.copyspec_hits),
+                    copyspec_tokens=int(event.copyspec_tokens),
                     phase_timings_us=dict(event.phase_timings_us),
                 )
                 generated_token_ids = list(event.generated_token_ids)
@@ -223,6 +229,12 @@ def consume_dflash_events(
             live_acceptance_pct = float(event.acceptance_ratio) * 100.0
             elapsed_s = (time.perf_counter_ns() - request_start_ns) / 1e9
             live_tok_s = live_token_count / max(0.001, elapsed_s - prefill_elapsed_s)
+            cycles_completed = int(event.cycles_completed)
+            tokens_per_cycle = (
+                float(event.generated_tokens) / float(cycles_completed)
+                if cycles_completed > 0
+                else None
+            )
             update_live_request(
                 request_id=request_id,
                 state="decode",
@@ -230,6 +242,13 @@ def consume_dflash_events(
                 ttft_s=ttft_s,
                 decode_tok_s=live_tok_s,
                 acceptance_rate=live_acceptance_pct / 100.0,
+                tokens_per_cycle=tokens_per_cycle,
+                cycles=cycles_completed,
+                adaptive_block_reductions=int(event.adaptive_block_reductions),
+                adaptive_block_cycles=int(event.adaptive_block_cycles),
+                adaptive_block_min=event.adaptive_block_min,
+                copyspec_hits=int(event.copyspec_hits),
+                copyspec_tokens=int(event.copyspec_tokens),
             )
             if live_token_count % 2048 == 0:
                 sys.stderr.write(

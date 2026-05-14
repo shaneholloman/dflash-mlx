@@ -70,6 +70,11 @@ class TokenEvent:
     cycles_completed: int
     fallback_ar: bool = False
     fallback_reason: str | None = None
+    adaptive_block_reductions: int = 0
+    adaptive_block_cycles: int = 0
+    adaptive_block_min: int | None = None
+    copyspec_hits: int = 0
+    copyspec_tokens: int = 0
 
 
 @dataclass(frozen=True)

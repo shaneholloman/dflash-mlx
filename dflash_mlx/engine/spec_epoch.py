@@ -72,6 +72,7 @@ _DECODE_CLEAR_CACHE_INTERVAL_TOKENS = 1024
 _DDTREE_TOP_WIDTH = 2
 _DDTREE_MAX_BRANCH_POSITIONS = 2
 _ADAPTIVE_REDUCED_BURST_CYCLES = 24
+_ADAPTIVE_LONG_CONTEXT_REDUCED_BURST_CYCLES = 64
 
 
 @dataclass(frozen=True)
@@ -187,7 +188,7 @@ class _AdaptiveBlockPolicy:
     window_size: int = 4
     reduced_burst_cycles: int = _ADAPTIVE_REDUCED_BURST_CYCLES
     long_context_prompt_tokens: int = 32768
-    long_context_burst_cycles: int = 64
+    long_context_burst_cycles: int = _ADAPTIVE_LONG_CONTEXT_REDUCED_BURST_CYCLES
     low_commit_threshold: float = 3.0
     recent_low_commit_threshold: float = 2.75
     high_commit_guard: int = 5
@@ -1162,6 +1163,8 @@ class SpeculativeSession:
                                     else 0.0
                                 ),
                                 cycles_completed=int(state.cycles_completed),
+                                copyspec_hits=int(copyspec_hits_total),
+                                copyspec_tokens=int(copyspec_tokens_total),
                             )
                             yield_pause.done(_pre_yield)
 
@@ -1426,6 +1429,8 @@ class SpeculativeSession:
                         else 0.0
                     ),
                     cycles_completed=int(state.cycles_completed),
+                    copyspec_hits=int(copyspec_hits_total),
+                    copyspec_tokens=int(copyspec_tokens_total),
                 )
                 yield_pause.done(_pre_yield)
 
@@ -1924,6 +1929,23 @@ class SpeculativeSession:
                         else 0.0
                     ),
                     cycles_completed=int(state.cycles_completed),
+                    adaptive_block_reductions=(
+                        int(adaptive_block_policy.reductions)
+                        if adaptive_block_policy is not None
+                        else 0
+                    ),
+                    adaptive_block_cycles=(
+                        int(adaptive_block_policy.reduced_cycles)
+                        if adaptive_block_policy is not None
+                        else 0
+                    ),
+                    adaptive_block_min=(
+                        adaptive_block_policy.min_seen
+                        if adaptive_block_policy is not None
+                        else None
+                    ),
+                    copyspec_hits=int(state.copyspec_hits),
+                    copyspec_tokens=int(state.copyspec_tokens),
                 )
                 yield_pause.done(_pre_yield)
 

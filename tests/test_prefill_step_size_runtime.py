@@ -1798,6 +1798,29 @@ def test_adaptive_verify_mode_long_context_burst_is_initial_only():
     assert policy.reduced_burst_cycles == 24
 
 
+def test_adaptive_verify_mode_probe_falls_back_to_reduced_after_two_low_full_cycles():
+    policy = spec_epoch._AdaptiveBlockPolicy.from_runtime(
+        runtime_config=_runtime_context(verify_mode="adaptive").runtime,
+        effective_block_tokens=8,
+        verify_len_cap=8,
+        prompt_len=32768,
+    )
+    assert policy is not None
+
+    for _ in range(64):
+        policy.record(block_len=4, acceptance_len=3)
+
+    assert policy.mode == "probe"
+
+    policy.record(block_len=8, acceptance_len=0)
+    assert policy.mode == "probe"
+
+    policy.record(block_len=8, acceptance_len=0)
+    assert policy.mode == "reduced"
+    assert policy.reduced_cycles_since_probe == 0
+    assert policy.reduced_burst_cycles == 24
+
+
 def test_adaptive_verify_mode_long_context_handoff_starts_block4():
     draft_model = _draft_model(block_size=8)
 

@@ -143,7 +143,17 @@ def test_consume_dflash_events_updates_live_metrics_from_engine_events(monkeypat
                 phase_cold_us=100.0,
                 phase_seam_us=20.0,
             ),
-            TokenEvent(token_id=10, generated_tokens=1, acceptance_ratio=0.5, cycles_completed=1),
+            TokenEvent(
+                token_id=10,
+                generated_tokens=1,
+                acceptance_ratio=0.5,
+                cycles_completed=1,
+                adaptive_block_reductions=1,
+                adaptive_block_cycles=4,
+                adaptive_block_min=4,
+                copyspec_hits=1,
+                copyspec_tokens=3,
+            ),
             SummaryEvent(
                 elapsed_us=10.0,
                 prompt_token_count=3,
@@ -158,6 +168,12 @@ def test_consume_dflash_events_updates_live_metrics_from_engine_events(monkeypat
                     "verify": 3.0,
                     "replay": 4.0,
                 },
+                tokens_per_cycle=1.0,
+                adaptive_block_reductions=1,
+                adaptive_block_cycles=4,
+                adaptive_block_min=4,
+                copyspec_hits=1,
+                copyspec_tokens=3,
             ),
         ]
     )
@@ -181,6 +197,13 @@ def test_consume_dflash_events_updates_live_metrics_from_engine_events(monkeypat
     assert current["state"] == "finishing"
     assert current["ttft_s"] is not None
     assert current["ttft_s"] >= 0.0
+    assert current["tokens_per_cycle"] == 1.0
+    assert current["cycles"] == 1
+    assert current["adaptive_block_reductions"] == 1
+    assert current["adaptive_block_cycles"] == 4
+    assert current["adaptive_block_min"] == 4
+    assert current["copyspec_hits"] == 1
+    assert current["copyspec_tokens"] == 3
     assert current["prefill_phase_timings_us"] == {
         "phase_cold_us": 100.0,
         "phase_seam_us": 20.0,
@@ -191,6 +214,73 @@ def test_consume_dflash_events_updates_live_metrics_from_engine_events(monkeypat
         "verify": 3.0,
         "replay": 4.0,
     }
+
+
+def test_consume_dflash_events_updates_live_cycle_metrics_before_summary(monkeypatch):
+    _reset_live_metrics_state()
+    monkeypatch.setattr(metrics_mod, "current_runtime_cache_manager", lambda: None)
+    start_live_request(
+        request_id=16,
+        mode_used="dflash",
+        prompt_tokens=3,
+        max_tokens=16,
+    )
+    rqueue = SimpleQueue()
+    events = ClosableEvents(
+        [
+            PrefillCompleteEvent(
+                prefill_us=1.0,
+                prompt_token_count=3,
+                logical_ctx_tokens=3,
+                physical_prefill_tokens=3,
+                prefill_tokens_restored=0,
+                prefill_tokens_computed=3,
+            ),
+            TokenEvent(
+                token_id=10,
+                generated_tokens=1,
+                acceptance_ratio=0.5,
+                cycles_completed=1,
+            ),
+            TokenEvent(
+                token_id=11,
+                generated_tokens=2,
+                acceptance_ratio=1.0,
+                cycles_completed=1,
+                adaptive_block_reductions=1,
+                adaptive_block_cycles=4,
+                adaptive_block_min=4,
+                copyspec_hits=1,
+                copyspec_tokens=3,
+            ),
+        ]
+    )
+
+    result = consume_dflash_events(
+        event_iter=events,
+        rqueue=rqueue,
+        ctx=FakeContext(),
+        tokenizer=FakeTokenizer(),
+        prompt=[1, 2, 3],
+        max_tokens=16,
+        eos_token_ids=set(),
+        request_start_ns=0,
+        request_id=16,
+    )
+
+    current = get_live_metrics_payload()["current_request"]
+
+    assert result.summary_event is None
+    assert current["state"] == "decode"
+    assert current["generated_tokens"] == 2
+    assert current["cycles"] == 1
+    assert current["tokens_per_cycle"] == 2.0
+    assert current["acceptance_rate"] == 1.0
+    assert current["adaptive_block_reductions"] == 1
+    assert current["adaptive_block_cycles"] == 4
+    assert current["adaptive_block_min"] == 4
+    assert current["copyspec_hits"] == 1
+    assert current["copyspec_tokens"] == 3
 
 
 def test_consume_dflash_events_ignores_snapshot_publication_metadata():

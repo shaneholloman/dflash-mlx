@@ -33,6 +33,25 @@ Prefill throughput is split deliberately:
   divided by user-visible prefill wall time.
 - `prefill_tok_s_apparent`: logical prompt tokens divided by the same wall time.
 
+Decode throughput is exposed in two forms:
+
+- `last_request.decode_tok_s`: decode-only throughput for the last completed
+  request.
+- `rates.average_decode_tok_s`: weighted decode-only average since server
+  startup, computed as total generated tokens divided by cumulative decode
+  seconds. `totals.decode_s` exposes that cumulative decode denominator.
+
+Requests also expose `tokens_per_cycle`, `cycles`,
+`adaptive_block_reductions`, `adaptive_block_cycles`, `adaptive_block_min`,
+`copyspec_hits`, and `copyspec_tokens`. During decode these fields are live in
+`current_request`; after completion they are retained in `last_request` and
+`recent_requests`.
+
+`adaptive_block_cycles` counts decode cycles run below the full verify block
+size. `adaptive_block_min` is the smallest block size used by adaptive verify,
+usually `4` when long-context fallback is active. `tokens_per_cycle` is the
+quickest way to tell whether low acceptance is collapsing speculative progress.
+
 Completed requests also expose `cache_hit_tokens`, `cache_status`, `ttft_s`,
 `phase_timings_us`, and `prefill_phase_timings_us` in `last_request` and
 `recent_requests`. `cache_status` is `WARM` when prefix restore reused tokens

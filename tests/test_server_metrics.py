@@ -168,6 +168,11 @@ def _summary_event(
     acceptance_ratio: float = 0.0,
     cycles_completed: int = 0,
     tokens_per_cycle: float = 0.0,
+    adaptive_block_reductions: int = 0,
+    adaptive_block_cycles: int = 0,
+    adaptive_block_min: int | None = None,
+    copyspec_hits: int = 0,
+    copyspec_tokens: int = 0,
     phase_timings_us: dict[str, float] | None = None,
     elapsed_us: float = 0.0,
 ) -> SummaryEvent:
@@ -181,6 +186,11 @@ def _summary_event(
         cycles_completed=cycles_completed,
         phase_timings_us=phase_timings_us or {},
         tokens_per_cycle=tokens_per_cycle,
+        adaptive_block_reductions=adaptive_block_reductions,
+        adaptive_block_cycles=adaptive_block_cycles,
+        adaptive_block_min=adaptive_block_min,
+        copyspec_hits=copyspec_hits,
+        copyspec_tokens=copyspec_tokens,
     )
 
 
@@ -491,14 +501,17 @@ def test_metrics_endpoint_returns_json_before_request(monkeypatch):
         "requests_per_s",
         "requests_per_s_60s",
         "generated_tokens_per_s",
+        "average_decode_tok_s",
         "prefill_tokens_physical_per_s",
         "prefill_tokens_restored_per_s",
         "active_decode_tok_s",
     }
     assert payload["rates"]["requests_per_s"] == 0.0
     assert payload["rates"]["requests_per_s_60s"] == 0.0
+    assert payload["rates"]["average_decode_tok_s"] is None
     assert payload["prefix_cache"]["entries"] == 0
     assert payload["totals"]["requests"] == 0
+    assert payload["totals"]["decode_s"] == 0.0
 
 
 def test_live_memory_payload_does_not_spawn_system_wired_probe(monkeypatch):
@@ -752,6 +765,13 @@ def test_metrics_endpoint_reports_current_request(monkeypatch):
     assert current["prefill_tokens_processed"] == 1024
     assert current["prefill_tokens_total"] == 4096
     assert current["ttft_s"] is None
+    assert current["tokens_per_cycle"] is None
+    assert current["cycles"] is None
+    assert current["adaptive_block_reductions"] == 0
+    assert current["adaptive_block_cycles"] == 0
+    assert current["adaptive_block_min"] is None
+    assert current["copyspec_hits"] == 0
+    assert current["copyspec_tokens"] == 0
     assert current["prefill_phase_timings_us"] == {}
     assert current["phase_timings_us"] == {}
     assert current["elapsed_s"] >= 0.0
@@ -764,6 +784,13 @@ def test_metrics_endpoint_reports_current_request(monkeypatch):
         ttft_s=2.5,
         decode_tok_s=24.0,
         acceptance_rate=0.75,
+        tokens_per_cycle=1.5,
+        cycles=2,
+        adaptive_block_reductions=1,
+        adaptive_block_cycles=8,
+        adaptive_block_min=4,
+        copyspec_hits=1,
+        copyspec_tokens=3,
         phase_timings_us={"draft": 1000.0, "verify": 2000.0, "replay": 300.0},
     )
 
@@ -774,6 +801,13 @@ def test_metrics_endpoint_reports_current_request(monkeypatch):
     assert payload["current_request"]["ttft_s"] == 2.5
     assert payload["current_request"]["decode_tok_s"] == 24.0
     assert payload["current_request"]["acceptance_rate"] == 0.75
+    assert payload["current_request"]["tokens_per_cycle"] == 1.5
+    assert payload["current_request"]["cycles"] == 2
+    assert payload["current_request"]["adaptive_block_reductions"] == 1
+    assert payload["current_request"]["adaptive_block_cycles"] == 8
+    assert payload["current_request"]["adaptive_block_min"] == 4
+    assert payload["current_request"]["copyspec_hits"] == 1
+    assert payload["current_request"]["copyspec_tokens"] == 3
     assert payload["current_request"]["phase_timings_us"] == {
         "draft": 1000.0,
         "verify": 2000.0,
@@ -798,6 +832,11 @@ def test_metrics_endpoint_reports_last_request_and_prefix_cache(monkeypatch):
             acceptance_ratio=0.81,
             cycles_completed=44,
             tokens_per_cycle=2.27,
+            adaptive_block_reductions=2,
+            adaptive_block_cycles=19,
+            adaptive_block_min=4,
+            copyspec_hits=3,
+            copyspec_tokens=12,
             phase_timings_us={
                 "prefill": 1_000_000.0,
                 "draft": 300_000.0,
@@ -841,7 +880,13 @@ def test_metrics_endpoint_reports_last_request_and_prefix_cache(monkeypatch):
     assert last["prefill_tok_s_apparent"] == 1000.0
     assert round(last["decode_tok_s"], 2) == 33.33
     assert last["acceptance_rate"] == 0.81
+    assert last["tokens_per_cycle"] == 2.27
     assert last["cycles"] == 44
+    assert last["adaptive_block_reductions"] == 2
+    assert last["adaptive_block_cycles"] == 19
+    assert last["adaptive_block_min"] == 4
+    assert last["copyspec_hits"] == 3
+    assert last["copyspec_tokens"] == 12
     assert last["finish_reason"] == "stop"
     assert last["phase_timings_us"] == {
         "prefill": 1_000_000.0,
@@ -856,15 +901,100 @@ def test_metrics_endpoint_reports_last_request_and_prefix_cache(monkeypatch):
     assert payload["prefix_cache"]["last_computed_tokens"] == 250
     assert payload["totals"]["requests"] == 1
     assert payload["totals"]["generated_tokens"] == 100
+    assert payload["totals"]["decode_s"] == 3.0
     assert payload["totals"]["prefill_tokens_physical"] == 250
     assert payload["totals"]["prefill_tokens_restored"] == 750
     assert payload["rates"]["requests_per_s"] > 0.0
     assert payload["rates"]["requests_per_s_60s"] > 0.0
     assert payload["rates"]["generated_tokens_per_s"] > 0.0
+    assert round(payload["rates"]["average_decode_tok_s"], 2) == 33.33
     assert payload["rates"]["active_decode_tok_s"] == last["decode_tok_s"]
     assert len(payload["recent_requests"]) == 1
     assert payload["recent_requests"][0]["request_id"] == 12
     assert payload["recent_requests"][0]["cache_status"] == "WARM"
+    assert payload["recent_requests"][0]["adaptive_block_cycles"] == 19
+    assert payload["recent_requests"][0]["tokens_per_cycle"] == 2.27
+
+
+def test_metrics_average_decode_ignores_non_decode_requests(monkeypatch):
+    _reset_live_metrics_state()
+    runtime_config = _configure_metrics()
+    monkeypatch.setattr(metrics_mod, "current_runtime_cache_manager", lambda: None)
+
+    finalize_request_observability(
+        request_id=20,
+        summary_event=_summary_event(
+            generation_tokens=100,
+            acceptance_ratio=0.8,
+            cycles_completed=20,
+            tokens_per_cycle=5.0,
+        ),
+        request_start_ns=0,
+        request_done_ns=4_000_000_000,
+        first_token_ns=1_000_000_000,
+        prefill_done_ns=1_000_000_000,
+        prompt_token_count=1000,
+        live_token_count=100,
+        cache_lookup_ms=0.0,
+        cache_hit_tokens=0,
+        cache_insert_ms=0.0,
+        finish_reason="stop",
+        max_tokens=100,
+        runtime_config=runtime_config,
+        diagnostics=None,
+    )
+    payload = get_live_metrics_payload()
+    assert payload["totals"]["generated_tokens"] == 100
+    assert payload["totals"]["decode_s"] == 3.0
+    assert round(payload["rates"]["average_decode_tok_s"], 2) == 33.33
+
+    record_target_only_request(
+        request_id=21,
+        mode_used="ar_fastpath",
+        wall_ms=500.0,
+        max_tokens=16,
+        diagnostics=None,
+    )
+    payload = get_live_metrics_payload()
+    assert payload["totals"]["generated_tokens"] == 100
+    assert payload["totals"]["decode_s"] == 3.0
+    assert round(payload["rates"]["average_decode_tok_s"], 2) == 33.33
+
+    finalize_request_observability(
+        request_id=22,
+        summary_event=_summary_event(
+            generation_tokens=0,
+            acceptance_ratio=0.0,
+            cycles_completed=0,
+            tokens_per_cycle=0.0,
+        ),
+        request_start_ns=0,
+        request_done_ns=1_200_000_000,
+        first_token_ns=None,
+        prefill_done_ns=1_000_000_000,
+        prompt_token_count=1000,
+        live_token_count=0,
+        cache_lookup_ms=0.0,
+        cache_hit_tokens=0,
+        cache_insert_ms=0.0,
+        finish_reason="stop",
+        max_tokens=16,
+        runtime_config=runtime_config,
+        diagnostics=None,
+    )
+    payload = get_live_metrics_payload()
+    assert payload["last_request"]["request_id"] == 22
+    assert payload["last_request"]["generated_tokens"] == 0
+    assert payload["last_request"]["decode_s"] == 0.2
+    assert payload["last_request"]["decode_tok_s"] == 0.0
+    assert payload["totals"]["generated_tokens"] == 100
+    assert payload["totals"]["decode_s"] == 3.0
+    assert round(payload["rates"]["average_decode_tok_s"], 2) == 33.33
+
+    _reset_live_metrics_state()
+    payload = get_live_metrics_payload()
+    assert payload["totals"]["decode_s"] == 0.0
+    assert payload["rates"]["average_decode_tok_s"] is None
 
 
 def test_prompt_regime_distinguishes_text_completion_from_chat():
