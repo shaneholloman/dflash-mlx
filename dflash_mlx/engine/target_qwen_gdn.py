@@ -164,6 +164,67 @@ def _split_sdpa_output(
     return mx.concatenate(outputs, axis=2)
 
 
+def _tail_causal_mask(q_len: int, kv_len: int) -> mx.array:
+    q_pos = mx.arange(kv_len - q_len, kv_len)[:, None]
+    k_pos = mx.arange(kv_len)[None, :]
+    return k_pos <= q_pos
+
+
+def _repeat_gqa_mask(mask: Any, *, q_len: int, kv_len: int, gqa: int) -> Any:
+    if mask is None:
+        return None
+    if isinstance(mask, str) and mask == "causal":
+        mask = _tail_causal_mask(q_len, kv_len)
+    if not isinstance(mask, mx.array):
+        return mask
+    if int(mask.shape[-2]) != q_len:
+        return mask
+    reps = [1] * mask.ndim
+    reps[-2] = int(gqa)
+    return mx.tile(mask, tuple(reps))
+
+
+def _gqa_reshape_sdpa(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    *,
+    scale: float,
+    mask: Optional[Any],
+    cache: Optional[Any] = None,
+) -> mx.array:
+    batch_size, query_heads, q_len, head_dim = queries.shape
+    _, kv_heads, kv_len, _ = keys.shape
+    if kv_heads <= 0 or query_heads == kv_heads or query_heads % kv_heads != 0:
+        return scaled_dot_product_attention(
+            queries, keys, values, cache=cache, scale=scale, mask=mask
+        )
+    gqa = query_heads // kv_heads
+    grouped_queries = queries.reshape(
+        batch_size,
+        kv_heads,
+        gqa,
+        q_len,
+        head_dim,
+    ).reshape(batch_size, kv_heads, gqa * q_len, head_dim)
+    grouped_mask = _repeat_gqa_mask(mask, q_len=q_len, kv_len=kv_len, gqa=gqa)
+    output = scaled_dot_product_attention(
+        grouped_queries,
+        keys,
+        values,
+        cache=cache,
+        scale=scale,
+        mask=grouped_mask,
+    )
+    return output.reshape(
+        batch_size,
+        kv_heads,
+        gqa,
+        q_len,
+        head_dim,
+    ).reshape(batch_size, query_heads, q_len, head_dim)
+
+
 def _as_int_list(values: mx.array) -> list[int]:
     return [int(value) for value in values.tolist()]
 
@@ -381,7 +442,7 @@ def _tree_attention_call(
     keys = _apply_rope_positions(attn.rope, keys, positions)
     keys, values = cache.update_and_fetch(keys, values)
     tree_mask = getattr(cache, _TREE_ATTENTION_MASK_ATTR, mask)
-    output = scaled_dot_product_attention(
+    output = _gqa_reshape_sdpa(
         queries,
         keys,
         values,
@@ -687,26 +748,14 @@ def _install_split_full_attention_hook(attn: Any) -> None:
             and int(values.shape[-1]) in (128, 256)
         )
         if should_use_batched_2pass:
-            from dflash_mlx.kernels import batched_sdpa_2pass_exact
-
-            output = batched_sdpa_2pass_exact(
-                queries=queries,
-                keys=keys,
-                values=values,
+            output = _gqa_reshape_sdpa(
+                queries,
+                keys,
+                values,
+                cache=cache,
                 scale=self.scale,
-                mask=mask if isinstance(mask, mx.array) else None,
+                mask=mask,
             )
-            if output is None:
-                output = _split_sdpa_output(
-                    queries=queries,
-                    keys=keys,
-                    values=values,
-                    scale=self.scale,
-                    mask=mask,
-                    cache=cache,
-                    chunk_size=1,
-                    cached_prefix_len=cached_prefix_len,
-                )
         elif should_split:
             output = _split_sdpa_output(
                 queries=queries,

@@ -10,6 +10,7 @@ import mlx.core as mx
 import pytest
 from mlx_lm.models.base import scaled_dot_product_attention
 
+from dflash_mlx.engine.target_qwen_gdn import _gqa_reshape_sdpa
 from dflash_mlx.kernels import batched_sdpa_2pass_exact
 
 SHAPES = [
@@ -42,6 +43,11 @@ def _swa_tail_mask(q_len: int, kv_len: int, dtype: mx.Dtype, window_size: int) -
     k_pos = mx.arange(kv_len)[None, :]
     allowed = (k_pos <= q_pos) & (q_pos < k_pos + window_size)
     return _additive_mask(allowed, dtype)
+
+def _swa_tail_bool_mask(q_len: int, kv_len: int, window_size: int) -> mx.array:
+    q_pos = mx.arange(kv_len - q_len, kv_len)[:, None]
+    k_pos = mx.arange(kv_len)[None, :]
+    return (k_pos <= q_pos) & (q_pos < k_pos + window_size)
 
 @pytest.mark.parametrize("name,hq,hk,head_dim", SHAPES)
 @pytest.mark.parametrize("kv_len", KV_LENGTHS)
@@ -99,4 +105,61 @@ def test_batched_sdpa_2pass_matches_native_tail_masks(
     )
     assert max_rel <= 1e-2, (
         f"{name} {dtype} kv={kv_len} mask={mask_kind} max_rel={max_rel:.4g}"
+    )
+
+@pytest.mark.parametrize("name,hq,hk,head_dim", SHAPES)
+@pytest.mark.parametrize("kv_len", [1024, 4096])
+@pytest.mark.parametrize("mask_kind", ["causal_string", "explicit_causal", "swa_bool"])
+def test_gqa_reshape_sdpa_matches_native_masks(
+    name: str,
+    hq: int,
+    hk: int,
+    head_dim: int,
+    kv_len: int,
+    mask_kind: str,
+) -> None:
+    q_len = 16
+    dtype = mx.bfloat16
+    q = _rand((1, hq, q_len, head_dim), dtype)
+    k = _rand((1, hk, kv_len, head_dim), dtype)
+    v = _rand((1, hk, kv_len, head_dim), dtype)
+    scale = 1.0 / math.sqrt(head_dim)
+
+    if mask_kind == "causal_string":
+        mask = "causal"
+    elif mask_kind == "explicit_causal":
+        mask = _causal_tail_mask(q_len, kv_len, dtype)
+    else:
+        mask = _swa_tail_bool_mask(q_len, kv_len, window_size=2048)
+
+    native = scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        cache=None,
+        scale=scale,
+        mask=mask,
+    )
+    custom = _gqa_reshape_sdpa(
+        q,
+        k,
+        v,
+        cache=None,
+        scale=scale,
+        mask=mask,
+    )
+    mx.eval(native, custom)
+    _sync()
+
+    native_f = native.astype(mx.float32)
+    custom_f = custom.astype(mx.float32)
+    max_abs = float(mx.max(mx.abs(native_f - custom_f)).item())
+    ref_max = float(mx.max(mx.abs(native_f)).item())
+    max_rel = max_abs / (ref_max + 1e-6)
+
+    assert max_abs <= 1e-2, (
+        f"{name} kv={kv_len} mask={mask_kind} max_abs={max_abs:.4g}"
+    )
+    assert max_rel <= 1e-2, (
+        f"{name} kv={kv_len} mask={mask_kind} max_rel={max_rel:.4g}"
     )
