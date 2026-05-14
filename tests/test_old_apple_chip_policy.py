@@ -3,6 +3,7 @@
 # Based on DFlash (arXiv:2602.06036)
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
 
 import dflash_mlx.verify_linear as verify_linear
@@ -93,6 +94,15 @@ def test_resolve_draft_load_dtype_fails_if_chip_detection_fails(monkeypatch):
     )
 
 
+def test_cast_floating_model_uses_mlx_apply_callback_signature():
+    layer = nn.Linear(2, 2, bias=False)
+    layer.weight = mx.ones((2, 2), dtype=mx.bfloat16)
+
+    runtime_loading._cast_floating_model(layer, mx.float16)
+
+    assert layer.weight.dtype == mx.float16
+
+
 def test_load_draft_bundle_casts_quantized_old_apple_floating_tensors(
     tmp_path,
     monkeypatch,
@@ -103,8 +113,8 @@ def test_load_draft_bundle_casts_quantized_old_apple_floating_tensors(
             self.int_value = mx.array([1], dtype=mx.uint32)
 
         def apply(self, fn):
-            self.float_value = fn("float_value", self.float_value)
-            self.int_value = fn("int_value", self.int_value)
+            self.float_value = fn(self.float_value)
+            self.int_value = fn(self.int_value)
 
     fake_model = FakeDraftModel()
     quant_calls = []
@@ -148,6 +158,44 @@ def test_load_draft_bundle_casts_quantized_old_apple_floating_tensors(
     assert prewarm_dtypes == [(fake_model, mx.float16)]
     assert meta["draft_load_dtype"] == "float16"
     assert meta["draft_load_dtype_source"] == "old_apple_bf16_emulation"
+
+
+def test_load_draft_bundle_casts_w4a32_floating_tensors_to_f32(
+    tmp_path,
+    monkeypatch,
+):
+    class FakeDraftModel:
+        def __init__(self):
+            self.float_value = mx.array([1.0], dtype=mx.float16)
+            self.int_value = mx.array([1], dtype=mx.uint32)
+
+        def apply(self, fn):
+            self.float_value = fn(self.float_value)
+            self.int_value = fn(self.int_value)
+
+    fake_model = FakeDraftModel()
+
+    monkeypatch.setattr(
+        runtime_loading,
+        "load_model",
+        lambda *args, **kwargs: (fake_model, {"model_type": "qwen3"}),
+    )
+    monkeypatch.setattr(runtime_loading.nn, "quantize", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        runtime_loading,
+        "detect_chip",
+        lambda: _profile("applegpu_g13s"),
+    )
+    monkeypatch.setattr(verify_linear, "install_verify_linears", lambda *args, **kwargs: None)
+    monkeypatch.setattr(verify_linear, "prewarm_verify_kernels", lambda *args, **kwargs: None)
+
+    model, meta = runtime_loading.load_draft_bundle(tmp_path, draft_quant="w4a32")
+
+    assert model is fake_model
+    assert fake_model.float_value.dtype == mx.float32
+    assert fake_model.int_value.dtype == mx.uint32
+    assert meta["draft_load_dtype"] == "float32"
+    assert meta["draft_load_dtype_source"] is None
 
 
 def test_load_draft_bundle_preserves_checkpoint_dtype_without_quant(

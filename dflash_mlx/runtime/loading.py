@@ -279,7 +279,7 @@ def load_draft_bundle(
             _cast_floating_model(model, draft_load_dtype)
         if quant_spec.act_bits == 32:
 
-            def _cast_to_f32(_, x: mx.array) -> mx.array:
+            def _cast_to_f32(x: mx.array) -> mx.array:
                 if mx.issubdtype(x.dtype, mx.floating):
                     return x.astype(mx.float32)
                 return x
@@ -320,7 +320,7 @@ def load_draft_bundle(
 
 
 def _cast_floating_model(model: Any, dtype: Any) -> None:
-    def _cast(_, x: mx.array) -> mx.array:
+    def _cast(x: mx.array) -> mx.array:
         if mx.issubdtype(x.dtype, mx.floating) and x.dtype != dtype:
             return x.astype(dtype)
         return x
