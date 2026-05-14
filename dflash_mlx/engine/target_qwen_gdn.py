@@ -84,7 +84,7 @@ def _install_exact_small_proj_hooks(
     *,
     pad_m: int = _EXACT_SMALL_PROJ_PAD_M,
 ) -> None:
-    for attr_name in ("in_proj_b", "in_proj_a"):
+    for attr_name in ("in_proj_b", "in_proj_a", "in_proj_ba"):
         proj = getattr(linear_attn, attr_name, None)
         if proj is None or getattr(proj, "_dflash_exact_small_proj_wrapped", False):
             continue
@@ -236,6 +236,43 @@ def _tree_conv1d(
     )
 
 
+def _linear_attn_projections(
+    linear_attn: Any,
+    inputs: mx.array,
+) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+    if (
+        hasattr(linear_attn, "in_proj_qkvz")
+        and hasattr(linear_attn, "in_proj_ba")
+        and hasattr(linear_attn, "fix_query_key_value_ordering")
+    ):
+        batch_size, seq_len, _ = inputs.shape
+        q, k, v, z, b, a = linear_attn.fix_query_key_value_ordering(
+            linear_attn.in_proj_qkvz(inputs),
+            linear_attn.in_proj_ba(inputs),
+        )
+        qkv = mx.concatenate(
+            [
+                q.reshape(batch_size, seq_len, -1),
+                k.reshape(batch_size, seq_len, -1),
+                v.reshape(batch_size, seq_len, -1),
+            ],
+            axis=-1,
+        )
+        return qkv, z, b, a
+
+    qkv = linear_attn.in_proj_qkv(inputs)
+    z_proj = linear_attn.in_proj_z(inputs)
+    z = z_proj.reshape(
+        inputs.shape[0],
+        inputs.shape[1],
+        linear_attn.num_v_heads,
+        linear_attn.head_v_dim,
+    )
+    b = linear_attn.in_proj_b(inputs)
+    a = linear_attn.in_proj_a(inputs)
+    return qkv, z, b, a
+
+
 def _tree_recurrent_call(
     linear_attn: Any,
     inputs: mx.array,
@@ -251,11 +288,7 @@ def _tree_recurrent_call(
     if sharding_group is not None:
         inputs = sum_gradients(sharding_group)(inputs)
 
-    qkv = linear_attn.in_proj_qkv(inputs)
-    z_proj = linear_attn.in_proj_z(inputs)
-    z = z_proj.reshape(batch_size, tree_size, linear_attn.num_v_heads, linear_attn.head_v_dim)
-    b = linear_attn.in_proj_b(inputs)
-    a = linear_attn.in_proj_a(inputs)
+    qkv, z, b, a = _linear_attn_projections(linear_attn, inputs)
 
     conv_out = _tree_conv1d(linear_attn, qkv=qkv, cache=cache, parent_ids=parent_ids)
     q, k, v = [
@@ -498,11 +531,7 @@ def _install_speculative_linear_cache_hook(linear_attn: Any) -> None:
         if sharding_group is not None:
             inputs = sum_gradients(sharding_group)(inputs)
 
-        qkv = self.in_proj_qkv(inputs)
-        z_proj = self.in_proj_z(inputs)
-        z = z_proj.reshape(B, S, self.num_v_heads, self.head_v_dim)
-        b = self.in_proj_b(inputs)
-        a = self.in_proj_a(inputs)
+        qkv, z, b, a = _linear_attn_projections(self, inputs)
 
         if cache[0] is not None:
             conv_state = cache[0]
