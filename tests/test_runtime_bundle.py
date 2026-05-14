@@ -46,6 +46,10 @@ def test_runtime_registry_preserves_draft_resolution():
         == "z-lab/Qwen3.5-9B-DFlash"
     )
     assert (
+        resolve_optional_draft_ref("Qwen/Qwen3.5-27B", None)
+        == "z-lab/Qwen3.5-27B-DFlash"
+    )
+    assert (
         resolve_optional_draft_ref("mlx-community/Qwen3.5-9B-4bit", None)
         == "z-lab/Qwen3.5-9B-DFlash"
     )

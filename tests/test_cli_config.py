@@ -70,7 +70,7 @@ def test_serve_cli_thinking_default_is_disabled(monkeypatch):
 
     assert args.enable_thinking is False
     assert args.chat_template_args == {"enable_thinking": False}
-    assert args.fastpath_max_tokens == 256
+    assert args.fastpath_max_tokens == 0
 
     args = parser.parse_args(["--model", "m", "--enable-thinking"])
     normalize_cli_args(args)
@@ -426,6 +426,35 @@ def test_serve_cli_rejects_invalid_memory_limit():
     with pytest.raises(SystemExit):
         build_parser().parse_args(["--model", "m", "--wired-limit", "bad"])
 
+def test_serve_cli_parses_prefix_cache_byte_suffixes(monkeypatch):
+    _clear_runtime_env(monkeypatch)
+
+    args = build_parser().parse_args(
+        [
+            "--model",
+            "m",
+            "--prefix-cache-max-bytes",
+            "2GB",
+            "--prefix-cache-l2-max-bytes",
+            "50GB",
+        ]
+    )
+    normalize_cli_args(args)
+
+    assert args.runtime_config.prefix_cache_max_bytes == 2 * 1024**3
+    assert args.runtime_config.prefix_cache_l2_max_bytes == 50 * 1024**3
+
+def test_serve_cli_parses_prefix_cache_byte_suffix_env(monkeypatch):
+    _clear_runtime_env(monkeypatch)
+    monkeypatch.setenv("DFLASH_PREFIX_CACHE_MAX_BYTES", "2GB")
+    monkeypatch.setenv("DFLASH_PREFIX_CACHE_L2_MAX_BYTES", "50GB")
+
+    args = build_parser().parse_args(["--model", "m"])
+    normalize_cli_args(args)
+
+    assert args.runtime_config.prefix_cache_max_bytes == 2 * 1024**3
+    assert args.runtime_config.prefix_cache_l2_max_bytes == 50 * 1024**3
+
 def _install_metal_limit_probe(monkeypatch):
     calls = []
     recommended = 64 * 1024**3
@@ -633,7 +662,7 @@ def test_startup_banner_prints_resolved_metal_limits(monkeypatch, capsys):
             runtime_config=None,
             metal_limits=limits,
             chat_template_args={"enable_thinking": True},
-            fastpath_max_tokens=256,
+            fastpath_max_tokens=0,
         ),
     )
 
@@ -648,16 +677,16 @@ def test_startup_banner_prints_resolved_metal_limits(monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "Draft quant:  w4 (model_default)" in err
     assert "Thinking:     enabled" in err
-    assert "Fast path:    AR <= 256 tokens" in err
+    assert "Fast path:    off" in err
     assert "Wired limit: auto -> 64.0 GiB" in err
     assert "Cache limit: 8.0 GiB -> 8.0 GiB" in err
 
     provider.cli_args.chat_template_args = {}
-    provider.cli_args.fastpath_max_tokens = 0
+    provider.cli_args.fastpath_max_tokens = 64
     runtime.print_startup_banner()
     err = capsys.readouterr().err
     assert "Thinking:     disabled" in err
-    assert "Fast path:    off" in err
+    assert "Fast path:    AR <= 64 tokens" in err
 
 @pytest.mark.parametrize(
     "argv,error",

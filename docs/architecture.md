@@ -37,10 +37,10 @@ The live registry is explicit. A target must resolve to a matching DFlash draft
 through `runtime.registry.DRAFT_REGISTRY` or through `--draft`.
 
 If no draft resolves, loading fails. This runtime does not silently become a
-generic no-draft MLX server. The server does have a short-output AR fast path for
-small `max_tokens` requests, controlled by `--fastpath-max-tokens` (default
-`256`, `0` disables), but that is a serving policy after a valid runtime has
-already loaded.
+generic no-draft MLX server. The server has an opt-in short-output AR fast path
+for small `max_tokens` requests, controlled by `--fastpath-max-tokens` (default
+`0`, disabled), but that is a serving policy after a valid runtime has already
+loaded.
 
 The current DFlash draft class is `DFlashDraftModel`. Target-family behavior is
 owned by `engine.target_ops`; the registered concrete implementations are
@@ -236,6 +236,8 @@ Runtime/config:
 - `dflash_mlx/runtime/config.py` - `RuntimeConfigSpec`, product defaults,
   resolver, validation, source reporting, and offline command projections;
 - `dflash_mlx/runtime/context.py` - typed runtime context carrier;
+- `dflash_mlx/runtime/chip_detect.py` - Apple Silicon generation/tier and BF16
+  capability detection;
 - `dflash_mlx/diagnostics.py` - diagnostics config;
 - `dflash_mlx/metal_limits.py` - MLX wired/cache limit application;
 - `dflash_mlx/internal_debug.py` - private kernel-debug env surface.
@@ -249,15 +251,25 @@ Server:
 - `dflash_mlx/server/prefix_cache_flow.py` - per-request prefix cache lookup
   and snapshot-service setup;
 - `dflash_mlx/server/protocol.py` - response protocol helpers;
+- `dflash_mlx/server/tool_calls.py` - tokenizer tool-parser install, OpenAI
+  tool-call normalization, and fail-fast tool-choice validation;
+- `dflash_mlx/server/responses_adapter.py` - minimal non-streaming
+  `/v1/responses` compatibility adapter;
 - `dflash_mlx/server/metrics.py` - request accounting, live `/metrics`, and
   diagnostics event projection;
 - `dflash_mlx/server/request_loop.py` - DFlash event-to-response loop.
 
 Engine:
 
+- `dflash_mlx/engine/config.py` - engine-local config dataclasses;
 - `dflash_mlx/engine/spec_epoch.py` - DFlash request/cycle driver;
 - `dflash_mlx/engine/events.py` - typed engine event ABI;
 - `dflash_mlx/engine/prefill.py` - prefill helpers;
+- `dflash_mlx/engine/sampling.py` - prompt token prep, suppress-token masks,
+  greedy token selection, and eval/timing helpers;
+- `dflash_mlx/engine/copyspec.py` - exact repeated-token candidate reuse;
+- `dflash_mlx/engine/ddtree.py` - DDTree candidate planning helpers;
+- `dflash_mlx/engine/gqa_sdpa.py` - long-context GQA SDPA routing helpers;
 - `dflash_mlx/engine/target_features.py` - target hidden feature store;
 - `dflash_mlx/engine/target_ops.py` - target architecture seam and resolver;
 - `dflash_mlx/engine/target_qwen_gdn.py` - Qwen target cache, hidden capture,
@@ -297,6 +309,8 @@ Server package:
 - `dflash_mlx/server/request_loop.py` - event/token bridge;
 - `dflash_mlx/server/metrics.py` - structured event logging;
 - `dflash_mlx/server/protocol.py` - lightweight protocol types;
+- `dflash_mlx/server/tool_calls.py` - tool parser install, tool-call
+  normalization, and tool-choice validation;
 - `dflash_mlx/server/responses_adapter.py` - minimal non-streaming
   `/v1/responses` compatibility adapter.
 

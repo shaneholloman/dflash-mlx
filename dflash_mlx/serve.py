@@ -157,7 +157,7 @@ class DFlashResponseGenerator(mlx_server.ResponseGenerator):
         )
         try:
             fastpath_max_tokens = int(
-                getattr(self.model_provider.cli_args, "fastpath_max_tokens", 256) or 0
+                getattr(self.model_provider.cli_args, "fastpath_max_tokens", 0) or 0
             )
 
             if fastpath_max_tokens > 0 and args.max_tokens <= fastpath_max_tokens:

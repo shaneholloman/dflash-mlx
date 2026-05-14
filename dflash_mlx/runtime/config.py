@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -14,6 +15,44 @@ DEFAULT_PREFIX_CACHE_L2_DIR = os.path.expanduser("~/.cache/dflash/prefix_l2")
 SURFACE_SERVE_DOCTOR = "serve_doctor"
 SURFACE_GENERATE = "generate"
 SURFACE_BENCHMARK = "benchmark"
+
+_BYTE_COUNT_RE = re.compile(
+    r"(-?[0-9]+(?:\.[0-9]+)?)\s*([kmgt]?i?b?|bytes?)?",
+    re.IGNORECASE,
+)
+
+
+def _parse_byte_count(raw: Any) -> int:
+    value = str(raw).strip()
+    match = _BYTE_COUNT_RE.fullmatch(value)
+    if match is None:
+        raise argparse.ArgumentTypeError("expected raw bytes or a byte value like 2GB")
+    number = float(match.group(1))
+    unit = (match.group(2) or "b").lower()
+    multipliers = {
+        "": 1,
+        "b": 1,
+        "byte": 1,
+        "bytes": 1,
+        "k": 1024,
+        "kb": 1024,
+        "kib": 1024,
+        "m": 1024**2,
+        "mb": 1024**2,
+        "mib": 1024**2,
+        "g": 1024**3,
+        "gb": 1024**3,
+        "gib": 1024**3,
+        "t": 1024**4,
+        "tb": 1024**4,
+        "tib": 1024**4,
+    }
+    try:
+        multiplier = multipliers[unit]
+    except KeyError as exc:
+        raise argparse.ArgumentTypeError("unknown byte suffix") from exc
+    return int(number * multiplier)
+
 
 @dataclass(frozen=True)
 class EffectiveRuntimeConfig:
@@ -194,8 +233,11 @@ RUNTIME_CONFIG_FIELDS: tuple[RuntimeConfigFieldSpec, ...] = (
         field="prefix_cache_l2_max_bytes",
         flags=("--prefix-cache-l2-max-bytes",),
         env="DFLASH_PREFIX_CACHE_L2_MAX_BYTES",
-        value_type=int,
-        help="Byte budget for prefix-cache L2.",
+        value_type=_parse_byte_count,
+        help=(
+            "Byte budget for prefix-cache L2. "
+            "Accepts raw bytes or suffixes like 50GB."
+        ),
         metavar="BYTES",
     ),
     RuntimeConfigFieldSpec(
@@ -221,8 +263,11 @@ RUNTIME_CONFIG_FIELDS: tuple[RuntimeConfigFieldSpec, ...] = (
         field="prefix_cache_max_bytes",
         flags=("--prefix-cache-max-bytes",),
         env="DFLASH_PREFIX_CACHE_MAX_BYTES",
-        value_type=int,
-        help="Maximum total bytes the prefix cache may hold.",
+        value_type=_parse_byte_count,
+        help=(
+            "Maximum total bytes the prefix cache may hold. "
+            "Accepts raw bytes or suffixes like 2GB."
+        ),
         metavar="BYTES",
     ),
     RuntimeConfigFieldSpec(
@@ -446,7 +491,7 @@ def resolve_runtime_config(args: Any) -> EffectiveRuntimeConfig:
             _runtime_env("prefix_cache_max_entries"),
             defaults.prefix_cache_max_entries,
         ),
-        prefix_cache_max_bytes=_resolve_int(
+        prefix_cache_max_bytes=_resolve_byte_count(
             getattr(args, "prefix_cache_max_bytes", None),
             _runtime_env("prefix_cache_max_bytes"),
             defaults.prefix_cache_max_bytes,
@@ -471,7 +516,7 @@ def resolve_runtime_config(args: Any) -> EffectiveRuntimeConfig:
             _runtime_env("prefix_cache_l2_dir"),
             defaults.prefix_cache_l2_dir,
         ),
-        prefix_cache_l2_max_bytes=_resolve_int(
+        prefix_cache_l2_max_bytes=_resolve_byte_count(
             getattr(args, "prefix_cache_l2_max_bytes", None),
             _runtime_env("prefix_cache_l2_max_bytes"),
             defaults.prefix_cache_l2_max_bytes,
@@ -551,6 +596,18 @@ def _resolve_int(cli_value: int | None, env_key: str, default: int) -> int:
     if raw:
         return int(raw)
     return int(default)
+
+def _resolve_byte_count(cli_value: int | None, env_key: str, default: int) -> int:
+    if cli_value is not None:
+        return int(cli_value)
+    raw = os.environ.get(env_key, "").strip()
+    if raw:
+        try:
+            return _parse_byte_count(raw)
+        except argparse.ArgumentTypeError as exc:
+            raise ValueError(f"{env_key} must be a byte count: {exc}") from exc
+    return int(default)
+
 
 def _resolve_bool(cli_value: bool | None, env_key: str, default: bool) -> bool:
     if cli_value is not None:

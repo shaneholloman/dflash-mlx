@@ -140,10 +140,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fastpath-max-tokens",
         type=int,
-        default=256,
+        default=0,
         help=(
             "Use target-only AR for requests with max_tokens <= this threshold. "
-            "Default: 256; 0 disables the AR fast path."
+            "Default: 0 (disabled); set a positive value to enable."
         ),
     )
     parser.add_argument(

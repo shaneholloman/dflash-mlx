@@ -346,7 +346,7 @@ def _print_startup_banner(
         chat_template_args = {}
     thinking_enabled = bool(chat_template_args.get("enable_thinking", False))
     fastpath_max_tokens = int(
-        getattr(model_provider.cli_args, "fastpath_max_tokens", 256) or 0
+        getattr(model_provider.cli_args, "fastpath_max_tokens", 0) or 0
     )
     runtime_config = getattr(model_provider.cli_args, "runtime_config", None)
     target_fa_window = (

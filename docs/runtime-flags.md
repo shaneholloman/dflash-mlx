@@ -49,7 +49,7 @@ Generation defaults:
 | `--top-k INT` | default top-k, `0` disables |
 | `--min-p FLOAT` | default min-p filter |
 | `--max-tokens INT` | default request max tokens |
-| `--fastpath-max-tokens INT` | short-output target-only AR fast path threshold; default `256`, `0` disables; does not change DFlash max context |
+| `--fastpath-max-tokens INT` | short-output target-only AR fast path threshold; default `0` disables; set a positive value to opt in; does not change DFlash max context |
 | `--chat-template TEMPLATE` | inline chat template override |
 | `--use-default-chat-template` | force tokenizer default template |
 | `--enable-thinking` | set chat-template arg `enable_thinking=true`; default disabled |
@@ -90,11 +90,11 @@ Prefix cache:
 | --- | --- |
 | `--prefix-cache`, `--no-prefix-cache` | enable/disable DFlash prefix snapshots |
 | `--prefix-cache-max-entries INT` | L1 snapshot entry budget |
-| `--prefix-cache-max-bytes BYTES` | L1 snapshot byte budget |
+| `--prefix-cache-max-bytes BYTES` | L1 snapshot byte budget; raw integer bytes or suffixes like `2GB` |
 | `--max-snapshot-tokens INT` | snapshot insert token cap; `0` disables the cap |
 | `--prefix-cache-l2`, `--no-prefix-cache-l2` | enable/disable SSD L2 for persisted/spilled snapshots |
 | `--prefix-cache-l2-dir PATH` | L2 root directory |
-| `--prefix-cache-l2-max-bytes BYTES` | L2 disk budget |
+| `--prefix-cache-l2-max-bytes BYTES` | L2 disk budget; raw integer bytes or suffixes like `50GB` |
 
 Notes:
 
@@ -264,6 +264,9 @@ them.
 | `DFLASH_PREFIX_CACHE_MAX_BYTES` | `--prefix-cache-max-bytes BYTES` |
 | `DFLASH_TARGET_FA_WINDOW` | `--target-fa-window INT` |
 | `DFLASH_MAX_CTX` | `--dflash-max-ctx INT` |
+
+Byte-budget env vars accept raw integer bytes or suffixes such as `2GB` and
+`50GB`, matching the CLI flags.
 
 Prefer CLI flags for reproducible local runs. Env vars are mainly for Docker,
 CI, and wrappers.

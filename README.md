@@ -27,7 +27,7 @@ https://github.com/user-attachments/assets/a9be2b48-3264-4970-b836-c876b0b7fdda
 ## Technical details
 
 - **Tape-replay rollback** — instead of snapshotting and restoring the full GatedDeltaNet state, dflash-mlx records an innovation tape during verify and replays only the accepted steps through a custom Metal kernel. Keeps rollback cost low and preserves acceptance over long generations.
-- **JIT SDPA 2-pass** — long-context verify (`N >= 1024`) uses a custom Metal attention kernel that stays numerically aligned with stock MLX attention.
+- **Target-owned long-context attention routing** — Qwen and Gemma adapters route verify blocks through the appropriate MLX or GQA-reshape SDPA path internally, keeping the public CLI free of attention-kernel switches.
 - **Verify-specialized int4 qmm** (`verify_qmm`) — custom Metal simdgroup-MMA kernel for the M=16 quantized matmul that dominates the target verify step. Two shape-adaptive variants (`mma2big`, `mma2big_pipe` with K-split + double-buffered staging). Auto-enabled on MoE targets and dense models with ≥40 layers.
 - **Numerical coherence** — bf16-sensitive paths, including recurrent state replay and small projections, are stabilized across speculative cycles so accepted tokens stay consistent.
 - **Prefix cache (L1+L2)** — RAM snapshots of target KV + GDN recurrent state + captured hidden + last logits, with optional SSD spill, byte/entry budgets, and automatic eviction. Hits skip prefill on revisited prompts. This hot/cold cache hierarchy is inspired by [oMLX](https://github.com/jundot/omlx)'s tiered KV cache work, but dflash-mlx stores DFlash prefix snapshots rather than active paged-KV blocks.
@@ -110,16 +110,17 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   }"
 ```
 
-Compatible with OpenCode, aider, Continue, Open WebUI, and any
-OpenAI-compatible client. Chat Completions tool calls stream as OpenAI
+Compatible with OpenCode, aider, Continue, Open WebUI, LM Studio through its
+OpenAI-compatible adapter, and any other OpenAI-compatible client. Chat
+Completions tool calls stream as OpenAI
 `delta.tool_calls` for Qwen3-Coder XML, Gemma4, and JSON tool-call payloads
 inside model tool spans; malformed or undeclared tool calls fail at the server
 boundary instead of leaking raw XML/JSON as assistant content. Chat Completions
 accepts `tool_choice: "auto"` and `tool_choice: "none"`; function-specific
 `tool_choice` and `parallel_tool_calls: false` are rejected because the server
-does not implement serial tool enforcement. Short responses may take the
-target-only fast path; pass `--fastpath-max-tokens 0` to force DFlash on every
-request.
+does not implement serial tool enforcement. DFlash handles every request by
+default; pass a positive `--fastpath-max-tokens` value to opt into the
+target-only short-response fast path.
 
 `POST /v1/responses` is available as a minimal non-streaming compatibility
 adapter for text input and function-call tools. Streaming Responses,
@@ -209,8 +210,8 @@ dflash models     # list supported target/draft pairs
 ## Common server controls
 
 ```bash
-# Force DFlash even for short responses
-dflash serve --model Qwen/Qwen3.5-9B --fastpath-max-tokens 0
+# Opt into target-only AR for very short responses
+dflash serve --model Qwen/Qwen3.5-9B --fastpath-max-tokens 64
 
 # Tune prefill batching
 dflash serve --model Qwen/Qwen3.5-9B --prefill-step-size 8192
@@ -240,12 +241,12 @@ Diagnostics artifacts land in `.artifacts/dflash/diagnostics/<timestamp>-serve-<
 - **Chat templates** — enabled by default
 - **Recurrent rollback** — `RecurrentRollbackCache` keeps GatedDeltaNet state coherent across speculative verify and rollback
 - **Verify-specialized int4 qmm** — custom M=16 Metal kernel auto-enabled on MoE and dense ≥40-layer targets; falls back to stock `mx.quantized_matmul` everywhere else
+- **Adaptive verify policy** — default verify mode adjusts the verify block from observed acceptance and long-context pressure; fixed DFlash verification is still available with `--verify-mode dflash`
 - **Prefix cache L1+L2** — RAM snapshots with optional SSD spill, budget-based eviction, and hybrid-architecture support
 - **Diagnostics** — opt-in structured artifacts under `.artifacts/dflash/diagnostics/`
 
 ## Roadmap
 
-- **Adaptive block size** — vary draft block length per cycle based on observed acceptance regime instead of a fixed 16
 - **More architecture backends** — add new target families only with
   family-specific cache layout, attention masks, logits post-processing, hidden
   capture, rollback/trim behavior, and parity tests.
