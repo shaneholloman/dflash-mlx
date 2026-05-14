@@ -135,8 +135,9 @@ curl http://127.0.0.1:8000/metrics
 ```
 
 `prefill_tok_s_physical` counts only tokens actually computed after prefix-cache
-restore. `prefill_tok_s_apparent` uses the full logical prompt length over the
-same user-visible prefill wall time. `rates.average_decode_tok_s` is the
+restore. `prefill_tok_s_restored` counts restored prefix tokens over the same
+wall time. `prefill_tok_s_apparent` uses the full logical prompt length over
+the same user-visible prefill wall time. `rates.average_decode_tok_s` is the
 weighted decode-only average since server startup: total generated tokens
 divided by cumulative decode seconds. `current_request` shows an in-flight
 prefill/decode, `recent_requests` keeps the last 32 completed requests, and

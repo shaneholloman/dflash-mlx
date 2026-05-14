@@ -273,6 +273,28 @@ def test_aggregate_reports_cycle_and_tool_totals():
     assert totals["total_copyspec_hits"] == 3
     assert totals["total_copyspec_tokens"] == 12
 
+def test_aggregate_uses_server_decode_phase_for_decode_tps():
+    posts = [
+        {
+            "landmarks": {"tool_call_count": 1},
+            "server_metric": {
+                "prompt_tokens": 100,
+                "tokens": 10,
+                "wall_s": 1.0,
+                "decode_ms_server": 250.0,
+                "cache_hit_tokens": 90,
+            },
+        }
+    ]
+
+    totals = _aggregate(posts, wall_s=1.2)
+
+    assert totals["total_decode_tokens"] == 10
+    assert totals["total_decode_wall_s"] == 0.25
+    assert totals["total_response_wall_s"] == 1.0
+    assert totals["decode_tps_avg"] == 40.0
+    assert totals["response_tps_avg"] == 10.0
+
 def test_aggregate_falls_back_to_post_event_cycles_when_cycle_events_absent():
     posts = [
         {
@@ -314,7 +336,38 @@ def test_aggregate_uses_usage_cached_tokens_without_dflash_metrics():
 
     assert totals["total_prompt_tokens"] == 100
     assert totals["total_decode_tokens"] == 5
+    assert totals["total_decode_wall_s"] == 0.05
+    assert totals["total_response_wall_s"] == 0.06
+    assert totals["decode_tps_avg"] == 100.0
+    assert totals["response_tps_avg"] == pytest.approx(5 / 0.06)
     assert totals["total_cache_hit_tokens"] == 80
+
+def test_post_view_splits_response_and_decode_wall_without_server_metrics():
+    post = {
+        "landmarks": {
+            "usage": {"completion_tokens": 5},
+            "first_byte_ms": 10.0,
+            "end_t_ms": 60.0,
+        },
+        "server_metric": None,
+    }
+
+    view = agentic_trace._post_view(post)
+
+    assert view["wall_s"] == 0.06
+    assert view["decode_wall_s"] == 0.05
+    assert view["tps"] == pytest.approx(5 / 0.06)
+    assert view["decode_tok_s"] == 100.0
+    rows = agentic_trace._normalized_post_rows(
+        {
+            "metadata": {"label": "usage-only", "backend": "mlxlm"},
+            "client": "replay",
+            "posts": [{"idx": 1, **post}],
+        }
+    )
+    assert rows[0]["wall_s"] == 0.06
+    assert rows[0]["decode_ms"] == 50.0
+    assert rows[0]["decode_tok_s"] == 100.0
 
 def test_agentic_rows_normalize_dflash_post_metrics():
     summary = {
@@ -336,6 +389,9 @@ def test_agentic_rows_normalize_dflash_post_metrics():
                     "wall_s": 4.148,
                     "ttft_ms_server": 956.0,
                     "prefill_ms_server": 955.0,
+                    "prefill_tok_s_apparent": 14000.0,
+                    "prefill_tok_s_physical": 245.0,
+                    "prefill_tok_s_restored": 13755.0,
                     "decode_ms_server": 3193.0,
                     "decode_tok_s": 21.3,
                     "cache_hit_tokens": 13136,
@@ -380,6 +436,9 @@ def test_agentic_rows_normalize_dflash_post_metrics():
             "cache_hit": pytest.approx(13136 / 13370),
             "ttft_ms": 956.0,
             "prefill_ms": 955.0,
+            "prefill_logical_tok_s": 14000.0,
+            "prefill_real_tok_s": 245.0,
+            "prefill_restored_tok_s": 13755.0,
             "decode_ms": 3193.0,
             "decode_tok_s": 21.3,
             "out_tok": 68,
@@ -408,6 +467,7 @@ def test_agentic_rows_normalize_dflash_post_metrics():
         }
     ]
     assert "| # | cache | src | prompt | cached | computed |" in rendered
+    assert "| prefill logical | prefill real | prefill restored |" in rendered
     assert "| accept | tpc | copy hits | copy tok | cycles |" in rendered
     assert "| 2 | warm-l2 | L2 | 13370 | 13136 | 234 | 98.2% |" in rendered
 
@@ -914,6 +974,35 @@ def test_apply_dflash_stderr_totals_records_prefill_saved():
     assert totals["prefill_tokens_saved_cumulative"] == 512
 
 
+def test_parse_dflash_stderr_reads_split_prefill_summary():
+    events = agentic_trace.parse_dflash_stderr(
+        "2026-05-15 01:00:00 [dflash] decode 27.0 tok/s | "
+        "prefill logical 15630.9 tok/s | prefill real 188.3 tok/s | "
+        "prefill restored 15442.6 tok/s | 64.8% accepted | 500 tokens | "
+        "22.6s | prompt: 64571 tokens"
+    )
+
+    assert events == [
+        {
+            "kind": "tps",
+            "raw": (
+                "2026-05-15 01:00:00 [dflash] decode 27.0 tok/s | "
+                "prefill logical 15630.9 tok/s | prefill real 188.3 tok/s | "
+                "prefill restored 15442.6 tok/s | 64.8% accepted | 500 tokens | "
+                "22.6s | prompt: 64571 tokens"
+            ),
+            "tps": 27.0,
+            "accept": 0.648,
+            "tokens": 500,
+            "wall_s": 22.6,
+            "prompt_tokens": 64571,
+            "prefill_logical_tok_s": 15630.9,
+            "prefill_real_tok_s": 188.3,
+            "prefill_restored_tok_s": 15442.6,
+        }
+    ]
+
+
 def test_summarize_cycles_ignores_memory_boundary_events():
     summary = agentic_trace.summarize_cycles(
         [
@@ -970,7 +1059,9 @@ def _comparison_summary(label: str, backend: str, post_count: int, decode_tokens
             "wall_s": 10.0,
             "total_decode_tokens": decode_tokens,
             "total_decode_wall_s": decode_tokens / 100.0,
+            "total_response_wall_s": decode_tokens / 50.0,
             "decode_tps_avg": 100.0,
+            "response_tps_avg": 50.0,
             "total_prompt_tokens": 1000,
             "total_tool_calls": post_count,
             "total_cache_hit_tokens": 128 if backend == "dflash" else 0,
@@ -989,6 +1080,7 @@ def test_render_peer_comparison_keeps_per_post_table_when_trajectories_align():
     assert "Trajectory-robust aggregate metrics" in rendered
     assert "Trajectories aligned" in rendered
     assert "observed_response_ms_per_output_token" in rendered
+    assert "| observed_response_ms_per_output_token | 20.0 | 20.0 | +0.0 ms |" in rendered
     assert "| # | this | peer | gap_ms |" in rendered
 
 def test_render_peer_comparison_skips_per_post_table_when_trajectories_diverge():

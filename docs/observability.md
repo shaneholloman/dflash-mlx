@@ -31,7 +31,14 @@ Prefill throughput is split deliberately:
 
 - `prefill_tok_s_physical`: tokens actually computed after prefix-cache restore
   divided by user-visible prefill wall time.
+- `prefill_tok_s_restored`: prefix-cache restored tokens divided by the same
+  wall time.
 - `prefill_tok_s_apparent`: logical prompt tokens divided by the same wall time.
+
+The compact stderr summary line prints decode throughput as `decode ... tok/s`
+and all three prefill forms as `prefill logical`, `prefill real`, and
+`prefill restored` so long-context runs show both the cache-assisted
+user-visible rate and the actual compute rate.
 
 Decode throughput is exposed in two forms:
 

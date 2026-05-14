@@ -87,6 +87,7 @@ class _RequestAccounting:
     prefill_tok_s: Optional[float] = None
     prefill_tok_s_physical: Optional[float] = None
     prefill_tok_s_apparent: Optional[float] = None
+    prefill_tok_s_restored: Optional[float] = None
     decode_ms: Optional[float] = None
     decode_tok_s: Optional[float] = None
     acceptance_ratio: Optional[float] = None
@@ -198,6 +199,7 @@ class _RequestAccounting:
             prefill_accounting.get("logical_ctx_tokens", prompt_token_count)
         )
         physical_prefill_tokens = prefill_accounting.get("physical_prefill_tokens")
+        restored_prefill_tokens = prefill_accounting.get("prefill_tokens_restored")
         prefill_tok_s_apparent = (
             logical_prefill_tokens / (float(prefill_ms) / 1_000.0)
             if prefill_ms is not None and float(prefill_ms) > 0.0
@@ -206,6 +208,13 @@ class _RequestAccounting:
         prefill_tok_s_physical = (
             int(physical_prefill_tokens) / (float(prefill_ms) / 1_000.0)
             if physical_prefill_tokens is not None
+            and prefill_ms is not None
+            and float(prefill_ms) > 0.0
+            else None
+        )
+        prefill_tok_s_restored = (
+            int(restored_prefill_tokens) / (float(prefill_ms) / 1_000.0)
+            if restored_prefill_tokens is not None
             and prefill_ms is not None
             and float(prefill_ms) > 0.0
             else None
@@ -227,6 +236,7 @@ class _RequestAccounting:
             prefill_tok_s=prefill_tok_s,
             prefill_tok_s_physical=prefill_tok_s_physical,
             prefill_tok_s_apparent=prefill_tok_s_apparent,
+            prefill_tok_s_restored=prefill_tok_s_restored,
             decode_ms=decode_ms,
             decode_tok_s=decode_tok_s,
             acceptance_ratio=acceptance_ratio,
@@ -286,6 +296,10 @@ class _RequestAccounting:
             decode_ms=self.decode_ms,
             prefill_tok_s_physical=self.prefill_tok_s_physical,
             prefill_tok_s_apparent=self.prefill_tok_s_apparent,
+            prefill_tok_s_restored=self.prefill_tok_s_restored,
+            prefill_tokens_physical=self.physical_prefill_tokens,
+            prefill_tokens_restored=self.restored_prefill_tokens,
+            prefill_tokens_computed=self.computed_prefill_tokens,
             decode_tok_s=self.decode_tok_s,
             acceptance_rate=self.acceptance_ratio,
             tokens_per_cycle=self.tokens_per_cycle,
@@ -324,6 +338,7 @@ class _RequestAccounting:
                 "prefill_tok_s": self.prefill_tok_s,
                 "prefill_tok_s_physical": self.prefill_tok_s_physical,
                 "prefill_tok_s_apparent": self.prefill_tok_s_apparent,
+                "prefill_tok_s_restored": self.prefill_tok_s_restored,
                 "decode_tok_s": self.decode_tok_s,
                 "decode_ms": self.decode_ms,
                 "cache_lookup_ms": self.cache_lookup_ms,
@@ -701,13 +716,19 @@ def _reset_live_metrics_state() -> None:
 def _write_summary_line_from_accounting(accounting: _RequestAccounting) -> None:
     generation_tokens = int(accounting.generated_tokens or 0)
     prompt_tokens = int(accounting.prompt_tokens or 0)
-    prefill_tok_s = _float_or_none(accounting.prefill_tok_s) or 0.0
+    prefill_tok_s_apparent = _float_or_none(accounting.prefill_tok_s_apparent)
+    if prefill_tok_s_apparent is None:
+        prefill_tok_s_apparent = _float_or_none(accounting.prefill_tok_s) or 0.0
+    prefill_tok_s_physical = _float_or_none(accounting.prefill_tok_s_physical) or 0.0
+    prefill_tok_s_restored = _float_or_none(accounting.prefill_tok_s_restored) or 0.0
     tok_s = _float_or_none(accounting.decode_tok_s) or 0.0
     acceptance_pct = (_float_or_none(accounting.acceptance_ratio) or 0.0) * 100.0
     total_s = float(accounting.wall_ms) / 1_000.0
     _write_observability_line(
-        f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] {tok_s:.1f} tok/s | "
-        f"prefill {prefill_tok_s:.1f} tok/s | "
+        f"{time.strftime('%Y-%m-%d %H:%M:%S')} [dflash] decode {tok_s:.1f} tok/s | "
+        f"prefill logical {prefill_tok_s_apparent:.1f} tok/s | "
+        f"prefill real {prefill_tok_s_physical:.1f} tok/s | "
+        f"prefill restored {prefill_tok_s_restored:.1f} tok/s | "
         f"{acceptance_pct:.1f}% accepted | {generation_tokens} tokens | "
         f"{total_s:.1f}s | prompt: {prompt_tokens} tokens\n"
     )
@@ -804,7 +825,9 @@ def _append_diagnostics_summary(
         f"| {accounting.request_id} | {_fmt_int(accounting.prompt_tokens)} | "
         f"{_fmt_int(accounting.generated_tokens)} | {_fmt_ms(accounting.wall_ms)} | "
         f"{_fmt_ms(accounting.ttft_ms)} | {_fmt_ms(accounting.prefill_ms)} | "
-        f"{_fmt_float(accounting.prefill_tok_s)} | {prefill_step_size} | "
+        f"{_fmt_float(accounting.prefill_tok_s_apparent)} | "
+        f"{_fmt_float(accounting.prefill_tok_s_physical)} | "
+        f"{_fmt_float(accounting.prefill_tok_s_restored)} | {prefill_step_size} | "
         f"{_fmt_ms(accounting.decode_ms)} | "
         f"{_fmt_float3(accounting.acceptance_ratio)} | "
         f"{_fmt_float(accounting.tokens_per_cycle)} | "
@@ -817,9 +840,10 @@ def _append_diagnostics_summary(
                 fp.write(
                     "\n## Requests\n\n"
                     "| request | prompt_tokens | generated | wall_ms | ttft_ms | "
-                    "prefill_ms | prefill_tok_s | prefill_step | decode_ms | "
+                    "prefill_ms | prefill_logical_tok_s | prefill_real_tok_s | "
+                    "prefill_restored_tok_s | prefill_step | decode_ms | "
                     "acceptance | tokens_cycle | cycles | cache_hit_tokens |\n"
-                    "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
+                    "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
                 )
             fp.write(line)
     except OSError as exc:
@@ -970,6 +994,10 @@ def _last_request_payload(
     decode_ms: Optional[float],
     prefill_tok_s_physical: Optional[float],
     prefill_tok_s_apparent: Optional[float],
+    prefill_tok_s_restored: Optional[float],
+    prefill_tokens_physical: Optional[int],
+    prefill_tokens_restored: Optional[int],
+    prefill_tokens_computed: Optional[int],
     decode_tok_s: Optional[float],
     acceptance_rate: Optional[float],
     tokens_per_cycle: Optional[float],
@@ -994,6 +1022,10 @@ def _last_request_payload(
         "decode_s": _seconds_or_none(decode_ms),
         "prefill_tok_s_physical": _float_or_none(prefill_tok_s_physical),
         "prefill_tok_s_apparent": _float_or_none(prefill_tok_s_apparent),
+        "prefill_tok_s_restored": _float_or_none(prefill_tok_s_restored),
+        "prefill_tokens_physical": _int_or_none(prefill_tokens_physical),
+        "prefill_tokens_restored": _int_or_none(prefill_tokens_restored),
+        "prefill_tokens_computed": _int_or_none(prefill_tokens_computed),
         "decode_tok_s": _float_or_none(decode_tok_s),
         "acceptance_rate": _float_or_none(acceptance_rate),
         "tokens_per_cycle": _float_or_none(tokens_per_cycle),

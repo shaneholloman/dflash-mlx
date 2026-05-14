@@ -279,6 +279,9 @@ def test_diagnostics_post_event_records_prefill_details(tmp_path):
     row = json.loads((tmp_path / "post_events.jsonl").read_text().splitlines()[-1])
 
     assert row["prefill_tok_s"] == 2048.0
+    assert row["prefill_tok_s_apparent"] == 2048.0
+    assert row["prefill_tok_s_physical"] == 512.0
+    assert row["prefill_tok_s_restored"] == 1536.0
     assert row["logical_ctx_tokens"] == 4096
     assert row["physical_prefill_tokens"] == 1024
     assert row["prefill_tokens_restored"] == 3072
@@ -291,7 +294,7 @@ def test_diagnostics_post_event_records_prefill_details(tmp_path):
         "phase_cold_us": 1_900_000.0,
         "phase_seam_us": 100_000.0,
     }
-    assert "prefill_tok_s" in (tmp_path / "summary.md").read_text()
+    assert "prefill_logical_tok_s" in (tmp_path / "summary.md").read_text()
 
 
 def test_target_only_request_records_live_metrics_and_post_event(tmp_path, monkeypatch):
@@ -399,17 +402,23 @@ def test_finalize_request_observability_records_all_outputs(tmp_path, monkeypatc
     assert post["prompt_tokens"] == 8
     assert post["generated_tokens"] == 4
     assert post["prefill_tok_s"] == 8.0
+    assert post["prefill_tok_s_apparent"] == 8.0
+    assert post["prefill_tok_s_physical"] == 8.0
+    assert post["prefill_tok_s_restored"] == 0.0
     assert post["decode_tok_s"] == 2.0
     assert post["cache_status"] == "COLD"
     assert post["prefill_event"]["physical_prefill_tokens"] == 8
     assert post["memory_waterfall_peak"]["mlx_active_gb"] == 6.0
     summary = (tmp_path / "summary.md").read_text()
-    assert "| 10 | 8 | 4 | 3000.0 | 1500.0 | 1000.0 | 8.00 |" in summary
+    assert "| 10 | 8 | 4 | 3000.0 | 1500.0 | 1000.0 | 8.00 | 8.00 | 0.00 |" in summary
     payload = get_live_metrics_payload()
     assert payload["last_request"]["request_id"] == 10
     assert payload["last_request"]["generated_tokens"] == 4
     err = capsys.readouterr().err
-    assert "2.0 tok/s | prefill 8.0 tok/s" in err
+    assert (
+        "decode 2.0 tok/s | prefill logical 8.0 tok/s | "
+        "prefill real 8.0 tok/s | prefill restored 0.0 tok/s"
+    ) in err
     assert "req#10 mlx_active=2.00" in err
     assert "req#10 mlx_active=6.00" not in err
     assert "memory snapshot partial" not in err
@@ -878,6 +887,10 @@ def test_metrics_endpoint_reports_last_request_and_prefix_cache(monkeypatch):
     assert last["ttft_s"] == 1.0
     assert last["prefill_tok_s_physical"] == 250.0
     assert last["prefill_tok_s_apparent"] == 1000.0
+    assert last["prefill_tok_s_restored"] == 750.0
+    assert last["prefill_tokens_physical"] == 250
+    assert last["prefill_tokens_restored"] == 750
+    assert last["prefill_tokens_computed"] == 250
     assert round(last["decode_tok_s"], 2) == 33.33
     assert last["acceptance_rate"] == 0.81
     assert last["tokens_per_cycle"] == 2.27

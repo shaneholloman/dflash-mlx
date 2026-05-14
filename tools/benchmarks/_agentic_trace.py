@@ -488,6 +488,7 @@ def post_event_to_server_metric(
         "prefill_tok_s": pe.get("prefill_tok_s"),
         "prefill_tok_s_physical": pe.get("prefill_tok_s_physical"),
         "prefill_tok_s_apparent": pe.get("prefill_tok_s_apparent"),
+        "prefill_tok_s_restored": pe.get("prefill_tok_s_restored"),
         "logical_ctx_tokens": pe.get("logical_ctx_tokens"),
         "physical_prefill_tokens": pe.get("physical_prefill_tokens"),
         "prefill_tokens_restored": pe.get("prefill_tokens_restored"),
@@ -638,7 +639,17 @@ def _cache_hit_source(cache_lookup_event: dict[str, Any] | None) -> str | None:
     return None
 
 _DFLASH_TPS_RE = re.compile(
-    r"\[dflash\]\s+([\d.]+)\s+tok/s\s+\|\s+([\d.]+)%\s+accepted\s+\|\s+(\d+)\s+tokens\s+\|\s+([\d.]+)s\s+\|\s+prompt:\s+(\d+)\s+tokens"
+    r"\[dflash\]\s+(?:decode\s+)?(?P<tps>[\d.]+)\s+tok/s\s+\|.*?"
+    r"(?P<accept>[\d.]+)%\s+accepted\s+\|\s+(?P<tokens>\d+)\s+tokens\s+\|\s+"
+    r"(?P<wall_s>[\d.]+)s\s+\|\s+prompt:\s+(?P<prompt_tokens>\d+)\s+tokens"
+)
+_DFLASH_PREFILL_DETAIL_RE = re.compile(
+    r"prefill\s+logical\s+(?P<logical>[\d.]+)\s+tok/s\s+\|\s+"
+    r"prefill\s+real\s+(?P<real>[\d.]+)\s+tok/s\s+\|\s+"
+    r"prefill\s+restored\s+(?P<restored>[\d.]+)\s+tok/s"
+)
+_DFLASH_PREFILL_LEGACY_RE = re.compile(
+    r"prefill\s+(?P<prefill>[\d.]+)\s+tok/s"
 )
 _DFLASH_HIT_RE = re.compile(
     r"\[dflash\]\s+prefix\s+cache\s+hit\s+(\d+)/(\d+)\s+tokens"
@@ -660,15 +671,27 @@ def parse_dflash_stderr(text: str) -> list[dict[str, Any]]:
     for line in text.splitlines():
         m = _DFLASH_TPS_RE.search(line)
         if m:
-            events.append({
+            event = {
                 "kind": "tps",
                 "raw": line,
-                "tps": float(m.group(1)),
-                "accept": float(m.group(2)) / 100.0,
-                "tokens": int(m.group(3)),
-                "wall_s": float(m.group(4)),
-                "prompt_tokens": int(m.group(5)),
-            })
+                "tps": float(m.group("tps")),
+                "accept": float(m.group("accept")) / 100.0,
+                "tokens": int(m.group("tokens")),
+                "wall_s": float(m.group("wall_s")),
+                "prompt_tokens": int(m.group("prompt_tokens")),
+            }
+            prefill = _DFLASH_PREFILL_DETAIL_RE.search(line)
+            if prefill:
+                event["prefill_logical_tok_s"] = float(prefill.group("logical"))
+                event["prefill_real_tok_s"] = float(prefill.group("real"))
+                event["prefill_restored_tok_s"] = float(prefill.group("restored"))
+            else:
+                legacy_prefill = _DFLASH_PREFILL_LEGACY_RE.search(line)
+                if legacy_prefill:
+                    event["prefill_logical_tok_s"] = float(
+                        legacy_prefill.group("prefill")
+                    )
+            events.append(event)
             continue
         m = _DFLASH_HIT_RE.search(line)
         if m:
@@ -2278,21 +2301,31 @@ def _post_view(p: dict[str, Any]) -> dict[str, Any]:
     fb = lm.get("first_byte_ms")
     end = lm.get("end_t_ms")
     decode_wall_s_est = ((end - fb) / 1000.0) if (fb is not None and end is not None and end > fb) else None
+    response_wall_s_est = (float(end) / 1000.0) if isinstance(end, (int, float)) else None
     prompt_tokens = sm.get("prompt_tokens") if sm.get("prompt_tokens") is not None else usage.get("prompt_tokens")
     decode_tokens = sm.get("tokens") if sm.get("tokens") is not None else usage.get("completion_tokens")
     usage_cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
     cache_hit_tokens = sm.get("cache_hit_tokens")
     if cache_hit_tokens is None and isinstance(usage_cached, int):
         cache_hit_tokens = usage_cached
-    wall_s = sm.get("wall_s") if sm.get("wall_s") is not None else decode_wall_s_est
+    wall_s = sm.get("wall_s") if sm.get("wall_s") is not None else response_wall_s_est
+    decode_ms = _float_value(sm.get("decode_ms_server"))
+    decode_wall_s = (decode_ms / 1000.0) if decode_ms is not None else decode_wall_s_est
+    if decode_wall_s is None:
+        decode_wall_s = wall_s
     tps = sm.get("tps")
     if tps is None and decode_tokens and wall_s and wall_s > 0:
         tps = decode_tokens / wall_s
+    decode_tok_s = sm.get("decode_tok_s")
+    if decode_tok_s is None and decode_tokens and decode_wall_s and decode_wall_s > 0:
+        decode_tok_s = decode_tokens / decode_wall_s
     return {
         "prompt_tokens": prompt_tokens,
         "decode_tokens": decode_tokens,
         "wall_s": wall_s,
+        "decode_wall_s": decode_wall_s,
         "tps": tps,
+        "decode_tok_s": decode_tok_s,
         "accept": sm.get("accept"),
         "tokens_per_cycle": sm.get("tokens_per_cycle"),
         "copyspec_hits": sm.get("copyspec_hits"),
@@ -2366,8 +2399,8 @@ def _normalized_post_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
         )
         cache_hit_source = sm.get("cache_hit_source")
         decode_ms = _float_value(sm.get("decode_ms_server"))
-        if decode_ms is None and isinstance(view.get("wall_s"), (int, float)):
-            decode_ms = float(view["wall_s"]) * 1000.0
+        if decode_ms is None and isinstance(view.get("decode_wall_s"), (int, float)):
+            decode_ms = float(view["decode_wall_s"]) * 1000.0
         rows.append(
             {
                 "run": meta.get("label"),
@@ -2386,9 +2419,13 @@ def _normalized_post_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
                 or _float_value(lm.get("first_tool_call_sent_ms"))
                 or _float_value(lm.get("first_byte_ms")),
                 "prefill_ms": _float_value(sm.get("prefill_ms_server")),
+                "prefill_logical_tok_s": _float_value(sm.get("prefill_tok_s_apparent"))
+                or _float_value(sm.get("prefill_tok_s")),
+                "prefill_real_tok_s": _float_value(sm.get("prefill_tok_s_physical")),
+                "prefill_restored_tok_s": _float_value(sm.get("prefill_tok_s_restored")),
                 "decode_ms": decode_ms,
                 "decode_tok_s": _float_value(sm.get("decode_tok_s"))
-                or _float_value(view.get("tps")),
+                or _float_value(view.get("decode_tok_s")),
                 "out_tok": _int_value(view.get("decode_tokens")),
                 "wall_s": _float_value(view.get("wall_s")),
                 "acceptance": _float_value(view.get("accept")),
@@ -2433,6 +2470,9 @@ _ROWS_MD_COLUMNS = (
     ("cache_hit", "hit"),
     ("ttft_ms", "TTFT ms"),
     ("prefill_ms", "prefill ms"),
+    ("prefill_logical_tok_s", "prefill logical"),
+    ("prefill_real_tok_s", "prefill real"),
+    ("prefill_restored_tok_s", "prefill restored"),
     ("decode_ms", "decode ms"),
     ("decode_tok_s", "decode tok/s"),
     ("out_tok", "out"),
@@ -2455,7 +2495,11 @@ def _rows_md_value(key: str, value: Any) -> str:
         return f"{float(value) * 100:.1f}%" if isinstance(value, (int, float)) else str(value)
     if key == "acceptance":
         return f"{float(value) * 100:.1f}%" if isinstance(value, (int, float)) else str(value)
-    if key.endswith("_gb") or key in ("wall_s", "decode_tok_s", "tokens_per_cycle"):
+    if key.endswith("_gb") or key.endswith("_tok_s") or key in (
+        "wall_s",
+        "decode_tok_s",
+        "tokens_per_cycle",
+    ):
         return f"{float(value):.2f}" if isinstance(value, (int, float)) else str(value)
     if key.endswith("_ms"):
         return f"{float(value):.0f}" if isinstance(value, (int, float)) else str(value)
@@ -2808,6 +2852,7 @@ def _write_timeline_artifacts(
 def _aggregate(posts: list[dict[str, Any]], wall_s: float | None) -> dict[str, Any]:
     total_decode_tokens = 0
     total_decode_wall_s = 0.0
+    total_response_wall_s = 0.0
     total_prompt_tokens = 0
     total_cache_hit = 0
     total_cycles = 0
@@ -2823,8 +2868,10 @@ def _aggregate(posts: list[dict[str, Any]], wall_s: float | None) -> dict[str, A
         v = _post_view(p)
         if v["decode_tokens"]:
             total_decode_tokens += v["decode_tokens"]
-        if v["wall_s"]:
-            total_decode_wall_s += v["wall_s"]
+        sm = p.get("server_metric") or {}
+        response_wall_s = _float_value(v.get("wall_s"))
+        if response_wall_s:
+            total_response_wall_s += response_wall_s
         if v["prompt_tokens"]:
             total_prompt_tokens += v["prompt_tokens"]
         if v["cache_hit_tokens"]:
@@ -2837,7 +2884,9 @@ def _aggregate(posts: list[dict[str, Any]], wall_s: float | None) -> dict[str, A
             total_copyspec_tokens += v["copyspec_tokens"]
         if isinstance(v.get("prefill_tokens_saved_cumulative"), int):
             prefill_saved_values.append(v["prefill_tokens_saved_cumulative"])
-        sm = p.get("server_metric") or {}
+        decode_wall_s = _float_value(v.get("decode_wall_s"))
+        if decode_wall_s:
+            total_decode_wall_s += decode_wall_s
         cyc = sm.get("cycles_summary") or {}
         if cyc:
             total_cycles += int(cyc.get("n_cycles") or 0)
@@ -2858,7 +2907,9 @@ def _aggregate(posts: list[dict[str, Any]], wall_s: float | None) -> dict[str, A
         "total_prompt_tokens": total_prompt_tokens,
         "total_decode_tokens": total_decode_tokens,
         "total_decode_wall_s": total_decode_wall_s,
+        "total_response_wall_s": total_response_wall_s,
         "decode_tps_avg": (total_decode_tokens / total_decode_wall_s) if total_decode_wall_s > 0 else None,
+        "response_tps_avg": (total_decode_tokens / total_response_wall_s) if total_response_wall_s > 0 else None,
         "total_cache_hit_tokens": total_cache_hit,
         "prefill_tokens_saved_cumulative": max(prefill_saved_values) if prefill_saved_values else None,
         "total_cycles": total_cycles,
@@ -2977,7 +3028,7 @@ def _render_compare(summary: dict[str, Any], peer: dict[str, Any] | None = None)
         md.append("")
     md.append("## Per-POST")
     md.append("")
-    md.append("| # | prompt | decode | wall_s | tps | accept | tpc | cache_hit | ttft_srv | prefill_srv | decode_srv | cycles | tools | first_byte | first_content | first_tool | finish | src |")
+    md.append("| # | prompt | decode | wall_s | decode tok/s | accept | tpc | cache_hit | ttft_srv | prefill_srv | decode_srv | cycles | tools | first_byte | first_content | first_tool | finish | src |")
     md.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for p in summary["posts"]:
         v = _post_view(p)
@@ -2989,7 +3040,7 @@ def _render_compare(summary: dict[str, Any], peer: dict[str, Any] | None = None)
                 prompt=v["prompt_tokens"] if v["prompt_tokens"] is not None else "—",
                 decode=v["decode_tokens"] if v["decode_tokens"] is not None else "—",
                 wall=f"{v['wall_s']:.2f}" if v["wall_s"] is not None else "—",
-                tps=f"{v['tps']:.1f}" if v["tps"] is not None else "—",
+                tps=f"{v['decode_tok_s']:.1f}" if v["decode_tok_s"] is not None else "—",
                 accept=f"{v['accept']*100:.1f}%" if v["accept"] is not None else "—",
                 tpc=f"{v['tokens_per_cycle']:.2f}" if v["tokens_per_cycle"] is not None else "—",
                 hit=v["cache_hit_tokens"] if v["cache_hit_tokens"] is not None else "—",
@@ -3061,7 +3112,9 @@ def _fmt_ratio(a: Any, b: Any) -> str:
 
 def _observed_response_ms_per_output_token(totals: dict[str, Any]) -> float | None:
     tokens = totals.get("total_decode_tokens")
-    wall_s = totals.get("total_decode_wall_s")
+    wall_s = totals.get("total_response_wall_s")
+    if wall_s is None:
+        wall_s = totals.get("total_decode_wall_s")
     if isinstance(tokens, int) and tokens > 0 and isinstance(wall_s, (int, float)):
         return (float(wall_s) / float(tokens)) * 1000.0
     return None
