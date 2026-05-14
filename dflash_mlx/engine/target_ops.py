@@ -21,7 +21,6 @@ class TargetCapabilities:
     supports_target_hidden_capture: bool
     supports_verify_linear: bool = False
     supports_full_context_draft_layers: bool = False
-    supports_full_attention_split: bool = False
     supports_tree_verify: bool = False
 
 class TargetOps(Protocol):
@@ -51,14 +50,6 @@ class TargetOps(Protocol):
         quantize_kv_cache: bool = False,
         target_fa_window: Optional[int] = None,
     ) -> list[Any]: ...
-
-    def configure_full_attention_split(
-        self,
-        target_model: Any,
-        *,
-        enabled: bool,
-        chunk_size: int = 8,
-    ) -> None: ...
 
     def install_speculative_hooks(self, target_model: Any) -> None: ...
 

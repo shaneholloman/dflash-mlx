@@ -81,7 +81,6 @@ class DFlashModelProvider(mlx_server.ModelProvider):
             draft_ref=draft_ref,
             draft_quant=getattr(self.cli_args, "draft_quant", None) or None,
             verify_config=self.cli_args.runtime_context.verify,
-            split_full_attention_sdpa=getattr(self.cli_args, "split_sdpa", None),
         )
         model = bundle.target_model
         tokenizer = bundle.tokenizer

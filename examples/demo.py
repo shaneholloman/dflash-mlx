@@ -511,7 +511,6 @@ def main() -> None:
                 model_ref=resolved_target_ref,
                 draft_ref=args.draft_model,
                 verify_config=runtime_context.verify,
-                split_full_attention_sdpa=not args.quantize_kv_cache,
                 quantize_kv_cache=args.quantize_kv_cache,
             )
 

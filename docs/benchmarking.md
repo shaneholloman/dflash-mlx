@@ -65,7 +65,6 @@ performance numbers.
 | cooldown | `10` seconds |
 | memory summary | enabled |
 | MLX wired/cache limits | wired `auto`; cache `4GB` for `longctx`, `auto` otherwise |
-| split-SDPA in benchmark | auto by target policy |
 | output dir | `.artifacts/dflash/benchmarks/<timestamp>-<suite>-<model>` |
 
 The default `dflash benchmark` invocation uses `smoke`; that is intentionally a
@@ -104,13 +103,12 @@ selected row indices, and selected prompt ids.
 | `--no-chat-template` | raw prompt text |
 | `--draft-quant SPEC` | draft quantization override, e.g. `w4:gs64`; use `none` to disable model defaults |
 | `--no-eos` | suppress EOS for fixed-length runs |
-| `--split-sdpa`, `--no-split-sdpa` | benchmark verifier split-SDPA mode; default is auto by target policy |
 | `--prefill-step-size INT` | target prefill chunk size |
 | `--target-fa-window INT` | experimental target FA rotating window |
 | `--draft-sink-size INT` | draft cache sink tokens |
 | `--draft-window-size INT` | draft cache rolling window tokens |
 | `--verify-len-cap INT` | max tokens per verify forward |
-| `--verify-mode {auto,adaptive,ddtree,off}` | verifier path mode |
+| `--verify-mode {dflash,adaptive,ddtree,off}` | verifier path mode |
 | `--no-memory` | omit memory medians |
 | `--out PATH` | artifact directory |
 

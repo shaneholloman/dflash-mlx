@@ -176,9 +176,6 @@ def load_target_bundle(
     model_ref: str | Path | None = None,
     *,
     lazy: bool = True,
-    split_full_attention_sdpa: bool | None = None,
-    split_full_attention_sdpa_default: bool | None = None,
-    split_full_attention_chunk_size: int = 8,
     quantize_kv_cache: bool = False,
     verify_config: VerifyConfig | None = None,
 ) -> LoadedTargetBundle:
@@ -187,36 +184,12 @@ def load_target_bundle(
     target_ops = resolve_target_ops(model)
     target_family = target_ops.family(model)
     target_capabilities = target_ops.capabilities_for(model)
-    split_default = (
-        False
-        if split_full_attention_sdpa_default is None
-        else bool(split_full_attention_sdpa_default)
-    )
-    split_enabled = (
-        split_default
-        if split_full_attention_sdpa is None
-        else bool(split_full_attention_sdpa)
-    )
-    split_applied = bool(
-        split_enabled
-        and not quantize_kv_cache
-        and getattr(target_capabilities, "supports_full_attention_split", False)
-    )
     target_ops.install_speculative_hooks(model)
-    target_ops.configure_full_attention_split(
-        model,
-        enabled=split_applied,
-        chunk_size=split_full_attention_chunk_size,
-    )
     meta = {
         "resolved_model_ref": resolved_ref,
         "config": config,
         "quantize_kv_cache": bool(quantize_kv_cache),
         "target_family": target_family,
-        "split_full_attention_sdpa": split_applied,
-        "split_full_attention_sdpa_requested": split_full_attention_sdpa,
-        "split_full_attention_sdpa_default": split_default,
-        "split_full_attention_sdpa_resolved": split_enabled,
     }
     verify_linear_enabled = (
         bool(target_capabilities.supports_verify_linear)

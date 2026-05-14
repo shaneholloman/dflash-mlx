@@ -10,7 +10,6 @@ from dataclasses import dataclass, field
 @dataclass(frozen=True)
 class ModelRuntimeDefaults:
     draft_quant: str | None = None
-    split_sdpa: bool = False
 
 
 @dataclass(frozen=True)
@@ -22,7 +21,6 @@ class ModelSupportSpec:
 
 
 W4_DEFAULTS = ModelRuntimeDefaults(draft_quant="w4")
-QWEN36_35B_DEFAULTS = ModelRuntimeDefaults(draft_quant="w4", split_sdpa=True)
 
 MODEL_SUPPORT_SPECS: tuple[ModelSupportSpec, ...] = (
     ModelSupportSpec(("Qwen3.5-4B",), "z-lab/Qwen3.5-4B-DFlash", "hybrid_gdn"),
@@ -45,7 +43,7 @@ MODEL_SUPPORT_SPECS: tuple[ModelSupportSpec, ...] = (
         ("Qwen3.6-35B-A3B",),
         "z-lab/Qwen3.6-35B-A3B-DFlash",
         "hybrid_gdn",
-        QWEN36_35B_DEFAULTS,
+        W4_DEFAULTS,
     ),
     ModelSupportSpec(("Qwen3-4B",), "z-lab/Qwen3-4B-DFlash-b16", "pure_attention"),
     ModelSupportSpec(("Qwen3-8B",), "z-lab/Qwen3-8B-DFlash-b16", "pure_attention"),

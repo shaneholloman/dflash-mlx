@@ -143,7 +143,6 @@ def test_run_grid_writes_incremental_rows_and_gates_diverged_compare(monkeypatch
             "--clear-cache-between-cases",
             "--verify-mode",
             "adaptive",
-            "--split-sdpa",
             "--out",
             str(tmp_path / "grid"),
         ]
@@ -168,10 +167,9 @@ def test_run_grid_writes_incremental_rows_and_gates_diverged_compare(monkeypatch
     assert summary["comparison"][0]["compare_status"] == "diverged"
     assert summary["comparison"][0]["dflash_wall_ratio"] is None
     assert bundle_kwargs["verify_config"].mode == "adaptive"
-    assert bundle_kwargs["split_full_attention_sdpa"] is True
+    assert "split_full_attention_sdpa" not in bundle_kwargs
     manifest = json.loads((tmp_path / "grid" / "manifest.json").read_text())
     assert manifest["effective_config"]["verify_mode"] == "adaptive"
-    assert manifest["effective_config"]["split_sdpa"] is True
 
 
 def test_memory_sampler_ignores_first_stale_mlx_peak(monkeypatch):

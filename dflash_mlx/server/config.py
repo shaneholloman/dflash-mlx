@@ -96,12 +96,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Draft quantization override, e.g. w4:gs64; use 'none' to disable model defaults.",
     )
     parser.add_argument(
-        "--split-sdpa",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Target split-SDPA verifier path. Default: auto by target policy.",
-    )
-    parser.add_argument(
         "--log-level",
         type=str,
         default="INFO",

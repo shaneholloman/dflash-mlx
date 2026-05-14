@@ -210,7 +210,7 @@ class _AdaptiveBlockPolicy:
         verify_len_cap: int,
         prompt_len: int = 0,
     ) -> "_AdaptiveBlockPolicy | None":
-        if str(getattr(runtime_config, "verify_mode", "auto")) != "adaptive":
+        if str(getattr(runtime_config, "verify_mode", "dflash")) != "adaptive":
             return None
         full_block_tokens = int(effective_block_tokens)
         if full_block_tokens <= 4:
@@ -1506,7 +1506,7 @@ class SpeculativeSession:
         prefill: _PrefillResult,
         yield_pause: "_YieldPauseTracker",
     ) -> Generator[EngineEvent, None, _DecodeResult]:
-        if str(getattr(self.runtime_config, "verify_mode", "auto")) == "ddtree":
+        if str(getattr(self.runtime_config, "verify_mode", "dflash")) == "ddtree":
             return (
                 yield from self._run_ddtree_decode_events(
                     request=request,
@@ -2223,9 +2223,6 @@ def stream_dflash_generate_impl(
     allow_full_context_draft_layers = bool(
         getattr(target_capabilities, "supports_full_context_draft_layers", False)
     )
-    if quantize_kv_cache:
-        target_ops.configure_full_attention_split(target_model, enabled=False)
-
     prompt_tokens = (
         list(prompt_tokens_override)
         if prompt_tokens_override is not None

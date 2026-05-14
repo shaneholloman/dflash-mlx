@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 from mlx_lm.models.cache import KVCache, QuantizedKVCache, RotatingKVCache
 
+from dflash_mlx.engine import target_qwen_gdn as qwen_gdn
 from dflash_mlx.engine.target_ops import bind_draft_to_target, resolve_target_ops
 from dflash_mlx.engine.target_gemma4 import Gemma4TargetOps
 from dflash_mlx.engine.target_qwen_gdn import QwenGdnTargetOps
@@ -51,6 +52,59 @@ class _FakeTarget:
             layers=[_FakeFaLayer(), _FakeGdnLayer(), _FakeFaLayer()],
             embed_tokens=_FakeEmbed(),
         )
+
+def _fake_qwen_full_attention(*, q_heads: int = 4, kv_heads: int = 1, head_dim: int = 256):
+    class _Proj:
+        def __init__(self, out_dim: int) -> None:
+            self.out_dim = int(out_dim)
+            self.weight = mx.zeros((self.out_dim, 1), dtype=mx.float32)
+
+        def __call__(self, x: mx.array) -> mx.array:
+            return mx.zeros((x.shape[0], x.shape[1], self.out_dim), dtype=x.dtype)
+
+    class _Norm:
+        def __init__(self) -> None:
+            self.weight = mx.zeros((head_dim,), dtype=mx.float32)
+
+        def __call__(self, x: mx.array) -> mx.array:
+            return x
+
+    class _Cache:
+        offset = 4096
+
+        def update_and_fetch(self, keys: mx.array, values: mx.array):
+            return keys, values
+
+    class _Attention:
+        num_attention_heads = q_heads
+        num_key_value_heads = kv_heads
+        scale = 1.0
+
+        def __init__(self) -> None:
+            self.q_proj = _Proj(2 * q_heads * head_dim)
+            self.k_proj = _Proj(kv_heads * head_dim)
+            self.v_proj = _Proj(kv_heads * head_dim)
+            self.q_norm = _Norm()
+            self.k_norm = _Norm()
+            self.original_calls = 0
+
+        def rope(self, x: mx.array, offset=None) -> mx.array:
+            del offset
+            return x
+
+        def o_proj(self, x: mx.array) -> mx.array:
+            return x
+
+        def __call__(self, x: mx.array, mask=None, cache=None) -> mx.array:
+            del mask, cache
+            self.original_calls += 1
+            return mx.full(
+                (x.shape[0], x.shape[1], q_heads * head_dim),
+                7.0,
+                dtype=x.dtype,
+            )
+
+    return _Attention(), _Cache()
 
 class _FakePureAttentionTarget:
     def __init__(self, *, model_type: str = "qwen3") -> None:
@@ -216,16 +270,65 @@ def test_capabilities_for_distinguishes_hybrid_and_pure_attention():
     assert hybrid.supports_recurrent_rollback is True
     assert hybrid.supports_dflash is True
     assert hybrid.supports_prefix_snapshot is True
-    assert hybrid.supports_full_attention_split is True
     assert hybrid.supports_tree_verify is True
     assert pure.supports_recurrent_rollback is False
     assert pure.supports_dflash is True
     assert pure.supports_kv_trim is True
     assert pure.supports_rotating_cache_snapshot is False
     assert pure.supports_shared_kv is False
-    assert pure.supports_full_attention_split is False
     assert pure.supports_tree_verify is True
 
+def test_qwen_verify_gqa_route_is_internal_default(monkeypatch):
+    attn, cache = _fake_qwen_full_attention()
+    qwen_gdn._install_full_attention_gqa_hook(attn)
+    calls: list[tuple[int, int, int]] = []
+
+    def _fake_gqa(queries, keys, values, *, cache, scale, mask):
+        del values, cache, scale, mask
+        calls.append((int(queries.shape[2]), int(keys.shape[2]), int(queries.shape[-1])))
+        return mx.ones(queries.shape, dtype=queries.dtype)
+
+    monkeypatch.setattr(qwen_gdn, "_gqa_reshape_sdpa", _fake_gqa)
+
+    out = attn(mx.zeros((1, 4, 32), dtype=mx.bfloat16), mask="causal", cache=cache)
+    mx.eval(out)
+
+    assert calls == [(4, 4, 256)]
+    assert attn.original_calls == 0
+
+def test_qwen_prefill_uses_original_attention(monkeypatch):
+    attn, cache = _fake_qwen_full_attention()
+    qwen_gdn._install_full_attention_gqa_hook(attn)
+
+    def _fail_gqa(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("q_len > 16 must not enter verify GQA route")
+
+    monkeypatch.setattr(qwen_gdn, "_gqa_reshape_sdpa", _fail_gqa)
+
+    out = attn(mx.zeros((1, 32, 32), dtype=mx.bfloat16), mask="causal", cache=cache)
+    mx.eval(out)
+
+    assert attn.original_calls == 1
+    assert out.shape == (1, 32, 1024)
+
+def test_qwen_quantized_kv_cache_uses_original_attention(monkeypatch):
+    attn, _cache = _fake_qwen_full_attention()
+    quantized_cache = QuantizedKVCache(group_size=64, bits=8)
+    quantized_cache.offset = 4096
+    qwen_gdn._install_full_attention_gqa_hook(attn)
+
+    def _fail_gqa(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("quantized target KV must not enter verify GQA route")
+
+    monkeypatch.setattr(qwen_gdn, "_gqa_reshape_sdpa", _fail_gqa)
+
+    out = attn(mx.zeros((1, 4, 32), dtype=mx.bfloat16), mask="causal", cache=quantized_cache)
+    mx.eval(out)
+
+    assert attn.original_calls == 1
+    assert out.shape == (1, 4, 1024)
 
 def test_qwen_tree_cache_support_rejects_rotating_and_quantized_kv():
     ops = QwenGdnTargetOps()
@@ -292,7 +395,6 @@ def test_gemma4_capabilities_enable_prefix_snapshot_without_shared_kv():
     assert caps.supports_shared_kv is False
     assert caps.supports_target_hidden_capture is True
     assert caps.supports_verify_linear is True
-    assert caps.supports_full_attention_split is False
     assert caps.supports_tree_verify is False
 
 
@@ -371,6 +473,44 @@ def test_gemma4_make_cache_matches_official_shared_kv_cache_types():
         "KVCache",
         "RotatingKVCache",
     ]
+
+
+def test_gemma4_full_attention_gqa_hook_is_internal():
+    from mlx_lm.models import gemma4_text
+
+    args = gemma4_text.ModelArgs(
+        hidden_size=32,
+        num_hidden_layers=2,
+        intermediate_size=64,
+        num_attention_heads=2,
+        head_dim=8,
+        global_head_dim=8,
+        num_key_value_heads=1,
+        num_kv_shared_layers=0,
+        vocab_size=128,
+        vocab_size_per_layer_input=128,
+        hidden_size_per_layer_input=0,
+        sliding_window=16,
+        layer_types=("sliding_attention", "full_attention"),
+        use_double_wide_mlp=False,
+        attention_k_eq_v=False,
+        final_logit_softcapping=None,
+        tie_word_embeddings=True,
+    )
+    model = gemma4_text.Model(args)
+    target = SimpleNamespace(
+        args=SimpleNamespace(model_type="gemma4"),
+        language_model=model,
+    )
+
+    ops = Gemma4TargetOps()
+    ops.install_speculative_hooks(target)
+
+    sliding_attn = model.model.layers[0].self_attn
+    full_attn = model.model.layers[1].self_attn
+    assert not hasattr(sliding_attn, "_dflash_split_sdpa_enabled")
+    assert not hasattr(full_attn, "_dflash_split_sdpa_enabled")
+    assert getattr(type(full_attn), "_dflash_full_attention_gqa_installed") is True
 
 def test_gemma4_logits_use_tied_embedding_head():
     target = _FakeGemmaLogitTarget(tied=True)

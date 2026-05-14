@@ -63,16 +63,10 @@ DFlash runtime:
 | `--draft-sink-size INT` | draft cache sink tokens |
 | `--draft-window-size INT` | draft cache rolling window tokens |
 | `--verify-len-cap INT` | max tokens per verify forward, `0` means block size |
-| `--verify-mode {auto,adaptive,ddtree,off}` | verifier path mode; default `adaptive` probes shorter low-acceptance blocks, `ddtree` verifies a small branch batch, `off` is debug/parity only |
+| `--verify-mode {dflash,adaptive,ddtree,off}` | verifier path mode; default `adaptive` probes shorter low-acceptance blocks, `ddtree` verifies a small branch batch, `off` is debug/parity only |
 | `--dflash-max-ctx INT` | DFlash runtime context cap; `0` means no cap |
 | `--target-fa-window INT` | experimental target FA rotating window; `0` means full KV |
 | `--clear-cache-boundaries`, `--no-clear-cache-boundaries` | clear the MLX cache at safe request boundaries |
-
-Additional DFlash controls:
-
-| Flag | Meaning |
-| --- | --- |
-| `--split-sdpa`, `--no-split-sdpa` | target split-SDPA verifier path; default is auto by target policy |
 
 Draft loading:
 
@@ -153,12 +147,11 @@ Flags:
 | `--no-chat-template` | use raw prompt text |
 | `--draft REF_OR_PATH` | draft override |
 | `--draft-quant SPEC` | draft quantization override, e.g. `w4:gs64`; use `none` to disable model defaults |
-
 Runtime override flags:
 
 | Flag | Meaning |
 | --- | --- |
-| `--verify-mode {auto,adaptive,ddtree,off}` | verifier path mode; default `adaptive` probes shorter low-acceptance blocks, `ddtree` verifies a small branch batch, `off` is debug/parity only |
+| `--verify-mode {dflash,adaptive,ddtree,off}` | verifier path mode; default `adaptive` probes shorter low-acceptance blocks, `ddtree` verifies a small branch batch, `off` is debug/parity only |
 | `--prefill-step-size INT` | target prefill chunk size |
 | `--target-fa-window INT` | experimental target FA rotating window; `0` means full KV |
 | `--draft-sink-size INT` | draft cache sink tokens |
@@ -208,13 +201,11 @@ Flags:
 | `--no-chat-template` | raw prompt mode |
 | `--draft-quant SPEC` | draft quantization override, e.g. `w4:gs64`; use `none` to disable model defaults |
 | `--no-eos` | suppress EOS so generation reaches token cap |
-| `--split-sdpa`, `--no-split-sdpa` | target split-SDPA verifier path; default is auto by target policy |
-
 Runtime override flags:
 
 | Flag | Meaning |
 | --- | --- |
-| `--verify-mode {auto,adaptive,ddtree,off}` | verifier path mode; default `adaptive` probes shorter low-acceptance blocks, `ddtree` verifies a small branch batch, `off` is debug/parity only |
+| `--verify-mode {dflash,adaptive,ddtree,off}` | verifier path mode; default `adaptive` probes shorter low-acceptance blocks, `ddtree` verifies a small branch batch, `off` is debug/parity only |
 | `--prefill-step-size INT` | target prefill chunk size |
 | `--target-fa-window INT` | experimental target FA rotating window; `0` means full KV |
 | `--draft-sink-size INT` | draft cache sink tokens |
@@ -263,7 +254,7 @@ them.
 | `DFLASH_DRAFT_WINDOW_SIZE` | `--draft-window-size INT` |
 | `DFLASH_VERIFY_LEN_CAP` | `--verify-len-cap INT` |
 | `DFLASH_CLEAR_CACHE_BOUNDARIES` | `--clear-cache-boundaries`, `--no-clear-cache-boundaries` |
-| `DFLASH_VERIFY_MODE` | `--verify-mode {auto,adaptive,ddtree,off}` |
+| `DFLASH_VERIFY_MODE` | `--verify-mode {dflash,adaptive,ddtree,off}` |
 | `DFLASH_MAX_SNAPSHOT_TOKENS` | `--max-snapshot-tokens INT` |
 | `DFLASH_PREFIX_CACHE_L2_ENABLED` | `--prefix-cache-l2`, `--no-prefix-cache-l2` |
 | `DFLASH_PREFIX_CACHE_L2_DIR` | `--prefix-cache-l2-dir PATH` |
@@ -305,6 +296,6 @@ The runtime rejects invalid config before serving:
 - `prefix_cache_l2_max_bytes >= 0`
 - `target_fa_window >= 0`
 - `dflash_max_ctx >= 0`
-- `verify_mode in {auto, adaptive, ddtree, off}`
+- `verify_mode in {dflash, adaptive, ddtree, off}`
 
 Use `dflash doctor --json` to see the resolved effective config.

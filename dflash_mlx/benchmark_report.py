@@ -13,10 +13,6 @@ from typing import Any
 
 from dflash_mlx.benchmark_suites import BenchmarkPrompt, ctx_tokens
 
-
-def _optional_bool(value: Any) -> bool | None:
-    return None if value is None else bool(value)
-
 def _metal_limits_payload(args: argparse.Namespace) -> dict[str, Any] | None:
     limits = getattr(args, "metal_limits", None)
     if limits is None:
@@ -129,15 +125,6 @@ def suite_report(
             "use_chat_template": not bool(args.no_chat_template),
             "draft_quant": config.get("draft_quant", args.draft_quant),
             "no_eos": bool(args.no_eos),
-            "split_sdpa": _optional_bool(
-                config["split_sdpa"] if "split_sdpa" in config else args.split_sdpa
-            ),
-            "split_sdpa_applied": _optional_bool(
-                config.get("split_sdpa_applied", config.get("split_sdpa"))
-            ),
-            "split_sdpa_requested": _optional_bool(config.get("split_sdpa_requested")),
-            "split_sdpa_default": _optional_bool(config.get("split_sdpa_default")),
-            "split_sdpa_resolved": _optional_bool(config.get("split_sdpa_resolved")),
             "target_fa_window": int(args.target_fa_window),
             "draft_sink_size": int(args.draft_sink_size),
             "draft_window_size": int(args.draft_window_size),
@@ -177,11 +164,6 @@ def flatten_prompt_runs(
             row["max_tokens"] = suite_config.get("max_tokens")
             row["block_tokens"] = suite_config.get("block_tokens")
             row["use_chat_template"] = suite_config.get("use_chat_template")
-            row["split_sdpa"] = suite_config.get("split_sdpa")
-            row["split_sdpa_applied"] = suite_config.get("split_sdpa_applied")
-            row["split_sdpa_requested"] = suite_config.get("split_sdpa_requested")
-            row["split_sdpa_default"] = suite_config.get("split_sdpa_default")
-            row["split_sdpa_resolved"] = suite_config.get("split_sdpa_resolved")
             row["target_fa_window"] = suite_config.get("target_fa_window")
             row["draft_sink_size"] = suite_config.get("draft_sink_size")
             row["draft_window_size"] = suite_config.get("draft_window_size")
@@ -290,10 +272,6 @@ def summary_markdown(result: dict[str, Any]) -> str:
         f"- prompt_source: {config.get('prompt_source')}",
         f"- prompt_tokenization_mode: {config.get('prompt_tokenization_mode')}",
         f"- use_chat_template: {config.get('use_chat_template')}",
-        f"- split_sdpa_applied: {config.get('split_sdpa_applied', config.get('split_sdpa'))}",
-        f"- split_sdpa_requested: {config.get('split_sdpa_requested')}",
-        f"- split_sdpa_default: {config.get('split_sdpa_default')}",
-        f"- split_sdpa_resolved: {config.get('split_sdpa_resolved')}",
         f"- target_fa_window: {config.get('target_fa_window')}",
         f"- draft_window: {config.get('draft_sink_size')}+{config.get('draft_window_size')}",
         f"- verify_len_cap: {config.get('verify_len_cap')}",

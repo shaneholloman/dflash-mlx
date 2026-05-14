@@ -46,7 +46,7 @@ def _runtime_config(**overrides):
         "dflash_max_ctx": 0,
         "max_snapshot_tokens": 32000,
         "clear_cache_boundaries": False,
-        "verify_mode": "auto",
+        "verify_mode": "dflash",
         "prefix_cache_max_entries": 4,
         "prefix_cache_max_bytes": 8 * 1024**3,
     }
@@ -77,12 +77,7 @@ def _configure_metrics(runtime_config=None):
             draft_model=SimpleNamespace(target_layer_ids=(3, 7)),
             effective_draft_quant="w4",
             draft_meta={"draft_quant_source": "model_default"},
-            target_meta={
-                "split_full_attention_sdpa": True,
-                "split_full_attention_sdpa_requested": None,
-                "split_full_attention_sdpa_default": True,
-                "split_full_attention_sdpa_resolved": True,
-            },
+            target_meta={},
             tokenizer=_fake_tokenizer(),
             cli_args=SimpleNamespace(
                 model="target-model",
@@ -266,7 +261,7 @@ def test_diagnostics_post_event_records_prefill_details(tmp_path):
             dflash_max_ctx=0,
             max_snapshot_tokens=32000,
             clear_cache_boundaries=False,
-            verify_mode="auto",
+            verify_mode="dflash",
         ),
         diagnostics=diagnostics,
     )
@@ -480,11 +475,6 @@ def test_metrics_endpoint_returns_json_before_request(monkeypatch):
     assert payload["server"]["draft_quant"] == "w4"
     assert payload["server"]["draft_quant_source"] == "model_default"
     assert payload["runtime"]["prefill_step_size"] == 2048
-    assert payload["runtime"]["split_sdpa"] is True
-    assert payload["runtime"]["split_sdpa_applied"] is True
-    assert payload["runtime"]["split_sdpa_requested"] is None
-    assert payload["runtime"]["split_sdpa_default"] is True
-    assert payload["runtime"]["split_sdpa_resolved"] is True
     assert payload["memory"].keys() >= {
         "rss_gb",
         "rss_peak_gb",

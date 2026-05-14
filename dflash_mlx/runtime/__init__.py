@@ -29,14 +29,14 @@ def get_stop_token_ids(tokenizer: Any) -> list[int]:
 
 @dataclass(frozen=True)
 class VerifyConfig:
-    mode: str = "auto"
+    mode: str = "dflash"
     enable_qmm: bool = True
 
     @classmethod
     def from_mode(cls, mode: str | None) -> "VerifyConfig":
-        resolved = (mode or "auto").strip().lower()
-        if resolved not in ("auto", "adaptive", "ddtree", "off"):
-            raise ValueError("verify mode must be auto, adaptive, ddtree, or off")
+        resolved = (mode or "dflash").strip().lower()
+        if resolved not in ("dflash", "adaptive", "ddtree", "off"):
+            raise ValueError("verify mode must be dflash, adaptive, ddtree, or off")
         return cls(mode=resolved)
 
 

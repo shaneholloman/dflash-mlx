@@ -56,7 +56,6 @@ def _pure_attention_ops(*, supports_verify_linear: bool = True):
             supports_verify_linear=supports_verify_linear,
         ),
         install_speculative_hooks=lambda model: None,
-        configure_full_attention_split=lambda model, **kwargs: None,
     )
 
 
@@ -119,7 +118,7 @@ def test_verify_config_off_disables_target_verify_linears(monkeypatch):
     assert os.environ["DFLASH_VERIFY_LINEAR"] == "1"
     assert os.environ["DFLASH_VERIFY_QMM"] == "1"
 
-def test_verify_config_auto_threads_qmm_without_env_transport(monkeypatch):
+def test_verify_config_dflash_threads_qmm_without_env_transport(monkeypatch):
     calls: list[bool | None] = []
 
     monkeypatch.setenv("DFLASH_VERIFY_QMM", "0")
@@ -140,7 +139,7 @@ def test_verify_config_auto_threads_qmm_without_env_transport(monkeypatch):
 
     target_bundle = runtime_loading.load_target_bundle(
         "model",
-        verify_config=VerifyConfig.from_mode("auto"),
+        verify_config=VerifyConfig.from_mode("dflash"),
     )
     meta = target_bundle.meta
 
@@ -148,6 +147,12 @@ def test_verify_config_auto_threads_qmm_without_env_transport(monkeypatch):
     assert meta["verify_linear_swapped"] == 3
     assert calls == [True]
     assert os.environ["DFLASH_VERIFY_QMM"] == "0"
+
+
+def test_verify_config_rejects_old_auto_mode_name():
+    with pytest.raises(ValueError, match="dflash, adaptive, ddtree, or off"):
+        VerifyConfig.from_mode("auto")
+
 
 def test_runtime_loader_uses_capability_not_config_fingerprint(monkeypatch):
     calls: list[bool | None] = []
@@ -169,7 +174,7 @@ def test_runtime_loader_uses_capability_not_config_fingerprint(monkeypatch):
 
     target_bundle = runtime_loading.load_target_bundle(
         "model",
-        verify_config=VerifyConfig.from_mode("auto"),
+        verify_config=VerifyConfig.from_mode("dflash"),
     )
     meta = target_bundle.meta
 
@@ -228,7 +233,7 @@ def test_target_capability_can_disable_verify_linear_before_parity(monkeypatch):
 
     target_bundle = runtime_loading.load_target_bundle(
         "model",
-        verify_config=VerifyConfig.from_mode("auto"),
+        verify_config=VerifyConfig.from_mode("dflash"),
     )
     meta = target_bundle.meta
 
@@ -248,6 +253,11 @@ def test_runtime_config_from_defaults_ignores_runtime_env(monkeypatch):
     cfg = runtime_config_from_defaults()
 
     assert cfg.prefix_cache_l2_dir == os.path.expanduser("~/.cache/dflash/prefix_l2")
+
+
+def test_runtime_config_rejects_old_auto_verify_mode():
+    with pytest.raises(ValueError, match="verify_mode must be dflash"):
+        runtime_config_from_defaults(verify_mode="auto")
 
 
 def test_offline_runtime_config_uses_default_runtime_without_cache(monkeypatch):
@@ -288,6 +298,14 @@ def test_offline_runtime_arguments_project_from_shared_runtime_schema():
     }
 
 
+def test_offline_runtime_arguments_reject_old_auto_verify_mode():
+    parser = argparse.ArgumentParser()
+    add_offline_runtime_arguments(parser, BENCHMARK_RUNTIME_FIELDS)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--verify-mode", "auto"])
+
+
 def test_offline_runtime_argument_defaults_follow_single_runtime_default(monkeypatch):
     monkeypatch.setattr(
         runtime_config,
@@ -319,14 +337,10 @@ def test_runtime_loader_delegates_hooks_to_target_ops_without_family_gate(monkey
         def capabilities_for(self, model):
             return SimpleNamespace(
                 supports_verify_linear=False,
-                supports_full_attention_split=True,
             )
 
         def install_speculative_hooks(self, model):
             calls.append(("install", {}))
-
-        def configure_full_attention_split(self, model, **kwargs):
-            calls.append(("configure", kwargs))
 
     monkeypatch.setattr(
         runtime_loading,
@@ -337,150 +351,13 @@ def test_runtime_loader_delegates_hooks_to_target_ops_without_family_gate(monkey
 
     target_bundle = runtime_loading.load_target_bundle(
         "model",
-        split_full_attention_sdpa=True,
-        split_full_attention_chunk_size=4,
         quantize_kv_cache=False,
-        verify_config=VerifyConfig.from_mode("auto"),
+        verify_config=VerifyConfig.from_mode("dflash"),
     )
     meta = target_bundle.meta
 
     assert meta["target_family"] == "gemma4_swa"
-    assert calls == [
-        ("install", {}),
-        ("configure", {"enabled": True, "chunk_size": 4}),
-    ]
-
-
-def test_runtime_loader_auto_split_uses_runtime_default(monkeypatch):
-    calls: list[tuple[str, dict]] = []
-
-    class _Ops:
-        def family(self, model):
-            return "hybrid_gdn"
-
-        def capabilities_for(self, model):
-            return SimpleNamespace(
-                supports_verify_linear=False,
-                supports_full_attention_split=True,
-            )
-
-        def install_speculative_hooks(self, model):
-            calls.append(("install", {}))
-
-        def configure_full_attention_split(self, model, **kwargs):
-            calls.append(("configure", kwargs))
-
-    monkeypatch.setattr(
-        runtime_loading,
-        "load",
-        lambda *args, **kwargs: (object(), object(), _large_dense_config()),
-    )
-    monkeypatch.setattr(runtime_loading, "resolve_target_ops", lambda model: _Ops())
-
-    target_bundle = runtime_loading.load_target_bundle(
-        "model",
-        split_full_attention_sdpa=None,
-        split_full_attention_sdpa_default=True,
-        split_full_attention_chunk_size=4,
-        quantize_kv_cache=False,
-        verify_config=VerifyConfig.from_mode("auto"),
-    )
-
-    assert target_bundle.meta["split_full_attention_sdpa_requested"] is None
-    assert target_bundle.meta["split_full_attention_sdpa_default"] is True
-    assert target_bundle.meta["split_full_attention_sdpa_resolved"] is True
-    assert target_bundle.meta["split_full_attention_sdpa"] is True
-    assert calls == [
-        ("install", {}),
-        ("configure", {"enabled": True, "chunk_size": 4}),
-    ]
-
-
-def test_runtime_loader_explicit_split_false_overrides_target_default(monkeypatch):
-    calls: list[tuple[str, dict]] = []
-
-    class _Ops:
-        def family(self, model):
-            return "hybrid_gdn"
-
-        def capabilities_for(self, model):
-            return SimpleNamespace(
-                supports_verify_linear=False,
-                supports_full_attention_split=True,
-            )
-
-        def install_speculative_hooks(self, model):
-            calls.append(("install", {}))
-
-        def configure_full_attention_split(self, model, **kwargs):
-            calls.append(("configure", kwargs))
-
-    monkeypatch.setattr(
-        runtime_loading,
-        "load",
-        lambda *args, **kwargs: (object(), object(), _large_dense_config()),
-    )
-    monkeypatch.setattr(runtime_loading, "resolve_target_ops", lambda model: _Ops())
-
-    target_bundle = runtime_loading.load_target_bundle(
-        "model",
-        split_full_attention_sdpa=False,
-        split_full_attention_sdpa_default=True,
-        split_full_attention_chunk_size=4,
-        quantize_kv_cache=False,
-        verify_config=VerifyConfig.from_mode("auto"),
-    )
-
-    assert target_bundle.meta["split_full_attention_sdpa_requested"] is False
-    assert target_bundle.meta["split_full_attention_sdpa_default"] is True
-    assert target_bundle.meta["split_full_attention_sdpa_resolved"] is False
-    assert target_bundle.meta["split_full_attention_sdpa"] is False
-    assert calls == [
-        ("install", {}),
-        ("configure", {"enabled": False, "chunk_size": 4}),
-    ]
-
-
-def test_runtime_loader_records_unsupported_split_sdpa_as_not_applied(monkeypatch):
-    calls: list[tuple[str, dict]] = []
-
-    class _Ops:
-        def family(self, model):
-            return "gemma4_swa"
-
-        def capabilities_for(self, model):
-            return SimpleNamespace(
-                supports_verify_linear=False,
-                supports_full_attention_split=False,
-            )
-
-        def install_speculative_hooks(self, model):
-            calls.append(("install", {}))
-
-        def configure_full_attention_split(self, model, **kwargs):
-            calls.append(("configure", kwargs))
-
-    monkeypatch.setattr(
-        runtime_loading,
-        "load",
-        lambda *args, **kwargs: (object(), object(), _large_dense_config()),
-    )
-    monkeypatch.setattr(runtime_loading, "resolve_target_ops", lambda model: _Ops())
-
-    target_bundle = runtime_loading.load_target_bundle(
-        "model",
-        split_full_attention_sdpa=True,
-        split_full_attention_chunk_size=4,
-        quantize_kv_cache=False,
-        verify_config=VerifyConfig.from_mode("auto"),
-    )
-
-    assert target_bundle.meta["split_full_attention_sdpa_requested"] is True
-    assert target_bundle.meta["split_full_attention_sdpa"] is False
-    assert calls == [
-        ("install", {}),
-        ("configure", {"enabled": False, "chunk_size": 4}),
-    ]
+    assert calls == [("install", {})]
 
 
 def test_runtime_verify_len_cap_limits_verify_token_count():

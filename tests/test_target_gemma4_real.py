@@ -199,12 +199,12 @@ def test_real_gemma4_dflash_matches_mlx_lm_greedy_tokens():
     draft_path = _local_snapshot(_draft_ref())
     runtime_context = build_offline_runtime_context(
         target_fa_window=0,
-        verify_mode="auto",
+        verify_mode="dflash",
     )
     bundle = load_runtime_bundle(
         model_ref=target_path,
         draft_ref=draft_path,
-        verify_config=VerifyConfig.from_mode("auto"),
+        verify_config=VerifyConfig.from_mode("dflash"),
     )
     target_model = bundle.target_model
     tokenizer = bundle.tokenizer

@@ -614,7 +614,7 @@ def main(argv: list[str] | None = None) -> None:
         draft_sink_size=int(args.draft_sink_size),
         draft_window_size=int(args.draft_window_size),
         verify_len_cap=int(args.verify_len_cap),
-        verify_mode="auto",
+        verify_mode="dflash",
     )
     runtime_context = build_runtime_context(
         runtime_config,

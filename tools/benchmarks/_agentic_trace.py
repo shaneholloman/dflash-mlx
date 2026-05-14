@@ -1502,7 +1502,7 @@ def replay_main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--max-snapshot-tokens", type=int, default=None)
     p.add_argument(
         "--verify-mode",
-        choices=("auto", "adaptive", "ddtree", "off"),
+        choices=("dflash", "adaptive", "ddtree", "off"),
         default=None,
     )
     p.add_argument("--clear-cache-boundaries", action=argparse.BooleanOptionalAction, default=None)
@@ -1908,7 +1908,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     p.add_argument(
         "--verify-mode",
-        choices=("auto", "adaptive", "ddtree", "off"),
+        choices=("dflash", "adaptive", "ddtree", "off"),
         default=None,
         help="dflash only: pass --verify-mode to dflash serve.",
     )

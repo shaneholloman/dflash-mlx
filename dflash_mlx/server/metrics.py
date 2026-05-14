@@ -394,21 +394,6 @@ def configure_live_metrics(
                 "target_fa_window": (
                     None if int(target_fa_window or 0) <= 0 else int(target_fa_window)
                 ),
-                "split_sdpa_applied": _bool_or_none(
-                    target_meta.get("split_full_attention_sdpa")
-                ),
-                "split_sdpa": _bool_or_none(
-                    target_meta.get("split_full_attention_sdpa")
-                ),
-                "split_sdpa_requested": _bool_or_none(
-                    target_meta.get("split_full_attention_sdpa_requested")
-                ),
-                "split_sdpa_default": _bool_or_none(
-                    target_meta.get("split_full_attention_sdpa_default")
-                ),
-                "split_sdpa_resolved": _bool_or_none(
-                    target_meta.get("split_full_attention_sdpa_resolved")
-                ),
                 "diagnostics": getattr(cli_args, "diagnostics", None),
             }
         )
@@ -667,11 +652,6 @@ def _reset_live_metrics_state() -> None:
                 "prefill_step_size": None,
                 "prefix_cache_enabled": None,
                 "target_fa_window": None,
-                "split_sdpa_applied": None,
-                "split_sdpa": None,
-                "split_sdpa_requested": None,
-                "split_sdpa_default": None,
-                "split_sdpa_resolved": None,
                 "diagnostics": None,
             }
         )

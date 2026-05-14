@@ -10,6 +10,12 @@ from typing import Any, Optional
 import mlx.core as mx
 from mlx_lm.models import cache as cache_mod
 
+from dflash_mlx.engine.gqa_sdpa import (
+    async_per_head_gqa_sdpa,
+    grouped_gqa_sdpa,
+    per_head_gqa_sdpa,
+    repeat_gqa_mask,
+)
 from dflash_mlx.engine.target_ops import TargetCapabilities
 
 
@@ -64,6 +70,183 @@ def _trim_recent_cache(cache_entry: Any, n: int) -> int:
         cache_entry.offset = offset - n
         return n
     return 0
+
+
+def _gemma4_split_candidate(attn: Any, x: mx.array, mask: Optional[Any], cache: Any) -> bool:
+    if cache is None or getattr(attn, "is_sliding", False):
+        return False
+    if not getattr(attn, "has_kv", True):
+        return False
+    if not (
+        mask is None
+        or (isinstance(mask, str) and mask == "causal")
+        or isinstance(mask, mx.array)
+    ):
+        return False
+
+    q_len = int(x.shape[1])
+    head_dim = int(getattr(attn, "head_dim", 0) or 0)
+    query_heads = int(getattr(attn, "n_heads", 0) or 0)
+    kv_heads = int(getattr(attn, "n_kv_heads", 0) or 0)
+    if (
+        head_dim != 512
+        or q_len <= 0
+        or q_len > 16
+        or kv_heads <= 0
+        or query_heads % kv_heads != 0
+    ):
+        return False
+
+    kv_len = int(getattr(cache, "offset", 0) or 0) + q_len
+    if kv_heads <= 2:
+        return kv_len >= 8192
+    if q_len <= 4:
+        return kv_len >= 16384
+    return q_len == 16 and kv_len >= 32768
+
+
+def _gemma4_full_gqa_sdpa(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    *,
+    scale: float,
+    mask: Optional[Any],
+    cache: Optional[Any],
+) -> mx.array:
+    _, query_heads, q_len, head_dim = queries.shape
+    _, kv_heads, kv_len, _ = keys.shape
+    if kv_heads <= 0 or query_heads == kv_heads or query_heads % kv_heads != 0:
+        return grouped_gqa_sdpa(
+            queries,
+            keys,
+            values,
+            cache=cache,
+            scale=scale,
+            mask=mask,
+        )
+
+    gqa = query_heads // kv_heads
+    if (
+        int(head_dim) != 512
+        or int(q_len) <= 0
+        or int(q_len) > 16
+        or queries.dtype not in (mx.bfloat16, mx.float16)
+    ):
+        return grouped_gqa_sdpa(
+            queries,
+            keys,
+            values,
+            cache=cache,
+            scale=scale,
+            mask=mask,
+        )
+    if int(kv_heads) <= 2 and int(kv_len) >= 8192:
+        grouped_mask = repeat_gqa_mask(mask, q_len=q_len, kv_len=kv_len, gqa=gqa)
+        return per_head_gqa_sdpa(
+            queries,
+            keys,
+            values,
+            scale=scale,
+            mask=grouped_mask,
+            gqa=gqa,
+        )
+    if int(kv_heads) >= 4 and int(q_len) <= 4 and int(kv_len) >= 16384:
+        grouped_mask = repeat_gqa_mask(mask, q_len=q_len, kv_len=kv_len, gqa=gqa)
+        return per_head_gqa_sdpa(
+            queries,
+            keys,
+            values,
+            scale=scale,
+            mask=grouped_mask,
+            gqa=gqa,
+        )
+    if int(kv_heads) >= 4 and int(q_len) == 16 and int(kv_len) >= 32768:
+        grouped_mask = repeat_gqa_mask(mask, q_len=q_len, kv_len=kv_len, gqa=gqa)
+        return async_per_head_gqa_sdpa(
+            queries,
+            keys,
+            values,
+            scale=scale,
+            mask=grouped_mask,
+            gqa=gqa,
+        )
+    return grouped_gqa_sdpa(
+        queries,
+        keys,
+        values,
+        cache=cache,
+        scale=scale,
+        mask=mask,
+    )
+
+
+def _install_full_attention_gqa_hook(attn: Any) -> None:
+    cls = type(attn)
+    if getattr(cls, "_dflash_full_attention_gqa_installed", False):
+        return
+
+    original_call = cls.__call__
+
+    def attention_call(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+        shared_kv: Optional[tuple] = None,
+        offset: Optional[Any] = None,
+    ) -> Any:
+        if (
+            shared_kv is not None
+            or not _gemma4_split_candidate(self, x, mask, cache)
+        ):
+            return original_call(
+                self,
+                x,
+                mask=mask,
+                cache=cache,
+                shared_kv=shared_kv,
+                offset=offset,
+            )
+
+        batch_size, seq_len, _ = x.shape
+        queries = self.q_proj(x).reshape(batch_size, seq_len, self.n_heads, self.head_dim)
+        queries = self.q_norm(queries)
+
+        keys = self.k_proj(x).reshape(batch_size, seq_len, self.n_kv_heads, self.head_dim)
+        values = keys
+        if not getattr(self, "use_k_eq_v", False):
+            values = self.v_proj(x).reshape(
+                batch_size, seq_len, self.n_kv_heads, self.head_dim
+            )
+
+        offset = mx.array(cache.offset)
+
+        keys = self.k_norm(keys)
+        keys = keys.transpose(0, 2, 1, 3)
+        keys = self.rope(keys, offset=offset)
+
+        values = self.v_norm(values)
+        values = values.transpose(0, 2, 1, 3)
+
+        queries = queries.transpose(0, 2, 1, 3)
+        queries = self.rope(queries, offset=offset)
+
+        keys, values = cache.update_and_fetch(keys, values)
+        output = _gemma4_full_gqa_sdpa(
+            queries,
+            keys,
+            values,
+            cache=cache,
+            scale=self.scale,
+            mask=mask,
+        )
+        output = output.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
+
+        return self.o_proj(output), (keys, values), offset
+
+    cls.__call__ = attention_call
+    cls._dflash_full_attention_gqa_installed = True
 
 
 class Gemma4TargetOps:
@@ -190,17 +373,15 @@ class Gemma4TargetOps:
             return target_model.make_cache()
         raise AttributeError("Gemma4 target must expose make_cache()")
 
-    def configure_full_attention_split(
-        self,
-        target_model: Any,
-        *,
-        enabled: bool,
-        chunk_size: int = 8,
-    ) -> None:
-        return None
-
     def install_speculative_hooks(self, target_model: Any) -> None:
-        return None
+        text_model = self.text_model(target_model)
+        if getattr(text_model, "_dflash_speculative_hooks_installed", False):
+            return
+        for layer in text_model.layers:
+            attn = getattr(layer, "self_attn", None)
+            if attn is not None:
+                _install_full_attention_gqa_hook(attn)
+        text_model._dflash_speculative_hooks_installed = True
 
     def forward_with_hidden_capture(
         self,

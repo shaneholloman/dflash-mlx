@@ -35,8 +35,9 @@ dflash serve \
   --prefix-cache-max-bytes 17179869184
 ```
 
-Split-SDPA defaults are target-policy auto in both `serve` and `benchmark`; use
-`--split-sdpa` or `--no-split-sdpa` only for an explicit A/B.
+Long-KV attention routing is target-owned. Qwen verify GQA and Gemma4
+full-attention GQA routes are selected internally by shape and cache state; there
+is no public SDPA override flag.
 
 `POST /v1/responses` is supported as a minimal non-streaming adapter for text
 input and function-call tools. Streaming, reasoning/text/truncation controls,

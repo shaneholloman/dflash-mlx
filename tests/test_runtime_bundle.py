@@ -63,8 +63,6 @@ def test_runtime_registry_preserves_draft_resolution():
         == "gemma4_swa"
     )
     assert resolve_model_support_spec("Qwen/Qwen3.5-9B").defaults.draft_quant == "w4"
-    assert resolve_model_support_spec("Qwen/Qwen3.6-35B-A3B").defaults.split_sdpa is True
-    assert resolve_model_support_spec("Qwen/Qwen3.6-27B").defaults.split_sdpa is False
     assert (
         resolve_model_support_spec("mlx-community/gemma-4-31b-it-4bit").defaults.draft_quant
         == "w4"
@@ -199,10 +197,8 @@ def test_runtime_bundle_loads_and_binds_draft(monkeypatch):
     assert bundle.support_spec is not None
     assert bundle.support_spec.draft_ref == "z-lab/Qwen3.5-9B-DFlash"
     assert bundle.support_spec.target_family == "hybrid_gdn"
-    assert bundle.support_spec.defaults.split_sdpa is False
     assert draft_model.bound is True
     assert target_calls[0][1]["quantize_kv_cache"] is True
-    assert target_calls[0][1]["split_full_attention_sdpa_default"] is False
     assert calls[0] == (
         "draft",
         "z-lab/Qwen3.5-9B-DFlash",
@@ -251,7 +247,7 @@ def test_runtime_bundle_applies_model_default_draft_quant(monkeypatch):
     assert bundle.draft_meta["draft_quant_source"] == "model_default"
 
 
-def test_runtime_bundle_applies_model_default_split_sdpa(monkeypatch):
+def test_runtime_bundle_does_not_forward_sdpa_override(monkeypatch):
     target_model = object()
     tokenizer = object()
     draft_model = SimpleNamespace(bound=False)
@@ -283,9 +279,8 @@ def test_runtime_bundle_applies_model_default_split_sdpa(monkeypatch):
     )
 
     assert bundle.support_spec is not None
-    assert bundle.support_spec.defaults.split_sdpa is True
-    assert target_calls[0][1]["split_full_attention_sdpa"] is None
-    assert target_calls[0][1]["split_full_attention_sdpa_default"] is True
+    assert "split_full_attention_sdpa" not in target_calls[0][1]
+    assert "split_full_attention_sdpa_default" not in target_calls[0][1]
 
 
 def test_runtime_bundle_draft_quant_none_disables_model_default(monkeypatch):

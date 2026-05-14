@@ -163,7 +163,7 @@ RUNTIME_CONFIG_FIELDS: tuple[RuntimeConfigFieldSpec, ...] = (
         field="verify_mode",
         flags=("--verify-mode",),
         env="DFLASH_VERIFY_MODE",
-        choices=("auto", "adaptive", "ddtree", "off"),
+        choices=("dflash", "adaptive", "ddtree", "off"),
         help="Verify path mode. Default adaptive shortens low-acceptance blocks; use off only for debug/parity.",
         surfaces=(SURFACE_SERVE_DOCTOR, SURFACE_GENERATE, SURFACE_BENCHMARK),
     ),
@@ -526,9 +526,9 @@ def validate_runtime_config(cfg: EffectiveRuntimeConfig) -> EffectiveRuntimeConf
         raise ValueError("--target-fa-window / target_fa_window must be >= 0")
     if cfg.dflash_max_ctx < 0:
         raise ValueError("--dflash-max-ctx / dflash_max_ctx must be >= 0")
-    if cfg.verify_mode not in ("auto", "adaptive", "ddtree", "off"):
+    if cfg.verify_mode not in ("dflash", "adaptive", "ddtree", "off"):
         raise ValueError(
-            "--verify-mode / verify_mode must be auto, adaptive, ddtree, or off"
+            "--verify-mode / verify_mode must be dflash, adaptive, ddtree, or off"
         )
     if not cfg.prefix_cache and cfg.prefix_cache_l2:
         return replace(cfg, prefix_cache_l2=False)

@@ -46,7 +46,6 @@ def load_runtime_bundle(
     draft_ref: str | None,
     draft_quant: str | None = None,
     verify_config: VerifyConfig | None = None,
-    split_full_attention_sdpa: bool | None = None,
     quantize_kv_cache: bool = False,
     lazy: bool = True,
 ) -> RuntimeBundle:
@@ -61,10 +60,6 @@ def load_runtime_bundle(
     target_bundle = load_target_bundle(
         model_ref,
         lazy=lazy,
-        split_full_attention_sdpa=split_full_attention_sdpa,
-        split_full_attention_sdpa_default=(
-            support_spec.defaults.split_sdpa if support_spec is not None else None
-        ),
         quantize_kv_cache=quantize_kv_cache,
         verify_config=verify_config,
     )

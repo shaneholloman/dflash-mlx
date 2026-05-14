@@ -85,7 +85,6 @@ CONTROLLED_FLAG_NAMES = (
     "use_chat_template",
     "draft_quant",
     "no_eos",
-    "split_sdpa",
     "prefill_step_size",
     "target_fa_window",
     "draft_sink_size",
@@ -350,29 +349,6 @@ def _optional_bool(value: Any) -> bool | None:
     return None if value is None else bool(value)
 
 
-def _applied_split_sdpa(target_meta: dict[str, Any]) -> bool:
-    if "split_full_attention_sdpa" not in target_meta:
-        raise RuntimeError("target metadata missing applied split_full_attention_sdpa")
-    return bool(target_meta["split_full_attention_sdpa"])
-
-
-def _split_sdpa_config_fields(target_meta: dict[str, Any]) -> dict[str, bool | None]:
-    applied = _applied_split_sdpa(target_meta)
-    return {
-        "split_sdpa": applied,
-        "split_sdpa_applied": applied,
-        "split_sdpa_requested": _optional_bool(
-            target_meta.get("split_full_attention_sdpa_requested")
-        ),
-        "split_sdpa_default": _optional_bool(
-            target_meta.get("split_full_attention_sdpa_default")
-        ),
-        "split_sdpa_resolved": _optional_bool(
-            target_meta.get("split_full_attention_sdpa_resolved")
-        ),
-    }
-
-
 def _build_config(
     *,
     prompt: str,
@@ -388,10 +364,6 @@ def _build_config(
     draft_load_dtype: str | None,
     draft_load_dtype_source: str | None,
     no_eos: bool,
-    split_sdpa: bool,
-    split_sdpa_requested: bool | None,
-    split_sdpa_default: bool | None,
-    split_sdpa_resolved: bool | None,
     prefill_step_size: int,
     target_fa_window: int,
     draft_sink_size: int,
@@ -411,11 +383,6 @@ def _build_config(
         "draft_load_dtype": draft_load_dtype,
         "draft_load_dtype_source": draft_load_dtype_source,
         "no_eos": bool(no_eos),
-        "split_sdpa": bool(split_sdpa),
-        "split_sdpa_applied": bool(split_sdpa),
-        "split_sdpa_requested": split_sdpa_requested,
-        "split_sdpa_default": split_sdpa_default,
-        "split_sdpa_resolved": split_sdpa_resolved,
         "prefill_step_size": int(prefill_step_size),
         "target_fa_window": int(target_fa_window),
         "draft_sink_size": int(draft_sink_size),
@@ -469,10 +436,6 @@ def _build_single_case_report(
     draft_load_dtype: str | None,
     draft_load_dtype_source: str | None,
     no_eos: bool,
-    split_sdpa: bool,
-    split_sdpa_requested: bool | None,
-    split_sdpa_default: bool | None,
-    split_sdpa_resolved: bool | None,
     prefill_step_size: int,
     target_fa_window: int,
     draft_sink_size: int,
@@ -517,10 +480,6 @@ def _build_single_case_report(
             draft_load_dtype=draft_load_dtype,
             draft_load_dtype_source=draft_load_dtype_source,
             no_eos=no_eos,
-            split_sdpa=split_sdpa,
-            split_sdpa_requested=split_sdpa_requested,
-            split_sdpa_default=split_sdpa_default,
-            split_sdpa_resolved=split_sdpa_resolved,
             prefill_step_size=prefill_step_size,
             target_fa_window=target_fa_window,
             draft_sink_size=draft_sink_size,
@@ -839,7 +798,6 @@ def _run_once_sequential(
     draft_model_ref: str | None,
     draft_quant: str | None,
     no_eos: bool,
-    split_sdpa: bool | None,
     prefill_step_size: int | None = None,
     target_fa_window: int | None = None,
     draft_sink_size: int | None = None,
@@ -893,7 +851,6 @@ def _run_once_sequential(
             draft_ref=draft_model_ref,
             draft_quant=draft_quant,
             verify_config=runtime_context.verify,
-            split_full_attention_sdpa=split_sdpa,
         )
         target_model = bundle.target_model
         tokenizer = bundle.tokenizer
@@ -987,7 +944,6 @@ def benchmark_once(
     draft_model_ref: str | None,
     draft_quant: str | None = None,
     no_eos: bool = False,
-    split_sdpa: bool | None = None,
     prefill_step_size: int | None = None,
     target_fa_window: int | None = None,
     draft_sink_size: int | None = None,
@@ -1015,13 +971,11 @@ def benchmark_once(
         draft_model_ref=draft_model_ref,
         draft_quant=draft_quant,
         no_eos=no_eos,
-        split_sdpa=split_sdpa,
         **runtime_values,
     )
     target_meta = result.pop("target_meta")
     draft_meta = result.pop("draft_meta")
     result.pop("pristine_target_meta", None)
-    split_sdpa_fields = _split_sdpa_config_fields(target_meta)
     result["run_index"] = 1
     result["thermal_pressure"] = thermal_pressure
     return _build_single_case_report(
@@ -1038,10 +992,6 @@ def benchmark_once(
         draft_load_dtype=draft_meta.get("draft_load_dtype"),
         draft_load_dtype_source=draft_meta.get("draft_load_dtype_source"),
         no_eos=no_eos,
-        split_sdpa=bool(split_sdpa_fields["split_sdpa_applied"]),
-        split_sdpa_requested=split_sdpa_fields["split_sdpa_requested"],
-        split_sdpa_default=split_sdpa_fields["split_sdpa_default"],
-        split_sdpa_resolved=split_sdpa_fields["split_sdpa_resolved"],
         **runtime_values,
     )
 
@@ -1056,7 +1006,6 @@ def benchmark_repeated(
     draft_model_ref: str | None = None,
     draft_quant: str | None = None,
     no_eos: bool = False,
-    split_sdpa: bool | None = None,
     prefill_step_size: int | None = None,
     target_fa_window: int | None = None,
     draft_sink_size: int | None = None,
@@ -1089,7 +1038,6 @@ def benchmark_repeated(
             draft_model_ref=draft_model_ref,
             draft_quant=draft_quant,
             no_eos=no_eos,
-            split_sdpa=split_sdpa,
             **runtime_values,
         )
         if target_meta is None:
@@ -1107,16 +1055,6 @@ def benchmark_repeated(
         if cooldown > 0 and run_index < repeat:
             time.sleep(cooldown)
 
-    split_sdpa_fields = (
-        _split_sdpa_config_fields(target_meta)
-        if target_meta is not None
-        else {
-            "split_sdpa_applied": False,
-            "split_sdpa_requested": None,
-            "split_sdpa_default": None,
-            "split_sdpa_resolved": None,
-        }
-    )
     return _build_single_case_report(
         prompt=prompt,
         max_new_tokens=max_new_tokens,
@@ -1137,10 +1075,6 @@ def benchmark_repeated(
             else None
         ),
         no_eos=no_eos,
-        split_sdpa=bool(split_sdpa_fields["split_sdpa_applied"]),
-        split_sdpa_requested=split_sdpa_fields["split_sdpa_requested"],
-        split_sdpa_default=split_sdpa_fields["split_sdpa_default"],
-        split_sdpa_resolved=split_sdpa_fields["split_sdpa_resolved"],
         **runtime_values,
     )
 
@@ -1157,7 +1091,6 @@ def benchmark_suite(
         "draft_model_ref": args.draft,
         "draft_quant": args.draft_quant,
         "no_eos": args.no_eos,
-        "split_sdpa": args.split_sdpa,
         "prefill_step_size": args.prefill_step_size,
         "target_fa_window": args.target_fa_window,
         "draft_sink_size": args.draft_sink_size,
@@ -1326,12 +1259,6 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         action="store_true",
         help="Suppress EOS so generation reaches --max-tokens. Default: EOS enabled.",
     )
-    parser.add_argument(
-        "--split-sdpa",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Enable split full-attention SDPA on target. Default: auto by target policy.",
-    )
     add_offline_runtime_arguments(parser, BENCHMARK_RUNTIME_FIELDS)
     parser.add_argument(
         "--out",
@@ -1372,9 +1299,6 @@ def _controlled_flag_values(
         "use_chat_template": not bool(args.no_chat_template),
         "draft_quant": config.get("draft_quant", args.draft_quant),
         "no_eos": bool(args.no_eos),
-        "split_sdpa": _optional_bool(config["split_sdpa"])
-        if "split_sdpa" in config
-        else _optional_bool(args.split_sdpa),
         "prefill_step_size": int(args.prefill_step_size),
         "target_fa_window": int(args.target_fa_window),
         "draft_sink_size": int(args.draft_sink_size),
@@ -1410,8 +1334,6 @@ def _explicit_flag_values(
         "--no-chat-template": "use_chat_template",
         "--draft-quant": "draft_quant",
         "--no-eos": "no_eos",
-        "--split-sdpa": "split_sdpa",
-        "--no-split-sdpa": "split_sdpa",
         "--prefill-step-size": "prefill_step_size",
         "--target-fa-window": "target_fa_window",
         "--draft-sink-size": "draft_sink_size",
@@ -1422,12 +1344,6 @@ def _explicit_flag_values(
     }
     seen = {option_to_name[token] for token in argv if token in option_to_name}
     values = _controlled_flag_values(args, output_path, config)
-    if "split_sdpa" in seen:
-        values["split_sdpa"] = _optional_bool(
-            config.get("split_sdpa_requested")
-            if config is not None and "split_sdpa_requested" in config
-            else args.split_sdpa
-        )
     if "draft_quant" in seen:
         values["draft_quant"] = args.draft_quant
     return {name: values[name] for name in CONTROLLED_FLAG_NAMES if name in seen}

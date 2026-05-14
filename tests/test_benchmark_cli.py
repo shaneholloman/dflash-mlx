@@ -65,8 +65,6 @@ def test_benchmark_parser_exposes_public_flags(capsys):
         "--no-chat-template",
         "--draft-quant",
         "--no-eos",
-        "--split-sdpa",
-        "--no-split-sdpa",
         "--target-fa-window",
         "--draft-sink-size",
         "--draft-window-size",
@@ -152,7 +150,6 @@ def test_benchmark_main_applies_requested_metal_limits(monkeypatch, tmp_path):
                 "suite": args.suite,
                 "model": args.model,
                 "draft": "auto-draft",
-                "split_sdpa": False,
             },
             "prompts": [],
             "runs": [],
@@ -213,7 +210,6 @@ def test_benchmark_invocation_records_explicit_and_effective_values():
             "--out",
             "/tmp/result.json",
             "--no-chat-template",
-            "--no-split-sdpa",
             "--draft-sink-size",
             "32",
             "--draft-window-size",
@@ -262,7 +258,6 @@ def test_benchmark_invocation_records_explicit_and_effective_values():
             "--out",
             "/tmp/result.json",
             "--no-chat-template",
-            "--no-split-sdpa",
             "--draft-sink-size",
             "32",
             "--draft-window-size",
@@ -307,7 +302,6 @@ def test_benchmark_invocation_records_explicit_and_effective_values():
     assert invocation["effective"]["cache_limit"] == 4 * 1024**3
     assert invocation["effective"]["use_chat_template"] is False
     assert invocation["effective"]["draft_quant"] == "w4"
-    assert invocation["effective"]["split_sdpa"] is False
 
 def test_benchmark_default_output_dir_is_artifact_root(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
@@ -711,7 +705,6 @@ def test_benchmark_runs_json_rows_keep_provenance():
                     "prompt_id": "p0",
                     "prompt_suite": "smoke",
                     "prompt_tokens": 8,
-                    "split_sdpa": False,
                 },
                 "runs": [
                     {
@@ -738,54 +731,6 @@ def test_benchmark_runs_json_rows_keep_provenance():
     assert row["prompt_tokenization_mode"] == "chat_template"
     assert row["max_tokens"] == 64
     assert row["verify_mode"] == "ddtree"
-    assert result["config"]["split_sdpa"] is False
-    assert result["config"]["split_sdpa_applied"] is False
-    assert row["split_sdpa"] is False
-    assert row["split_sdpa_applied"] is False
-
-
-def test_benchmark_manifest_effective_config_uses_applied_split_sdpa(tmp_path):
-    parser = benchmark.build_parser()
-    args = benchmark._finalize_benchmark_args(
-        parser.parse_args(["--suite", "smoke", "--model", "m"]),
-        ["--suite", "smoke", "--model", "m"],
-    )
-
-    effective = benchmark._controlled_flag_values(
-        args,
-        tmp_path,
-        {"split_sdpa": False},
-    )
-
-    assert args.split_sdpa is None
-    assert effective["split_sdpa"] is False
-
-
-def test_benchmark_invocation_separates_requested_and_applied_split_sdpa(tmp_path):
-    parser = benchmark.build_parser()
-    argv = ["dflash benchmark", "--model", "m", "--split-sdpa"]
-    args = benchmark._finalize_benchmark_args(
-        parser.parse_args(argv[1:]),
-        argv[1:],
-    )
-
-    invocation = benchmark._build_invocation(
-        args,
-        tmp_path,
-        argv,
-        {"split_sdpa": False, "split_sdpa_requested": True},
-    )
-
-    assert invocation["explicit_flags"]["split_sdpa"] is True
-    assert invocation["effective"]["split_sdpa"] is False
-
-
-def test_benchmark_split_sdpa_cli_is_tri_state():
-    parser = benchmark.build_parser()
-
-    assert parser.parse_args(["--model", "m"]).split_sdpa is None
-    assert parser.parse_args(["--model", "m", "--split-sdpa"]).split_sdpa is True
-    assert parser.parse_args(["--model", "m", "--no-split-sdpa"]).split_sdpa is False
 
 
 def test_benchmark_runtime_context_uses_product_verify_config():
@@ -1150,17 +1095,12 @@ def _patch_benchmark_target(monkeypatch, *, resolved_model_ref: str = "target"):
     )
     return target, tokenizer, {
         "resolved_model_ref": resolved_model_ref,
-        "split_full_attention_sdpa": False,
-        "split_full_attention_sdpa_requested": None,
-        "split_full_attention_sdpa_default": False,
-        "split_full_attention_sdpa_resolved": False,
     }
 
 
 def _run_one_fake_benchmark(
     *,
     draft_model_ref: str | None = None,
-    split_sdpa: bool | None = None,
 ) -> dict:
     return benchmark._run_once_sequential(
         prompt="prompt",
@@ -1171,7 +1111,6 @@ def _run_one_fake_benchmark(
         draft_model_ref=draft_model_ref,
         draft_quant=None,
         no_eos=True,
-        split_sdpa=split_sdpa,
     )
 
 
@@ -1217,51 +1156,9 @@ def test_benchmark_dflash_path_binds_draft_before_generation(monkeypatch):
     assert bundle_calls[0]["draft_ref"] is None
     assert bundle_calls[0]["draft_quant"] is None
     assert bundle_calls[0]["verify_config"] is not None
-    assert bundle_calls[0]["split_full_attention_sdpa"] is None
+    assert "split_full_attention_sdpa" not in bundle_calls[0]
     assert report["draft_meta"]["resolved_model_ref"] == "auto-draft"
     assert report["token_match"] is True
-
-
-def test_benchmark_records_applied_split_sdpa_state(monkeypatch):
-    target, tokenizer, target_meta = _patch_benchmark_target(monkeypatch)
-    target_meta["split_full_attention_sdpa"] = False
-    target_meta["split_full_attention_sdpa_requested"] = True
-
-    monkeypatch.setattr(
-        benchmark,
-        "load_runtime_bundle",
-        lambda **kwargs: SimpleNamespace(
-            target_model=target,
-            tokenizer=tokenizer,
-            target_meta=target_meta,
-            draft_model=_BindableBenchmarkDraft(),
-            draft_meta={"resolved_model_ref": "auto-draft"},
-            draft_backend=object(),
-            target_ops=object(),
-        ),
-    )
-    monkeypatch.setattr(
-        benchmark,
-        "_generate_dflash_stream_once",
-        lambda **kwargs: _fake_dflash_result(),
-    )
-
-    report = benchmark.benchmark_once(
-        prompt="prompt",
-        max_new_tokens=1,
-        block_tokens=16,
-        use_chat_template=False,
-        target_model_ref="target",
-        draft_model_ref=None,
-        draft_quant=None,
-        no_eos=True,
-        split_sdpa=True,
-        cooldown=0,
-    )
-
-    assert report["config"]["split_sdpa"] is False
-    assert report["config"]["split_sdpa_applied"] is False
-    assert report["config"]["split_sdpa_requested"] is True
 
 
 def test_benchmark_records_draft_load_dtype_in_config(monkeypatch):

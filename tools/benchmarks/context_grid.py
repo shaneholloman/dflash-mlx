@@ -216,7 +216,6 @@ def run_grid(args: argparse.Namespace, argv: Sequence[str]) -> dict[str, Any]:
             draft_ref=args.draft,
             draft_quant=args.draft_quant,
             verify_config=runtime_context.verify,
-            split_full_attention_sdpa=args.split_sdpa,
         )
         if prompt_tokens_by_context is None:
             prompt_tokens_by_context = {
@@ -701,7 +700,6 @@ def _effective_config(args: argparse.Namespace, contexts: list[int]) -> dict[str
         "draft_window_size": args.draft_window_size,
         "verify_len_cap": args.verify_len_cap,
         "verify_mode": args.verify_mode,
-        "split_sdpa": args.split_sdpa,
         "clear_cache_boundaries": args.clear_cache_boundaries,
         "clear_cache_between_cases": bool(args.clear_cache_between_cases),
         "no_eos": bool(args.no_eos),
@@ -729,10 +727,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--draft-sink-size", type=int, default=None)
     p.add_argument("--draft-window-size", type=int, default=None)
     p.add_argument("--verify-len-cap", type=int, default=None)
-    p.add_argument("--verify-mode", choices=("auto", "adaptive", "off"), default=None)
+    p.add_argument("--verify-mode", choices=("dflash", "adaptive", "off"), default=None)
     p.add_argument("--clear-cache-boundaries", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--clear-cache-between-cases", action="store_true")
-    p.add_argument("--split-sdpa", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--prompt-format", choices=("chat", "raw"), default="chat")
     p.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--memory-sample-interval", type=float, default=0.25)

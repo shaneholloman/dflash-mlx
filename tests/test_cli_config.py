@@ -149,10 +149,7 @@ def test_model_provider_adds_mlx_lm_server_boundary_defaults(monkeypatch):
             target_model=SimpleNamespace(parameters=lambda: []),
             tokenizer=SimpleNamespace(chat_template=None, default_chat_template=None),
             draft_model=SimpleNamespace(parameters=lambda: []),
-            target_meta={
-                "split_full_attention_sdpa": True,
-                "split_full_attention_sdpa_requested": None,
-            },
+            target_meta={},
             draft_meta={"draft_quant_source": "model_default"},
             draft_backend=draft_backend,
             target_ops=target_ops,
@@ -175,68 +172,9 @@ def test_model_provider_adds_mlx_lm_server_boundary_defaults(monkeypatch):
     provider.load("default_model")
     assert provider.target_ops is target_ops
     assert provider.draft_backend is draft_backend
-    assert load_calls[0]["split_full_attention_sdpa"] is None
-    assert provider.target_meta["split_full_attention_sdpa"] is True
+    assert "split_full_attention_sdpa" not in load_calls[0]
     assert provider.effective_draft_quant == "w4"
     assert provider.draft_meta["draft_quant_source"] == "model_default"
-
-
-def test_serve_split_sdpa_cli_is_tri_state(monkeypatch):
-    _clear_runtime_env(monkeypatch)
-    parser = build_parser()
-
-    args = parser.parse_args(["--model", "m"])
-    normalize_cli_args(args)
-    assert args.split_sdpa is None
-
-    args = parser.parse_args(["--model", "m", "--split-sdpa"])
-    normalize_cli_args(args)
-    assert args.split_sdpa is True
-
-    args = parser.parse_args(["--model", "m", "--no-split-sdpa"])
-    normalize_cli_args(args)
-    assert args.split_sdpa is False
-
-
-@pytest.mark.parametrize(
-    ("argv", "expected"),
-    [
-        (["--model", "m", "--split-sdpa"], True),
-        (["--model", "m", "--no-split-sdpa"], False),
-    ],
-)
-def test_model_provider_forwards_explicit_split_sdpa(monkeypatch, argv, expected):
-    _clear_runtime_env(monkeypatch)
-    load_calls: list[dict] = []
-
-    class FakeGroup:
-        def size(self):
-            return 1
-
-    monkeypatch.setattr(model_provider.mx.distributed, "init", lambda: FakeGroup())
-
-    def fake_load_runtime_bundle(**kwargs):
-        load_calls.append(kwargs)
-        return SimpleNamespace(
-            target_model=SimpleNamespace(parameters=lambda: []),
-            tokenizer=SimpleNamespace(chat_template=None, default_chat_template=None),
-            draft_model=SimpleNamespace(parameters=lambda: []),
-            target_meta={"split_full_attention_sdpa": bool(expected)},
-            draft_meta={"draft_quant_source": "none"},
-            draft_backend=object(),
-            target_ops=object(),
-            resolved_draft_ref="draft",
-            effective_draft_quant=None,
-        )
-
-    monkeypatch.setattr(model_provider, "load_runtime_bundle", fake_load_runtime_bundle)
-    args = build_parser().parse_args(argv)
-    normalize_cli_args(args)
-
-    provider = model_provider.DFlashModelProvider(args)
-    provider.load("default_model")
-
-    assert load_calls[0]["split_full_attention_sdpa"] is expected
 
 
 def test_model_provider_preserves_dflash_fields_if_parent_preloads(monkeypatch):
@@ -261,7 +199,7 @@ def test_model_provider_preserves_dflash_fields_if_parent_preloads(monkeypatch):
             target_model=SimpleNamespace(parameters=lambda: []),
             tokenizer=SimpleNamespace(chat_template=None, default_chat_template=None),
             draft_model=SimpleNamespace(parameters=lambda: []),
-            target_meta={"split_full_attention_sdpa": False},
+            target_meta={},
             draft_meta={"draft_quant_source": "none"},
             draft_backend=draft_backend,
             target_ops=target_ops,
@@ -277,7 +215,6 @@ def test_model_provider_preserves_dflash_fields_if_parent_preloads(monkeypatch):
     assert provider.model_key == ("m", None, "draft")
     assert provider.target_ops is target_ops
     assert provider.draft_backend is draft_backend
-    assert provider.target_meta["split_full_attention_sdpa"] is False
 
 
 def test_model_provider_materialization_failure_does_not_publish_loaded_state(monkeypatch):
@@ -300,7 +237,7 @@ def test_model_provider_materialization_failure_does_not_publish_loaded_state(mo
             target_model=target_model,
             tokenizer=SimpleNamespace(chat_template=None, default_chat_template=None),
             draft_model=draft_model,
-            target_meta={"split_full_attention_sdpa": True},
+            target_meta={},
             draft_meta={"draft_quant_source": "model_default"},
             draft_backend=draft_backend,
             target_ops=target_ops,
@@ -689,7 +626,7 @@ def test_startup_banner_prints_resolved_metal_limits(monkeypatch, capsys):
         model_key=("target", None, "draft"),
         effective_draft_quant="w4",
         draft_meta={"draft_quant_source": "model_default"},
-        target_meta={"split_full_attention_sdpa": True},
+        target_meta={},
         cli_args=SimpleNamespace(
             model="target",
             draft_model=None,
@@ -712,7 +649,6 @@ def test_startup_banner_prints_resolved_metal_limits(monkeypatch, capsys):
     assert "Draft quant:  w4 (model_default)" in err
     assert "Thinking:     enabled" in err
     assert "Fast path:    AR <= 256 tokens" in err
-    assert "Split SDPA:   auto -> on" in err
     assert "Wired limit: auto -> 64.0 GiB" in err
     assert "Cache limit: 8.0 GiB -> 8.0 GiB" in err
 

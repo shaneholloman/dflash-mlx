@@ -17,6 +17,12 @@ from mlx_lm.models.base import (
     scaled_dot_product_attention,
 )
 
+from dflash_mlx.engine.gqa_sdpa import (
+    async_per_head_gqa_sdpa,
+    grouped_gqa_sdpa,
+    per_head_gqa_sdpa,
+    repeat_gqa_mask,
+)
 from dflash_mlx.engine.target_ops import TargetCapabilities
 from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
 
@@ -118,72 +124,6 @@ def _attention_has_gated_q_proj(attn: Any) -> bool:
     expected_out_dim = 2 * num_attention_heads * int(q_norm_weight.shape[0])
     return int(q_proj_weight.shape[0]) == expected_out_dim
 
-def _split_sdpa_mask(
-    mask: Optional[Any],
-    *,
-    query_start: int,
-    query_end: int,
-    key_end: int,
-) -> Optional[Any]:
-    if mask is None or mask == "causal":
-        return mask
-    return mask[..., query_start:query_end, :key_end]
-
-def _split_sdpa_output(
-    *,
-    queries: mx.array,
-    keys: mx.array,
-    values: mx.array,
-    scale: float,
-    mask: Optional[Any],
-    cache: Optional[Any],
-    chunk_size: int,
-    cached_prefix_len: int,
-) -> mx.array:
-    q_len = int(queries.shape[2])
-    if q_len <= chunk_size:
-        return scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=scale, mask=mask
-        )
-
-    outputs: list[mx.array] = []
-    for start in range(0, q_len, chunk_size):
-        end = min(start + chunk_size, q_len)
-        key_end = cached_prefix_len + end
-        chunk_mask = _split_sdpa_mask(mask, query_start=start, query_end=end, key_end=key_end)
-        outputs.append(
-            scaled_dot_product_attention(
-                queries[:, :, start:end, :],
-                keys[:, :, :key_end, :],
-                values[:, :, :key_end, :],
-                cache=cache,
-                scale=scale,
-                mask=chunk_mask,
-            )
-        )
-    return mx.concatenate(outputs, axis=2)
-
-
-def _tail_causal_mask(q_len: int, kv_len: int) -> mx.array:
-    q_pos = mx.arange(kv_len - q_len, kv_len)[:, None]
-    k_pos = mx.arange(kv_len)[None, :]
-    return k_pos <= q_pos
-
-
-def _repeat_gqa_mask(mask: Any, *, q_len: int, kv_len: int, gqa: int) -> Any:
-    if mask is None:
-        return None
-    if isinstance(mask, str) and mask == "causal":
-        mask = _tail_causal_mask(q_len, kv_len)
-    if not isinstance(mask, mx.array):
-        return mask
-    if int(mask.shape[-2]) != q_len:
-        return mask
-    reps = [1] * mask.ndim
-    reps[-2] = int(gqa)
-    return mx.tile(mask, tuple(reps))
-
-
 def _gqa_reshape_sdpa(
     queries: mx.array,
     keys: mx.array,
@@ -193,36 +133,114 @@ def _gqa_reshape_sdpa(
     mask: Optional[Any],
     cache: Optional[Any] = None,
 ) -> mx.array:
-    batch_size, query_heads, q_len, head_dim = queries.shape
+    _, query_heads, q_len, head_dim = queries.shape
     _, kv_heads, kv_len, _ = keys.shape
     if kv_heads <= 0 or query_heads == kv_heads or query_heads % kv_heads != 0:
         return scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=scale, mask=mask
         )
     gqa = query_heads // kv_heads
-    grouped_queries = queries.reshape(
-        batch_size,
-        kv_heads,
-        gqa,
-        q_len,
-        head_dim,
-    ).reshape(batch_size, kv_heads, gqa * q_len, head_dim)
-    grouped_mask = _repeat_gqa_mask(mask, q_len=q_len, kv_len=kv_len, gqa=gqa)
-    output = scaled_dot_product_attention(
-        grouped_queries,
+    has_quantized_cache = cache is not None and hasattr(cache, "bits")
+    q_len_i = int(q_len)
+    kv_len_i = int(kv_len)
+    kv_heads_i = int(kv_heads)
+    if (
+        has_quantized_cache
+        or int(head_dim) != 256
+        or queries.dtype not in (mx.bfloat16, mx.float16)
+    ):
+        return grouped_gqa_sdpa(
+            queries,
+            keys,
+            values,
+            cache=cache,
+            scale=scale,
+            mask=mask,
+        )
+
+    use_native_gqa = (q_len_i == 1 and kv_len_i >= 4096) or (
+        q_len_i == 4
+        and (
+            kv_len_i <= 8192
+            or (int(gqa) <= 4 and kv_len_i <= 32768)
+            or (kv_heads_i >= 4 and kv_len_i <= 16384)
+        )
+    )
+    if use_native_gqa:
+        return scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            cache=cache,
+            scale=scale,
+            mask=mask,
+        )
+
+    if q_len_i not in (4, 16):
+        return grouped_gqa_sdpa(
+            queries,
+            keys,
+            values,
+            cache=cache,
+            scale=scale,
+            mask=mask,
+        )
+    if kv_heads_i <= 2 and q_len_i == 16:
+        if kv_len_i < 16384:
+            return grouped_gqa_sdpa(
+                queries,
+                keys,
+                values,
+                cache=cache,
+                scale=scale,
+                mask=mask,
+            )
+        grouped_mask = repeat_gqa_mask(mask, q_len=q_len, kv_len=kv_len, gqa=gqa)
+        if kv_len_i < 65536:
+            return async_per_head_gqa_sdpa(
+                queries,
+                keys,
+                values,
+                scale=scale,
+                mask=grouped_mask,
+                gqa=gqa,
+            )
+        return per_head_gqa_sdpa(
+            queries,
+            keys,
+            values,
+            scale=scale,
+            mask=grouped_mask,
+            gqa=gqa,
+        )
+    if kv_heads_i <= 2 and kv_len_i >= 8192:
+        grouped_mask = repeat_gqa_mask(mask, q_len=q_len, kv_len=kv_len, gqa=gqa)
+        return per_head_gqa_sdpa(
+            queries,
+            keys,
+            values,
+            scale=scale,
+            mask=grouped_mask,
+            gqa=gqa,
+        )
+    if kv_heads_i >= 4 and kv_len_i >= 16384:
+        grouped_mask = repeat_gqa_mask(mask, q_len=q_len, kv_len=kv_len, gqa=gqa)
+        return async_per_head_gqa_sdpa(
+            queries,
+            keys,
+            values,
+            scale=scale,
+            mask=grouped_mask,
+            gqa=gqa,
+        )
+    return grouped_gqa_sdpa(
+        queries,
         keys,
         values,
         cache=cache,
         scale=scale,
-        mask=grouped_mask,
+        mask=mask,
     )
-    return output.reshape(
-        batch_size,
-        kv_heads,
-        gqa,
-        q_len,
-        head_dim,
-    ).reshape(batch_size, query_heads, q_len, head_dim)
 
 
 def _as_int_list(values: mx.array) -> list[int]:
@@ -678,14 +696,14 @@ def _install_speculative_linear_cache_hook(linear_attn: Any) -> None:
     cls.__call__ = speculative_call
     cls._dflash_speculative_call_installed = True
 
-def _install_split_full_attention_hook(attn: Any) -> None:
+def _install_full_attention_gqa_hook(attn: Any) -> None:
     cls = type(attn)
-    if getattr(cls, "_dflash_split_full_attention_installed", False):
+    if getattr(cls, "_dflash_full_attention_gqa_installed", False):
         return
 
     original_call = cls.__call__
 
-    def split_call(
+    def attention_call(
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
@@ -694,7 +712,15 @@ def _install_split_full_attention_hook(attn: Any) -> None:
         tree_output = _tree_attention_call(self, x, mask=mask, cache=cache)
         if tree_output is not None:
             return tree_output
-        if not getattr(self, "_dflash_split_sdpa_enabled", False):
+        cached_prefix_len = int(getattr(cache, "offset", 0) or 0) if cache is not None else 0
+        can_route_gqa = (
+            cache is not None
+            and not isinstance(cache, cache_mod.QuantizedKVCache)
+            and cached_prefix_len >= _HYBRID_SDPA_EXACT_KV_THRESHOLD
+            and (mask is None or mask == "causal" or isinstance(mask, mx.array))
+            and 0 < int(x.shape[1]) <= 16
+        )
+        if not can_route_gqa:
             return original_call(self, x, mask=mask, cache=cache)
         if not _attention_has_gated_q_proj(self):
             return original_call(self, x, mask=mask, cache=cache)
@@ -718,65 +744,31 @@ def _install_split_full_attention_hook(attn: Any) -> None:
         values = values.reshape(B, L, num_key_value_heads, -1).transpose(
             0, 2, 1, 3
         )
-
-        cached_prefix_len = int(getattr(cache, "offset", 0) or 0) if cache is not None else 0
-        if cache is not None:
-            queries = self.rope(queries, offset=cached_prefix_len)
-            keys = self.rope(keys, offset=cached_prefix_len)
-            keys, values = cache.update_and_fetch(keys, values)
-        else:
-            queries = self.rope(queries)
-            keys = self.rope(keys)
-
-        exact_prefix_threshold = int(
-            getattr(
-                self,
-                "_dflash_split_sdpa_exact_kv_threshold",
-                _HYBRID_SDPA_EXACT_KV_THRESHOLD,
-            )
-        )
-        should_split = (
-            cache is not None
-            and cached_prefix_len >= exact_prefix_threshold
-            and (mask is None or mask == "causal" or isinstance(mask, mx.array))
-        )
-        should_use_batched_2pass = (
-            should_split
-            and int(queries.shape[2]) == 16
-            and queries.dtype in (mx.bfloat16, mx.float16)
+        can_use_gqa_fast_path = (
+            queries.dtype in (mx.bfloat16, mx.float16)
             and int(queries.shape[-1]) in (128, 256)
             and int(values.shape[-1]) in (128, 256)
         )
-        if should_use_batched_2pass:
-            output = _gqa_reshape_sdpa(
-                queries,
-                keys,
-                values,
-                cache=cache,
-                scale=self.scale,
-                mask=mask,
-            )
-        elif should_split:
-            output = _split_sdpa_output(
-                queries=queries,
-                keys=keys,
-                values=values,
-                scale=self.scale,
-                mask=mask,
-                cache=cache,
-                chunk_size=1,
-                cached_prefix_len=cached_prefix_len,
-            )
-        else:
-            output = scaled_dot_product_attention(
-                queries, keys, values, cache=cache, scale=self.scale, mask=mask
-            )
+        if not can_use_gqa_fast_path:
+            return original_call(self, x, mask=mask, cache=cache)
+
+        queries = self.rope(queries, offset=cached_prefix_len)
+        keys = self.rope(keys, offset=cached_prefix_len)
+        keys, values = cache.update_and_fetch(keys, values)
+        output = _gqa_reshape_sdpa(
+            queries,
+            keys,
+            values,
+            cache=cache,
+            scale=self.scale,
+            mask=mask,
+        )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         gated_output = output * mx.sigmoid(gate)
         return self.o_proj(gated_output)
 
-    cls.__call__ = split_call
-    cls._dflash_split_full_attention_installed = True
+    cls.__call__ = attention_call
+    cls._dflash_full_attention_gqa_installed = True
 
 class QwenGdnTargetOps:
     backend_name = "qwen_gdn"
@@ -847,7 +839,6 @@ class QwenGdnTargetOps:
             supports_shared_kv=False,
             supports_target_hidden_capture=True,
             supports_verify_linear=self._supports_verify_linear(target_model),
-            supports_full_attention_split=has_recurrent,
             supports_tree_verify=True,
         )
 
@@ -1006,7 +997,7 @@ class QwenGdnTargetOps:
         if self.family(target_model) == "pure_attention":
             for layer in text_model.layers:
                 if hasattr(layer, "self_attn"):
-                    _install_split_full_attention_hook(layer.self_attn)
+                    _install_full_attention_gqa_hook(layer.self_attn)
             text_model._dflash_speculative_hooks_installed = True
             return
         for layer in text_model.layers:
@@ -1014,27 +1005,8 @@ class QwenGdnTargetOps:
                 _install_exact_small_proj_hooks(layer.linear_attn)
                 _install_speculative_linear_cache_hook(layer.linear_attn)
             elif not getattr(layer, "is_linear", False) and hasattr(layer, "self_attn"):
-                _install_split_full_attention_hook(layer.self_attn)
+                _install_full_attention_gqa_hook(layer.self_attn)
         text_model._dflash_speculative_hooks_installed = True
-
-    def configure_full_attention_split(
-        self,
-        target_model: Any,
-        *,
-        enabled: bool,
-        chunk_size: int = 8,
-    ) -> None:
-        text_model = self.text_model(target_model)
-        if self.family(target_model) == "pure_attention":
-            return
-        self.install_speculative_hooks(target_model)
-        for layer in text_model.layers:
-            if not getattr(layer, "is_linear", False) and hasattr(layer, "self_attn"):
-                layer.self_attn._dflash_split_sdpa_enabled = enabled
-                layer.self_attn._dflash_split_sdpa_chunk_size = int(chunk_size)
-                layer.self_attn._dflash_split_sdpa_exact_kv_threshold = (
-                    _HYBRID_SDPA_EXACT_KV_THRESHOLD
-                )
 
     def make_cache(
         self,

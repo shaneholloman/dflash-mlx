@@ -110,27 +110,32 @@ def test_run_generate_defaults_follow_single_runtime_default(monkeypatch):
         "DEFAULT_RUNTIME_CONFIG",
         replace(runtime_config.DEFAULT_RUNTIME_CONFIG, draft_window_size=1536),
     )
-    captured = []
+    captured_runtime = []
+    captured_load = []
 
     class _Tokenizer:
         def decode(self, token):
             return str(token)
 
-    monkeypatch.setattr(
-        generate,
-        "load_runtime_bundle",
-        lambda **_kwargs: SimpleNamespace(
+    def _load_runtime_bundle(**kwargs):
+        captured_load.append(kwargs)
+        return SimpleNamespace(
             target_model=object(),
             tokenizer=_Tokenizer(),
             draft_model=object(),
             draft_backend=object(),
             target_ops=object(),
-        ),
+        )
+
+    monkeypatch.setattr(
+        generate,
+        "load_runtime_bundle",
+        _load_runtime_bundle,
     )
     monkeypatch.setattr(generate, "get_stop_token_ids", lambda _tokenizer: [])
 
     def _stream(**kwargs):
-        captured.append(kwargs["runtime_context"])
+        captured_runtime.append(kwargs["runtime_context"])
         return _ClosableGenerateStream(
             [
                 SummaryEvent(
@@ -159,7 +164,8 @@ def test_run_generate_defaults_follow_single_runtime_default(monkeypatch):
         )
         == 0
     )
-    assert captured[0].runtime.draft_window_size == 1536
+    assert captured_runtime[0].runtime.draft_window_size == 1536
+    assert "split_full_attention_sdpa" not in captured_load[0]
 
 
 def test_generate_cli_rejects_invalid_prefill_step_size(monkeypatch):
