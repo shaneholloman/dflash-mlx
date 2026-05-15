@@ -279,13 +279,17 @@ def build_prompt_regime(args: Any, tokenizer: Any, request: Any = None) -> dict[
         chat_template_args = {}
     request_type = getattr(request, "request_type", None)
     is_chat = request_type == "chat"
+    enable_thinking = chat_template_args.get(
+        "enable_thinking",
+        getattr(tokenizer, "has_thinking", False),
+    )
     return {
         "request_type": request_type or "unknown",
         "request_tokenization": "mlx_lm.server",
         "runtime_prompt_input": "prompt_tokens_override",
         "chat_template": bool(is_chat and getattr(tokenizer, "has_chat_template", False)),
         "chat_template_args": dict(chat_template_args) if is_chat else {},
-        "enable_thinking": bool(is_chat and chat_template_args.get("enable_thinking", False)),
+        "enable_thinking": bool(is_chat and enable_thinking),
         "use_default_chat_template": bool(
             is_chat and getattr(args, "use_default_chat_template", False)
         ),
@@ -344,7 +348,12 @@ def _print_startup_banner(
     chat_template_args = getattr(model_provider.cli_args, "chat_template_args", {})
     if not isinstance(chat_template_args, dict):
         chat_template_args = {}
-    thinking_enabled = bool(chat_template_args.get("enable_thinking", False))
+    thinking_enabled = bool(
+        chat_template_args.get(
+            "enable_thinking",
+            getattr(model_provider.tokenizer, "has_thinking", False),
+        )
+    )
     fastpath_max_tokens = int(
         getattr(model_provider.cli_args, "fastpath_max_tokens", 0) or 0
     )

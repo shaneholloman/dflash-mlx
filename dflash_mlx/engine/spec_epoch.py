@@ -519,7 +519,11 @@ class SpeculativeSession:
                 yield evt
                 yield_pause.done(_pre_yield)
 
-        snapshot_boundary = compute_snapshot_boundary(prompt_len, stable_prefix_len)
+        snapshot_boundary = (
+            compute_snapshot_boundary(prompt_len, stable_prefix_len)
+            if supports_prefix_snapshot
+            else 0
+        )
         prefill_context_len = max(0, snapshot_boundary - 1)
         chunked_start = min(snap_prefix_len, prefill_context_len)
         for chunk_start in range(chunked_start, prefill_context_len, prefill_step_size):

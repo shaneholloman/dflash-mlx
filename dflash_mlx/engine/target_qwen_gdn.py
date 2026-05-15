@@ -26,7 +26,6 @@ from dflash_mlx.engine.gqa_sdpa import (
 from dflash_mlx.engine.target_ops import TargetCapabilities
 from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
 
-_EXACT_SMALL_PROJ_PAD_M = 16
 _HYBRID_SDPA_EXACT_KV_THRESHOLD = 1024
 _TREE_POSITIONS_ATTR = "_dflash_tree_positions"
 _TREE_PARENT_IDS_ATTR = "_dflash_tree_parent_ids"
@@ -53,48 +52,6 @@ def _required_positive_int_attr(obj: Any, name: str) -> int:
     if parsed <= 0:
         raise ValueError(f"Invalid Qwen target config field {name}: {value!r}")
     return parsed
-
-class _ExactSmallProjPad(nn.Module):
-    def __init__(self, linear: nn.Module, *, pad_m: int = _EXACT_SMALL_PROJ_PAD_M):
-        super().__init__()
-        self.linear = linear
-        self.pad_m = int(pad_m)
-        self._dflash_exact_small_proj_wrapped = True
-
-    @property
-    def weight(self) -> mx.array:
-        return self.linear.weight
-
-    @weight.setter
-    def weight(self, value: mx.array) -> None:
-        self.linear.weight = value
-
-    @property
-    def bias(self) -> Optional[mx.array]:
-        return getattr(self.linear, "bias", None)
-
-    @bias.setter
-    def bias(self, value: Optional[mx.array]) -> None:
-        self.linear.bias = value
-
-    def __call__(self, x: mx.array) -> mx.array:
-        if x.ndim == 3 and x.shape[1] < self.pad_m:
-            batch_size, seq_len, hidden_dim = x.shape
-            pad = mx.zeros((batch_size, self.pad_m - seq_len, hidden_dim), dtype=x.dtype)
-            out = self.linear(mx.concatenate([x, pad], axis=1))
-            return out[:, :seq_len, :]
-        return self.linear(x)
-
-def _install_exact_small_proj_hooks(
-    linear_attn: Any,
-    *,
-    pad_m: int = _EXACT_SMALL_PROJ_PAD_M,
-) -> None:
-    for attr_name in ("in_proj_b", "in_proj_a", "in_proj_ba"):
-        proj = getattr(linear_attn, attr_name, None)
-        if proj is None or getattr(proj, "_dflash_exact_small_proj_wrapped", False):
-            continue
-        setattr(linear_attn, attr_name, _ExactSmallProjPad(proj, pad_m=pad_m))
 
 def _attention_num_heads(attn: Any) -> int:
     for attr in ("num_attention_heads", "n_heads"):
@@ -1002,7 +959,6 @@ class QwenGdnTargetOps:
             return
         for layer in text_model.layers:
             if getattr(layer, "is_linear", False) and hasattr(layer, "linear_attn"):
-                _install_exact_small_proj_hooks(layer.linear_attn)
                 _install_speculative_linear_cache_hook(layer.linear_attn)
             elif not getattr(layer, "is_linear", False) and hasattr(layer, "self_attn"):
                 _install_full_attention_gqa_hook(layer.self_attn)

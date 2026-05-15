@@ -61,7 +61,7 @@ def test_serve_cli_wires_runtime_env_flags(monkeypatch):
     assert args.runtime_config.prefill_step_size == 4096
     assert args.runtime_config.clear_cache_boundaries is True
 
-def test_serve_cli_thinking_default_is_disabled(monkeypatch):
+def test_serve_cli_thinking_uses_tokenizer_default(monkeypatch):
     _clear_runtime_env(monkeypatch)
     parser = build_parser()
 
@@ -69,15 +69,12 @@ def test_serve_cli_thinking_default_is_disabled(monkeypatch):
     normalize_cli_args(args)
 
     assert args.enable_thinking is False
-    assert args.chat_template_args == {"enable_thinking": False}
+    assert args.chat_template_args == {}
     assert args.fastpath_max_tokens == 0
 
     args = parser.parse_args(["--model", "m", "--enable-thinking"])
     normalize_cli_args(args)
     assert args.chat_template_args["enable_thinking"] is True
-
-    with pytest.raises(SystemExit):
-        parser.parse_args(["--model", "m", "--disable-thinking"])
 
 def test_serve_cli_fastpath_max_tokens_zero_is_accepted(monkeypatch):
     _clear_runtime_env(monkeypatch)

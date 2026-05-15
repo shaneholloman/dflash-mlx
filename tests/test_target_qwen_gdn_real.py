@@ -55,6 +55,32 @@ def _argmax_token(logits: mx.array) -> int:
     mx.eval(token)
     return int(token.item())
 
+def _greedy_ids(model, prompt_ids: list[int], max_tokens: int) -> list[int]:
+    cache = model.make_cache()
+    logits = model(mx.array(prompt_ids, dtype=mx.uint32)[None], cache=cache)[:, -1, :]
+    mx.eval(logits)
+    out = []
+    for _ in range(max_tokens):
+        token = int(mx.argmax(logits, axis=-1).item())
+        out.append(token)
+        logits = model(mx.array([[token]], dtype=mx.uint32), cache=cache)[:, -1, :]
+        mx.eval(logits)
+    return out
+
+def test_real_qwen_gdn_hooks_preserve_stock_greedy_trajectory():
+    model, tokenizer = _load_model()
+    ops = resolve_target_ops(model)
+    assert isinstance(ops, QwenGdnTargetOps)
+
+    prompt_ids = list(
+        tokenizer.encode("Solve carefully and give the final answer: What is 1234 + 5678?")
+    )
+    before = _greedy_ids(model, prompt_ids, max_tokens=36)
+    ops.install_speculative_hooks(model)
+    after = _greedy_ids(model, prompt_ids, max_tokens=36)
+
+    assert after == before
+
 def test_real_qwen_gdn_target_ops_forward_cache_and_rollback_parity():
     model, tokenizer = _load_model()
     ops = resolve_target_ops(model)

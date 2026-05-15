@@ -403,13 +403,16 @@ def test_generation_context_honors_effective_thinking_flag():
     assert ctx.has_thinking is False
 
 def test_request_thinking_default_and_request_override():
-    cli_args = SimpleNamespace(chat_template_args={"enable_thinking": False})
+    cli_args = SimpleNamespace(chat_template_args={})
 
-    assert thinking_enabled_for_request(cli_args) is False
+    assert thinking_enabled_for_request(cli_args) is True
+    assert thinking_enabled_for_request(
+        SimpleNamespace(chat_template_args={"enable_thinking": False})
+    ) is False
     assert thinking_enabled_for_request(
         cli_args,
-        SimpleNamespace(chat_template_kwargs={"enable_thinking": True}),
-    ) is True
+        SimpleNamespace(chat_template_kwargs={"enable_thinking": False}),
+    ) is False
 
 
 def test_chat_completions_loads_tool_choice_controls():

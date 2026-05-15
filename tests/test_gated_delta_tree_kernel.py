@@ -8,6 +8,9 @@ import mlx.core as mx
 
 from dflash_mlx.kernels import (
     _gated_delta_tree_ops,
+    _gated_delta_tree_tape_ops,
+    _gated_delta_ops_with_tape,
+    gated_delta_kernel_with_tape,
     _tree_depthwise_conv1d_ops,
     gated_delta_tree_kernel,
     gated_delta_tree_tape_kernel,
@@ -62,7 +65,7 @@ def test_gated_delta_tree_kernel_matches_reference_scalar_g():
     actual_y, actual_states = gated_delta_tree_kernel(q, k, v, g, beta, state, parent_ids)
     expected_y, expected_states = _gated_delta_tree_ops(q, k, v, g, beta, state, parent_ids)
 
-    _assert_close(actual_y, expected_y)
+    _assert_close(actual_y, expected_y.astype(q.dtype))
     _assert_close(actual_states, expected_states)
 
 
@@ -72,7 +75,7 @@ def test_gated_delta_tree_kernel_matches_reference_vector_g():
     actual_y, actual_states = gated_delta_tree_kernel(q, k, v, g, beta, state, parent_ids)
     expected_y, expected_states = _gated_delta_tree_ops(q, k, v, g, beta, state, parent_ids)
 
-    _assert_close(actual_y, expected_y)
+    _assert_close(actual_y, expected_y.astype(q.dtype))
     _assert_close(actual_states, expected_states)
 
 
@@ -85,9 +88,75 @@ def test_gated_delta_tree_kernel_keeps_state_dtype_with_bf16_inputs():
     beta = beta.astype(mx.bfloat16)
 
     _actual_y, actual_states = gated_delta_tree_kernel(q, k, v, g, beta, state, parent_ids)
-    mx.eval(actual_states)
+    _expected_y, expected_states = _gated_delta_tree_ops(q, k, v, g, beta, state, parent_ids)
+    mx.eval(actual_states, expected_states)
 
     assert actual_states.dtype == state.dtype
+    _assert_close(actual_states, expected_states, atol=1e-5)
+
+
+def test_gated_delta_tape_kernel_keeps_state_dtype_with_bf16_inputs():
+    q, k, v, g, beta, state, _parent_ids = _inputs(vectorized_g=False)
+    q = q.astype(mx.bfloat16)
+    k = k.astype(mx.bfloat16)
+    v = v.astype(mx.bfloat16)
+    g = g.astype(mx.bfloat16)
+    beta = beta.astype(mx.bfloat16)
+
+    _actual_y, actual_state, actual_tape = gated_delta_kernel_with_tape(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state,
+    )
+    _expected_y, expected_state, _expected_tape = _gated_delta_ops_with_tape(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state,
+    )
+    mx.eval(actual_state, expected_state, actual_tape)
+
+    assert actual_state.dtype == state.dtype
+    _assert_close(actual_state, expected_state)
+    assert actual_tape.dtype == mx.float32
+
+
+def test_gated_delta_tree_tape_kernel_keeps_tape_f32_with_bf16_inputs():
+    q, k, v, g, beta, state, parent_ids = _inputs(vectorized_g=False)
+    q = q.astype(mx.bfloat16)
+    k = k.astype(mx.bfloat16)
+    v = v.astype(mx.bfloat16)
+    g = g.astype(mx.bfloat16)
+    beta = beta.astype(mx.bfloat16)
+
+    actual_y, actual_tape = gated_delta_tree_tape_kernel(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state,
+        parent_ids,
+    )
+    expected_y, expected_tape = _gated_delta_tree_tape_ops(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state,
+        parent_ids,
+    )
+    mx.eval(actual_y, expected_y, actual_tape, expected_tape)
+
+    _assert_close(actual_y, expected_y.astype(q.dtype))
+    _assert_close(actual_tape, expected_tape, atol=1e-5)
+    assert actual_tape.dtype == mx.float32
 
 
 def test_gated_delta_tree_tape_kernel_replays_accepted_path():

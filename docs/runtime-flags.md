@@ -52,7 +52,7 @@ Generation defaults:
 | `--fastpath-max-tokens INT` | short-output target-only AR fast path threshold; default `0` disables; set a positive value to opt in; does not change DFlash max context |
 | `--chat-template TEMPLATE` | inline chat template override |
 | `--use-default-chat-template` | force tokenizer default template |
-| `--enable-thinking` | set chat-template arg `enable_thinking=true`; default disabled |
+| `--enable-thinking` | set chat-template arg `enable_thinking=true`; default follows tokenizer/model template |
 | `--chat-template-args JSON` | JSON args for template rendering |
 
 DFlash runtime:

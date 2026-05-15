@@ -150,11 +150,12 @@ per-process wired-memory source is available.
 The endpoint is for live debugging and benchmark visibility; it does not create
 benchmark artifacts.
 
-Qwen reasoning mode is disabled by default for chat templates. Enable it when a
-client or model requires the thinking template path:
+Chat-template thinking follows the tokenizer default. For Qwen thinking models,
+that means the thinking template path is enabled unless a request or CLI
+template override explicitly disables it:
 
 ```bash
-dflash serve --model mlx-community/Qwen3.6-27B-4bit --enable-thinking
+dflash serve --model mlx-community/Qwen3.6-27B-4bit --chat-template-args '{"enable_thinking":false}'
 ```
 
 ## Tested models

@@ -85,9 +85,6 @@ def _make_gated_delta_kernel_with_tape(*, has_mask: bool = False, vectorized: bo
           if (thread_index_in_simdgroup == 0) {{
             tape_[dv_idx] = delta;
           }}
-          for (int i = 0; i < n_per_t; ++i) {{
-            state[i] = static_cast<float>(static_cast<InT>(state[i]));
-          }}
           q_ += Hk * Dk;
           k_ += Hk * Dk;
           v_ += Hv * Dv;
@@ -99,7 +96,7 @@ def _make_gated_delta_kernel_with_tape(*, has_mask: bool = False, vectorized: bo
 
         for (int i = 0; i < n_per_t; ++i) {{
           auto s_idx = n_per_t * dk_idx + i;
-          o_state[s_idx] = static_cast<InT>(state[i]);
+          o_state[s_idx] = static_cast<StateT>(state[i]);
         }}
     """
 
@@ -165,7 +162,7 @@ def _gated_delta_ops_with_tape(
             delta = mx.where(y_mask, delta, mx.zeros_like(delta))
             y = mx.where(y_mask, y, mx.zeros_like(y))
         state = new_state
-        outputs.append(y)
+        outputs.append(y.astype(q.dtype))
         tape.append(delta.astype(mx.float32))
     return mx.stack(outputs, axis=1), state, mx.stack(tape, axis=1)
 
@@ -187,6 +184,7 @@ def gated_delta_kernel_with_tape(
         return _gated_delta_ops_with_tape(q, k, v, g, beta, state, mask)
 
     input_type = q.dtype
+    state_type = state.dtype
 
     if g.ndim == 4:
         kernel = _gated_delta_tape_kernel_vec
@@ -208,6 +206,7 @@ def gated_delta_kernel_with_tape(
         inputs=inputs,
         template=[
             ("InT", input_type),
+            ("StateT", state_type),
             ("Dk", Dk),
             ("Dv", Dv),
             ("Hk", Hk),
@@ -216,7 +215,7 @@ def gated_delta_kernel_with_tape(
         grid=(32, Dv, B * Hv),
         threadgroup=(32, 4, 1),
         output_shapes=[(B, T, Hv, Dv), state.shape, (B, T, Hv, Dv)],
-        output_dtypes=[input_type, input_type, mx.float32],
+        output_dtypes=[input_type, state_type, mx.float32],
     )
 
 
@@ -295,7 +294,7 @@ def _make_gated_delta_tree_kernel(*, vectorized: bool = False):
           }}
           for (int i = 0; i < n_per_t; ++i) {{
             auto s_idx = n_per_t * dk_idx + i;
-            tree_state_slot[s_idx] = static_cast<InT>(state[i]);
+            tree_state_slot[s_idx] = static_cast<StateT>(state[i]);
           }}
 
           q_ += Hk * Dk;
@@ -393,7 +392,6 @@ def _make_gated_delta_tree_tape_kernel(*, vectorized: bool = False):
             tape_[dv_idx] = delta;
           }}
           for (int i = 0; i < n_per_t; ++i) {{
-            state[i] = static_cast<float>(static_cast<InT>(state[i]));
             history[t][i] = state[i];
           }}
 
@@ -496,7 +494,7 @@ def _gated_delta_tree_tape_ops(
         y = (state_t * q[:, t, :, None, :]).sum(axis=-1)
         outputs.append(y)
         tape.append(delta.astype(mx.float32))
-        states.append(mx.contiguous(state_t.astype(q.dtype).astype(mx.float32)))
+        states.append(mx.contiguous(state_t))
     return mx.stack(outputs, axis=1), mx.stack(tape, axis=1)
 
 
@@ -531,6 +529,7 @@ def gated_delta_tree_kernel(
         inputs=[q, k, v, g, beta, state, parent_ids, T],
         template=[
             ("InT", input_type),
+            ("StateT", state_type),
             ("Dk", Dk),
             ("Dv", Dv),
             ("Hk", Hk),

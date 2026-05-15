@@ -13,8 +13,8 @@ STATEFUL_SERVER_API = "state" in getattr(mlx_server.Response, "__annotations__",
 
 def thinking_enabled_for_request(cli_args: Any, request_args: Any = None) -> bool:
     chat_args = getattr(cli_args, "chat_template_args", None)
-    enabled = False
-    if isinstance(chat_args, dict):
+    enabled = True
+    if isinstance(chat_args, dict) and "enable_thinking" in chat_args:
         enabled = bool(chat_args.get("enable_thinking", False))
 
     request_chat_args = getattr(request_args, "chat_template_kwargs", None)

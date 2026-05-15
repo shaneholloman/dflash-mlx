@@ -208,8 +208,6 @@ def _normalize_chat_template_args(args: argparse.Namespace) -> None:
     args.chat_template_args = dict(chat_args)
     if getattr(args, "enable_thinking", False):
         args.chat_template_args["enable_thinking"] = True
-    else:
-        args.chat_template_args.setdefault("enable_thinking", False)
 
 def _configure_diagnostics_args(args: argparse.Namespace) -> os.PathLike[str] | None:
     mode = str(getattr(args, "diagnostics", "off") or "off")
