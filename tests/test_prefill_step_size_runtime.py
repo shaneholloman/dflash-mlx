@@ -1728,7 +1728,7 @@ def test_adaptive_verify_mode_drops_and_recovers_block_len():
             draft_model=draft_model,
             draft_backend=draft_backend,
             prompt="unused",
-            max_new_tokens=120,
+            max_new_tokens=340,
             prompt_tokens_override=[1, 2],
             runtime_context=_runtime_context(verify_mode="adaptive"),
         )
@@ -1736,13 +1736,13 @@ def test_adaptive_verify_mode_drops_and_recovers_block_len():
 
     summary = next(event for event in events if isinstance(event, SummaryEvent))
 
-    assert draft_backend.calls[:29] == [(8, True)] * 4 + [(4, True)] * 24 + [(8, True)]
-    assert target_ops.verify_lengths[:29] == [8] * 4 + [4] * 24 + [8]
+    assert draft_backend.calls[:76] == [(8, True)] * 4 + [(4, True)] * 64 + [(8, True)] * 8
+    assert target_ops.verify_lengths[:76] == [8] * 4 + [4] * 64 + [8] * 8
     assert summary.block_tokens == 8
     assert summary.verify_len_cap == 8
-    assert summary.acceptance_history[:29] == (0,) * 4 + (3,) * 24 + (7,)
+    assert summary.acceptance_history[:76] == (0,) * 4 + (3,) * 64 + (7,) * 8
     assert summary.adaptive_block_reductions == 1
-    assert summary.adaptive_block_cycles == 24
+    assert summary.adaptive_block_cycles == 64
     assert summary.adaptive_block_min == 4
 
 
@@ -1764,7 +1764,7 @@ def test_adaptive_verify_mode_starts_reduced_for_long_context():
     assert short_policy.mode == "full"
     assert short_policy.block_limit() == 8
     assert short_policy.reductions == 0
-    assert short_policy.reduced_burst_cycles == 24
+    assert short_policy.reduced_burst_cycles == 64
     assert policy is not None
     assert policy.mode == "reduced"
     assert policy.block_limit() == 4
@@ -1781,24 +1781,31 @@ def test_adaptive_verify_mode_long_context_burst_is_initial_only():
     )
     assert policy is not None
 
-    for _ in range(64):
+    for _ in range(63):
         policy.record(block_len=4, acceptance_len=3)
 
-    assert policy.mode == "probe"
-    assert policy.reduced_burst_cycles == 24
+    assert policy.mode == "reduced"
 
-    policy.record(block_len=8, acceptance_len=7)
+    policy.record(block_len=4, acceptance_len=3)
+    assert policy.mode == "probe"
+    assert policy.reduced_burst_cycles == 64
+
+    for _ in range(7):
+        policy.record(block_len=8, acceptance_len=4)
+        assert policy.mode == "probe"
+
+    policy.record(block_len=8, acceptance_len=4)
     assert policy.mode == "full"
 
-    for _ in range(5):
-        policy.record(block_len=8, acceptance_len=0)
+    for _ in range(4):
+        policy.record(block_len=8, acceptance_len=3)
 
-    assert policy.mode == "reduced"
-    assert policy.reductions == 2
-    assert policy.reduced_burst_cycles == 24
+    assert policy.mode == "full"
+    assert policy.reductions == 1
+    assert policy.reduced_burst_cycles == 64
 
 
-def test_adaptive_verify_mode_probe_falls_back_to_reduced_after_two_low_full_cycles():
+def test_adaptive_verify_mode_probe_falls_back_to_reduced_after_eight_low_full_cycles():
     policy = spec_epoch._AdaptiveBlockPolicy.from_runtime(
         runtime_config=_runtime_context(verify_mode="adaptive").runtime,
         effective_block_tokens=8,
@@ -1812,13 +1819,14 @@ def test_adaptive_verify_mode_probe_falls_back_to_reduced_after_two_low_full_cyc
 
     assert policy.mode == "probe"
 
-    policy.record(block_len=8, acceptance_len=0)
-    assert policy.mode == "probe"
+    for _ in range(7):
+        policy.record(block_len=8, acceptance_len=0)
+        assert policy.mode == "probe"
 
     policy.record(block_len=8, acceptance_len=0)
     assert policy.mode == "reduced"
     assert policy.reduced_cycles_since_probe == 0
-    assert policy.reduced_burst_cycles == 24
+    assert policy.reduced_burst_cycles == 64
 
 
 def test_adaptive_verify_mode_long_context_handoff_starts_block4():
@@ -1869,7 +1877,7 @@ def test_adaptive_verify_mode_long_context_handoff_starts_block4():
     assert summary.adaptive_block_min == 4
 
 
-def test_adaptive_verify_mode_ignores_mixed_commit_windows():
+def test_adaptive_verify_mode_keeps_full_at_acceptance_boundary():
     draft_model = _draft_model(block_size=8)
 
     class _MixedTargetOps(_FakeTargetOps):
@@ -1890,7 +1898,7 @@ def test_adaptive_verify_mode_ignores_mixed_commit_windows():
             batch, seq_len = verify_ids.shape
             self.verify_lengths.append(int(seq_len))
             self._cycle += 1
-            accepted = 5 if self._cycle % 4 == 0 else 1
+            accepted = 3
             pattern = [0] + [0] * min(accepted, seq_len - 1)
             pattern += [1] * max(0, seq_len - len(pattern))
             logits = mx.zeros((batch, seq_len, 8), dtype=mx.float32)
@@ -1917,25 +1925,44 @@ def test_adaptive_verify_mode_ignores_mixed_commit_windows():
 
     summary = next(event for event in events if isinstance(event, SummaryEvent))
 
-    assert 4 not in target_ops.verify_lengths
+    assert target_ops.verify_lengths[:8] == [8] * 8
     assert summary.adaptive_block_reductions == 0
     assert summary.adaptive_block_cycles == 0
     assert summary.adaptive_block_min is None
 
 
-def test_adaptive_verify_mode_recovers_after_isolated_high_commit():
+def test_adaptive_verify_mode_drops_after_isolated_high_commit():
     policy = spec_epoch._AdaptiveBlockPolicy(full_block_tokens=8)
 
     policy.record(block_len=8, acceptance_len=7)
     for _ in range(3):
         policy.record(block_len=8, acceptance_len=0)
 
-    assert policy.mode == "full"
-
-    policy.record(block_len=8, acceptance_len=0)
-
     assert policy.mode == "reduced"
     assert policy.reductions == 1
+
+
+def test_adaptive_verify_mode_probe_resumes_at_acceptance_boundary():
+    policy = spec_epoch._AdaptiveBlockPolicy.from_runtime(
+        runtime_config=_runtime_context(verify_mode="adaptive").runtime,
+        effective_block_tokens=8,
+        verify_len_cap=8,
+        prompt_len=32768,
+    )
+    assert policy is not None
+
+    for _ in range(64):
+        policy.record(block_len=4, acceptance_len=3)
+
+    assert policy.mode == "probe"
+
+    for _ in range(7):
+        policy.record(block_len=8, acceptance_len=4)
+        assert policy.mode == "probe"
+
+    policy.record(block_len=8, acceptance_len=4)
+
+    assert policy.mode == "full"
 
 
 def test_ddtree_verify_mode_selects_branch_candidate():

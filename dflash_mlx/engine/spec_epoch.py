@@ -71,8 +71,9 @@ from dflash_mlx.engine.memory_waterfall import (
 _DECODE_CLEAR_CACHE_INTERVAL_TOKENS = 1024
 _DDTREE_TOP_WIDTH = 2
 _DDTREE_MAX_BRANCH_POSITIONS = 2
-_ADAPTIVE_REDUCED_BURST_CYCLES = 24
+_ADAPTIVE_REDUCED_BURST_CYCLES = 64
 _ADAPTIVE_LONG_CONTEXT_REDUCED_BURST_CYCLES = 64
+_ADAPTIVE_PROBE_CYCLES = 8
 
 
 @dataclass(frozen=True)
@@ -189,10 +190,10 @@ class _AdaptiveBlockPolicy:
     reduced_burst_cycles: int = _ADAPTIVE_REDUCED_BURST_CYCLES
     long_context_prompt_tokens: int = 32768
     long_context_burst_cycles: int = _ADAPTIVE_LONG_CONTEXT_REDUCED_BURST_CYCLES
-    low_commit_threshold: float = 3.0
-    recent_low_commit_threshold: float = 2.75
-    high_commit_guard: int = 5
-    cooldown_full_cycles: int = 0
+    probe_cycles: int = _ADAPTIVE_PROBE_CYCLES
+    drop_acceptance_threshold: float = 0.75
+    resume_acceptance_threshold: float = 0.80
+    tpc_threshold: float = 3.5
     mode: Literal["full", "reduced", "probe"] = "full"
     reduced_cycles_since_probe: int = 0
     probe_cycles_remaining: int = 0
@@ -230,6 +231,28 @@ class _AdaptiveBlockPolicy:
             return int(min(self.full_block_tokens, self.min_block_tokens))
         return int(self.full_block_tokens)
 
+    @staticmethod
+    def _window_stats(commits: Sequence[int]) -> tuple[float, float]:
+        cycles = len(commits)
+        if cycles <= 0:
+            return 0.0, 0.0
+        total_commits = sum(int(x) for x in commits)
+        if total_commits <= 0:
+            return 0.0, 0.0
+        accepted_draft = max(0, total_commits - cycles)
+        acceptance = accepted_draft / total_commits
+        tokens_per_cycle = total_commits / cycles
+        return float(acceptance), float(tokens_per_cycle)
+
+    def _enter_reduced(self) -> None:
+        self.mode = "reduced"
+        self.reduced_cycles_since_probe = 0
+        self.reduced_burst_cycles = _ADAPTIVE_REDUCED_BURST_CYCLES
+        self.probe_cycles_remaining = 0
+        self.probe_commits.clear()
+        self.full_commits.clear()
+        self.reductions += 1
+
     def record(self, *, block_len: int, acceptance_len: int) -> None:
         block_len = int(block_len)
         acceptance_len = int(acceptance_len)
@@ -244,7 +267,7 @@ class _AdaptiveBlockPolicy:
             )
             if self.reduced_cycles_since_probe >= self.reduced_burst_cycles:
                 self.mode = "probe"
-                self.probe_cycles_remaining = 2
+                self.probe_cycles_remaining = self.probe_cycles
                 self.probe_commits.clear()
                 self.reduced_burst_cycles = _ADAPTIVE_REDUCED_BURST_CYCLES
             return
@@ -258,40 +281,32 @@ class _AdaptiveBlockPolicy:
         if self.mode == "probe":
             self.probe_commits.append(commit_count)
             self.probe_cycles_remaining = max(0, self.probe_cycles_remaining - 1)
-            probe_avg = sum(self.probe_commits) / len(self.probe_commits)
-            if commit_count > self.min_block_tokens or probe_avg >= 4.25:
+            if self.probe_cycles_remaining > 0:
+                return
+            probe_acceptance, probe_tpc = self._window_stats(self.probe_commits)
+            if (
+                probe_acceptance >= self.resume_acceptance_threshold
+                and probe_tpc >= self.tpc_threshold
+            ):
                 self.mode = "full"
-                self.cooldown_full_cycles = self.window_size
                 self.reduced_cycles_since_probe = 0
                 self.reduced_burst_cycles = _ADAPTIVE_REDUCED_BURST_CYCLES
                 self.probe_commits.clear()
+                self.full_commits.clear()
                 self.probe_cycles_remaining = 0
-            elif self.probe_cycles_remaining <= 0:
-                self.mode = "reduced"
-                self.reduced_cycles_since_probe = 0
-                self.reduced_burst_cycles = _ADAPTIVE_REDUCED_BURST_CYCLES
-                self.probe_commits.clear()
-            return
-
-        if self.cooldown_full_cycles > 0:
-            self.cooldown_full_cycles -= 1
+            else:
+                self._enter_reduced()
             return
 
         if len(self.full_commits) < self.window_size:
             return
 
-        recent_commits = list(self.full_commits)
-        full_avg = sum(self.full_commits) / len(self.full_commits)
-        recent_avg = sum(recent_commits) / len(recent_commits)
+        rolling_acceptance, rolling_tpc = self._window_stats(self.full_commits)
         if (
-            full_avg <= self.low_commit_threshold
-            and recent_avg <= self.recent_low_commit_threshold
-            and max(recent_commits) <= self.high_commit_guard
+            rolling_acceptance < self.drop_acceptance_threshold
+            or rolling_tpc < self.tpc_threshold
         ):
-            self.mode = "reduced"
-            self.reduced_cycles_since_probe = 0
-            self.reduced_burst_cycles = _ADAPTIVE_REDUCED_BURST_CYCLES
-            self.reductions += 1
+            self._enter_reduced()
 
 
 @dataclass
