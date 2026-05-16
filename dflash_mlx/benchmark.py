@@ -91,7 +91,32 @@ CONTROLLED_FLAG_NAMES = (
     "draft_window_size",
     "verify_len_cap",
     "verify_mode",
+    "only_dflash",
     "out",
+)
+DEFAULT_MAX_TOKENS = 64
+AIME25_DEFAULT_MAX_TOKENS = 65536
+
+_AIME_INT_RE = re.compile(r"(?<!\d)([+-]?\d{1,4})(?!\d)")
+_AIME_FINAL_RE = re.compile(
+    r"(?:answer|final answer)\s*[:：]\s*(?:\\boxed\s*)?\{?\$?\s*([+-]?\d{1,4})",
+    re.IGNORECASE,
+)
+_REASONING_BLOCK_RE = re.compile(
+    r"<(think|thinking|reason|reasoning|thought)\b[^>]*>.*?</\1\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_DETAILS_REASONING_RE = re.compile(
+    r"<details\b(?=[^>]*\btype=[\"']reasoning[\"'])[^>]*>.*?</details\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_REASONING_OPEN_RE = re.compile(
+    r"<(think|thinking|reason|reasoning|thought)\b[^>]*>",
+    re.IGNORECASE,
+)
+_DETAILS_REASONING_OPEN_RE = re.compile(
+    r"<details\b(?=[^>]*\btype=[\"']reasoning[\"'])[^>]*>",
+    re.IGNORECASE,
 )
 
 class _BenchmarkHelpFormatter(argparse.RawTextHelpFormatter):
@@ -225,6 +250,7 @@ def _finalize_benchmark_args(
 ) -> argparse.Namespace:
     tokens = list(argv_tokens or [])
     suite_explicit = "--suite" in tokens
+    max_tokens_explicit = "--max-tokens" in tokens
     if args.repeat is None:
         args.repeat = 1
     if args.repeat < 1:
@@ -242,6 +268,8 @@ def _finalize_benchmark_args(
         args.limit = _default_limit_for_suite(args.suite)
     if args.limit < 1:
         raise ValueError("--limit must be >= 1")
+    if args.suite == "aime25" and not max_tokens_explicit:
+        args.max_tokens = AIME25_DEFAULT_MAX_TOKENS
     if args.cache_limit is None:
         args.cache_limit = 4 * GiB if args.suite == "longctx" else "auto"
     build_offline_runtime_config(**offline_runtime_kwargs(args, BENCHMARK_RUNTIME_FIELDS))
@@ -281,6 +309,92 @@ def _tokens_per_second(token_count: Any, elapsed_us: Any) -> float | None:
     if tokens is None or elapsed is None or elapsed <= 0.0:
         return None
     return tokens / (elapsed / 1_000_000.0)
+
+def _decode_token_ids(tokenizer: Any, token_ids: list[int]) -> str:
+    if not token_ids:
+        return ""
+    try:
+        return str(tokenizer.decode(token_ids))
+    except TypeError:
+        return "".join(str(tokenizer.decode(int(token))) for token in token_ids)
+
+def _aime_normalize_answer(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    value = str(raw).strip().replace(",", "")
+    value = value.strip("$ .")
+    if not re.fullmatch(r"[+-]?\d+", value):
+        return value or None
+    sign = "-" if value.startswith("-") else ""
+    digits = value[1:] if value[:1] in "+-" else value
+    return sign + (digits.lstrip("0") or "0")
+
+def _boxed_values(text: str) -> list[str]:
+    values: list[str] = []
+    marker = "\\boxed"
+    i = 0
+    while True:
+        start = text.find(marker, i)
+        if start < 0:
+            return values
+        brace = text.find("{", start + len(marker))
+        if brace < 0:
+            i = start + len(marker)
+            continue
+        depth = 0
+        for j in range(brace, len(text)):
+            ch = text[j]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    values.append(text[brace + 1 : j])
+                    i = j + 1
+                    break
+        else:
+            return values
+
+def _content_without_reasoning_blocks(text: str) -> str:
+    content = _DETAILS_REASONING_RE.sub("", str(text or ""))
+    content = _REASONING_BLOCK_RE.sub("", content)
+    cut_points = [
+        match.start()
+        for pattern in (_DETAILS_REASONING_OPEN_RE, _REASONING_OPEN_RE)
+        if (match := pattern.search(content)) is not None
+    ]
+    if cut_points:
+        content = content[: min(cut_points)]
+    return content
+
+def _extract_aime25_answer(text: str) -> tuple[str | None, str | None]:
+    content = _content_without_reasoning_blocks(text)
+    for line in reversed([line.strip() for line in content.splitlines() if line.strip()]):
+        match = _AIME_FINAL_RE.search(line)
+        if match is not None:
+            return _aime_normalize_answer(match.group(1)), "final_line"
+    boxed = _boxed_values(content)
+    if boxed:
+        return _aime_normalize_answer(boxed[-1]), "boxed"
+    ints = _AIME_INT_RE.findall(content)
+    if ints:
+        return _aime_normalize_answer(ints[-1]), "last_integer"
+    return None, None
+
+def _attach_aime25_score(result: dict[str, Any], expected_answer: str) -> None:
+    generated_text = str(result.pop("generated_text", ""))
+    scored_text = _content_without_reasoning_blocks(generated_text)
+    prediction, source = _extract_aime25_answer(generated_text)
+    expected = _aime_normalize_answer(expected_answer)
+    result["generated_text_chars"] = len(generated_text)
+    result["scored_text_chars"] = len(scored_text)
+    result["score"] = {
+        "kind": "aime25_exact",
+        "expected": expected,
+        "prediction": prediction,
+        "correct": bool(prediction is not None and expected is not None and prediction == expected),
+        "answer_source": source,
+    }
 
 def _format_run_entry(run: dict[str, Any]) -> dict[str, Any]:
     baseline = dict(run["baseline"])
@@ -327,18 +441,41 @@ def _format_run_entry(run: dict[str, Any]) -> dict[str, Any]:
     )
     if dflash.get("memory_end") is not None:
         dflash_entry["memory_end"] = dict(dflash["memory_end"])
+    if baseline.get("score") is not None:
+        baseline["score"] = dict(baseline["score"])
+    if dflash.get("score") is not None:
+        dflash_entry["score"] = dict(dflash["score"])
+    if baseline.get("generated_text_chars") is not None:
+        baseline["generated_text_chars"] = int(baseline["generated_text_chars"])
+    if baseline.get("scored_text_chars") is not None:
+        baseline["scored_text_chars"] = int(baseline["scored_text_chars"])
+    if dflash.get("generated_text_chars") is not None:
+        dflash_entry["generated_text_chars"] = int(dflash["generated_text_chars"])
+    if dflash.get("scored_text_chars") is not None:
+        dflash_entry["scored_text_chars"] = int(dflash["scored_text_chars"])
+    baseline_tps = _float_or_none(run.get("baseline_generation_tps"))
+    baseline_ttft = _float_or_none(run.get("baseline_ttft_ms"))
     return {
         "run": int(run["run_index"]),
         "thermal_pressure": str(run.get("thermal_pressure", "unknown")),
         "baseline": {
-            "ttft_ms": float(run["baseline_ttft_ms"]),
-            "generation_tps": float(run["baseline_generation_tps"]),
+            "ttft_ms": baseline_ttft,
+            "generation_tps": baseline_tps,
             "prefill_tok_s": baseline_prefill_tok_s,
             "prefill_tok_s_physical": baseline_prefill_tok_s,
             "prefill_tok_s_apparent": baseline_prefill_tok_s,
             "prefill_tokens_physical": _int_or_none(baseline.get("prompt_token_count")),
             "peak_memory_gb": baseline.get("peak_memory_gb"),
             "memory_end": baseline_memory_end,
+            **(
+                {
+                    "score": baseline["score"],
+                    "generated_text_chars": baseline.get("generated_text_chars"),
+                    "scored_text_chars": baseline.get("scored_text_chars"),
+                }
+                if baseline.get("score") is not None
+                else {}
+            ),
         },
         "dflash": dflash_entry,
         "speedup": float(run["generation_speedup_vs_baseline"]) if run["generation_speedup_vs_baseline"] is not None else None,
@@ -370,6 +507,7 @@ def _build_config(
     draft_window_size: int,
     verify_len_cap: int,
     verify_mode: str,
+    only_dflash: bool,
 ) -> dict[str, Any]:
     return {
         "model": model,
@@ -389,6 +527,7 @@ def _build_config(
         "draft_window_size": int(draft_window_size),
         "verify_len_cap": int(verify_len_cap),
         "verify_mode": str(verify_mode),
+        "only_dflash": bool(only_dflash),
         "prompt": prompt,
         "prompt_tokens": int(prompt_tokens),
         "prompt_id": slugify_prompt_id(prompt),
@@ -442,12 +581,31 @@ def _build_single_case_report(
     draft_window_size: int,
     verify_len_cap: int,
     verify_mode: str,
+    only_dflash: bool,
 ) -> dict[str, Any]:
     run_entries = [_format_run_entry(run) for run in runs]
-    baseline_tps_values = [float(run["baseline_generation_tps"]) for run in runs]
-    dflash_tps_values = [float(run["dflash_generation_tps"]) for run in runs]
+    baseline_tps_values = [
+        float(value)
+        for run in runs
+        if (value := _float_or_none(run.get("baseline_generation_tps"))) is not None
+    ]
+    dflash_tps_values = [
+        float(value)
+        for run in runs
+        if (value := _float_or_none(run.get("dflash_generation_tps"))) is not None
+    ]
     speedup_values = [float(run["generation_speedup_vs_baseline"]) for run in runs if run["generation_speedup_vs_baseline"] is not None]
     acceptance_ratio_values = [float(run["dflash"]["acceptance_ratio"]) for run in runs]
+    baseline_score_values = [
+        bool(score.get("correct"))
+        for run in run_entries
+        if (score := run.get("baseline", {}).get("score")) is not None
+    ]
+    dflash_score_values = [
+        bool(score.get("correct"))
+        for run in run_entries
+        if (score := run.get("dflash", {}).get("score")) is not None
+    ]
     baseline_prefill_tok_s_values = [
         value
         for run in run_entries
@@ -463,7 +621,11 @@ def _build_single_case_report(
         for run in run_entries
         if (value := run.get("dflash", {}).get("prefill_tok_s_apparent")) is not None
     ]
-    prompt_tokens = int(runs[0]["baseline"]["prompt_token_count"]) if runs else 0
+    prompt_tokens = (
+        int(runs[0]["baseline"].get("prompt_token_count") or runs[0]["dflash"].get("prompt_token_count") or 0)
+        if runs
+        else 0
+    )
     return {
         "hardware": _hardware_info(),
         "config": _build_config(
@@ -486,6 +648,7 @@ def _build_single_case_report(
             draft_window_size=draft_window_size,
             verify_len_cap=verify_len_cap,
             verify_mode=verify_mode,
+            only_dflash=only_dflash,
         ),
         "runs": run_entries,
         "summary": {
@@ -510,6 +673,27 @@ def _build_single_case_report(
                 else None
             ),
             "acceptance_ratio_median": statistics.median(acceptance_ratio_values) if acceptance_ratio_values else None,
+            "baseline_score": (
+                sum(1 for value in baseline_score_values if value) / len(baseline_score_values)
+                if baseline_score_values
+                else None
+            ),
+            "baseline_correct": (
+                sum(1 for value in baseline_score_values if value)
+                if baseline_score_values
+                else None
+            ),
+            "dflash_score": (
+                sum(1 for value in dflash_score_values if value) / len(dflash_score_values)
+                if dflash_score_values
+                else None
+            ),
+            "dflash_correct": (
+                sum(1 for value in dflash_score_values if value)
+                if dflash_score_values
+                else None
+            ),
+            "score_count": len(dflash_score_values) or len(baseline_score_values) or None,
         },
     }
 
@@ -602,6 +786,17 @@ def _load_pristine_target_bundle(model_ref: str | None):
     model, tokenizer, config = load_pristine_target(resolved_ref, lazy=True, return_config=True)
     return model, tokenizer, {"resolved_model_ref": resolved_ref, "config": config}
 
+def _prompt_tokens_for(tokenizer: Any, prompt: str, *, use_chat_template: bool) -> list[int]:
+    if use_chat_template and hasattr(tokenizer, "apply_chat_template"):
+        return list(
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+        )
+    return list(tokenizer.encode(prompt))
+
 def _generate_stock_baseline_once(
     *,
     target_model: Any,
@@ -611,6 +806,7 @@ def _generate_stock_baseline_once(
     no_eos: bool,
     use_chat_template: bool = True,
     prompt_tokens_override: list[int] | None = None,
+    capture_text: bool = False,
 ) -> dict[str, Any]:
     memory_reset_ok = _reset_peak_memory_for_benchmark("baseline")
 
@@ -665,6 +861,7 @@ def _generate_stock_baseline_once(
             "prompt_token_count": prompt_tokens,
             "generated_token_ids": [],
             "generation_tokens": 0,
+            **({"generated_text": ""} if capture_text else {}),
             "peak_memory_gb": _peak_memory_gb_if_reset(memory_reset_ok),
             "memory_end": _benchmark_memory_snapshot("baseline"),
         }
@@ -682,6 +879,11 @@ def _generate_stock_baseline_once(
         "generated_token_ids": generated_token_ids,
         "generation_tokens": generation_tokens,
         "generation_tps": generation_tps,
+        **(
+            {"generated_text": _decode_token_ids(tokenizer, generated_token_ids)}
+            if capture_text
+            else {}
+        ),
         "peak_memory_gb": (
             float(final_response.peak_memory) if memory_reset_ok else None
         ),
@@ -703,6 +905,7 @@ def _generate_dflash_stream_once(
     suppress_token_ids: list[int] | None,
     runtime_context: RuntimeContext,
     prompt_tokens_override: list[int] | None = None,
+    capture_text: bool = False,
 ) -> dict[str, Any]:
     memory_reset_ok = _reset_peak_memory_for_benchmark("dflash")
 
@@ -745,6 +948,11 @@ def _generate_dflash_stream_once(
     if summary is None:
         raise RuntimeError("DFlash stream did not yield a summary event")
     summary_payload = summary.to_payload()
+    if capture_text:
+        summary_payload["generated_text"] = _decode_token_ids(
+            tokenizer,
+            [int(token) for token in summary_payload.get("generated_token_ids", [])],
+        )
     if prefill is not None:
         summary_payload.update(prefill.to_payload())
     if not memory_reset_ok:
@@ -804,35 +1012,47 @@ def _run_once_sequential(
     draft_window_size: int | None = None,
     verify_len_cap: int | None = None,
     verify_mode: str | None = None,
+    expected_answer: str | None = None,
+    only_dflash: bool = False,
 ) -> dict[str, Any]:
-    pristine_target_model, pristine_tokenizer, pristine_meta = _load_pristine_target_bundle(
-        target_model_ref
-    )
-
-    if use_chat_template and hasattr(pristine_tokenizer, "apply_chat_template"):
-        prompt_tokens = list(
-            pristine_tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt}],
-                tokenize=True,
-                add_generation_prompt=True,
-            )
-        )
+    capture_text = expected_answer is not None
+    baseline: dict[str, Any]
+    pristine_meta: dict[str, Any] | None = None
+    prompt_tokens: list[int] | None = None
+    if only_dflash:
+        baseline = {
+            "elapsed_us": 0.0,
+            "prefill_us": 0.0,
+            "prompt_token_count": None,
+            "generated_token_ids": [],
+            "generation_tokens": 0,
+            "peak_memory_gb": None,
+            "memory_end": None,
+        }
     else:
-        prompt_tokens = list(pristine_tokenizer.encode(prompt))
-    try:
-        baseline = _generate_stock_baseline_once(
-            target_model=pristine_target_model,
-            tokenizer=pristine_tokenizer,
-            prompt=prompt,
-            max_new_tokens=max_new_tokens,
-            no_eos=no_eos,
-            use_chat_template=use_chat_template,
-            prompt_tokens_override=prompt_tokens,
+        pristine_target_model, pristine_tokenizer, pristine_meta = _load_pristine_target_bundle(
+            target_model_ref
         )
-    finally:
-        del pristine_target_model
-        del pristine_tokenizer
-        _release_loaded_models()
+        prompt_tokens = _prompt_tokens_for(
+            pristine_tokenizer,
+            prompt,
+            use_chat_template=use_chat_template,
+        )
+        try:
+            baseline = _generate_stock_baseline_once(
+                target_model=pristine_target_model,
+                tokenizer=pristine_tokenizer,
+                prompt=prompt,
+                max_new_tokens=max_new_tokens,
+                no_eos=no_eos,
+                use_chat_template=use_chat_template,
+                prompt_tokens_override=prompt_tokens,
+                capture_text=capture_text,
+            )
+        finally:
+            del pristine_target_model
+            del pristine_tokenizer
+            _release_loaded_models()
 
     target_model = None
     tokenizer = None
@@ -860,20 +1080,18 @@ def _run_once_sequential(
         draft_backend = bundle.draft_backend
         target_ops = bundle.target_ops
 
-        if use_chat_template and hasattr(tokenizer, "apply_chat_template"):
-            dflash_prompt_tokens = list(
-                tokenizer.apply_chat_template(
-                    [{"role": "user", "content": prompt}],
-                    tokenize=True,
-                    add_generation_prompt=True,
-                )
-            )
-        else:
-            dflash_prompt_tokens = list(tokenizer.encode(prompt))
-        assert prompt_tokens == dflash_prompt_tokens, (
-            f"Tokenizer drift between pristine and DFlash bundles: "
-            f"{len(prompt_tokens)} vs {len(dflash_prompt_tokens)} tokens"
+        dflash_prompt_tokens = _prompt_tokens_for(
+            tokenizer,
+            prompt,
+            use_chat_template=use_chat_template,
         )
+        if prompt_tokens is None:
+            prompt_tokens = dflash_prompt_tokens
+        else:
+            assert prompt_tokens == dflash_prompt_tokens, (
+                f"Tokenizer drift between pristine and DFlash bundles: "
+                f"{len(prompt_tokens)} vs {len(dflash_prompt_tokens)} tokens"
+            )
         dflash_eos_token_ids = get_stop_token_ids(tokenizer)
         dflash_stop_token_ids = [] if no_eos else dflash_eos_token_ids
         dflash_suppress_token_ids = dflash_eos_token_ids if no_eos else None
@@ -891,6 +1109,7 @@ def _run_once_sequential(
             suppress_token_ids=dflash_suppress_token_ids,
             prompt_tokens_override=prompt_tokens,
             runtime_context=runtime_context,
+            capture_text=capture_text,
         )
     finally:
         if target_model is not None:
@@ -901,23 +1120,35 @@ def _run_once_sequential(
             del draft_model
         _release_loaded_models()
 
+    if expected_answer is not None and not only_dflash:
+        _attach_aime25_score(baseline, expected_answer)
+    if expected_answer is not None:
+        _attach_aime25_score(dflash, expected_answer)
+
     baseline_elapsed = float(baseline["elapsed_us"])
     dflash_elapsed = float(dflash["elapsed_us"])
-    baseline_generation_tps = _generation_tps_from_baseline(baseline)
+    baseline_generation_tps = None if only_dflash else _generation_tps_from_baseline(baseline)
     dflash_generation_tps = _generation_tps_from_dflash(dflash)
     return {
         "baseline": _strip_generation_payload(baseline),
         "dflash": _strip_generation_payload(dflash),
-        "speedup_vs_baseline": _speedup(baseline_elapsed, dflash_elapsed),
-        "baseline_ttft_ms": _ttft_ms_from_baseline(baseline),
+        "speedup_vs_baseline": (
+            None if only_dflash else _speedup(baseline_elapsed, dflash_elapsed)
+        ),
+        "baseline_ttft_ms": None if only_dflash else _ttft_ms_from_baseline(baseline),
         "dflash_ttft_ms": _ttft_ms_from_dflash(dflash),
         "baseline_generation_tps": baseline_generation_tps,
         "dflash_generation_tps": dflash_generation_tps,
-        "generation_speedup_vs_baseline": _generation_speedup(
-            baseline_generation_tps,
-            dflash_generation_tps,
+        "generation_speedup_vs_baseline": (
+            None
+            if baseline_generation_tps is None
+            else _generation_speedup(baseline_generation_tps, dflash_generation_tps)
         ),
-        "token_match": baseline["generated_token_ids"] == dflash["generated_token_ids"],
+        "token_match": (
+            None
+            if only_dflash
+            else baseline["generated_token_ids"] == dflash["generated_token_ids"]
+        ),
         "target_meta": target_meta,
         "draft_meta": draft_meta,
         "pristine_target_meta": pristine_meta,
@@ -951,6 +1182,8 @@ def benchmark_once(
     verify_len_cap: int | None = None,
     verify_mode: str | None = None,
     cooldown: int = 10,
+    expected_answer: str | None = None,
+    only_dflash: bool = False,
 ) -> dict[str, Any]:
     runtime_values = _offline_runtime_values(
         prefill_step_size=prefill_step_size,
@@ -971,6 +1204,8 @@ def benchmark_once(
         draft_model_ref=draft_model_ref,
         draft_quant=draft_quant,
         no_eos=no_eos,
+        expected_answer=expected_answer,
+        only_dflash=only_dflash,
         **runtime_values,
     )
     target_meta = result.pop("target_meta")
@@ -992,6 +1227,7 @@ def benchmark_once(
         draft_load_dtype=draft_meta.get("draft_load_dtype"),
         draft_load_dtype_source=draft_meta.get("draft_load_dtype_source"),
         no_eos=no_eos,
+        only_dflash=only_dflash,
         **runtime_values,
     )
 
@@ -1013,6 +1249,8 @@ def benchmark_repeated(
     verify_len_cap: int | None = None,
     verify_mode: str | None = None,
     cooldown: int = 10,
+    expected_answer: str | None = None,
+    only_dflash: bool = False,
 ) -> dict[str, Any]:
     runtime_values = _offline_runtime_values(
         prefill_step_size=prefill_step_size,
@@ -1038,6 +1276,8 @@ def benchmark_repeated(
             draft_model_ref=draft_model_ref,
             draft_quant=draft_quant,
             no_eos=no_eos,
+            expected_answer=expected_answer,
+            only_dflash=only_dflash,
             **runtime_values,
         )
         if target_meta is None:
@@ -1075,6 +1315,7 @@ def benchmark_repeated(
             else None
         ),
         no_eos=no_eos,
+        only_dflash=only_dflash,
         **runtime_values,
     )
 
@@ -1098,6 +1339,7 @@ def benchmark_suite(
         "verify_len_cap": args.verify_len_cap,
         "verify_mode": args.verify_mode,
         "cooldown": args.cooldown,
+        "only_dflash": bool(args.only_dflash),
     }
     for prompt in prompts:
         if args.repeat > 1:
@@ -1105,16 +1347,20 @@ def benchmark_suite(
                 prompt=prompt.prompt,
                 max_new_tokens=args.max_tokens,
                 repeat=args.repeat,
+                expected_answer=prompt.expected_answer,
                 **common_kwargs,
             )
         else:
             report = benchmark_once(
                 prompt=prompt.prompt,
                 max_new_tokens=args.max_tokens,
+                expected_answer=prompt.expected_answer,
                 **common_kwargs,
             )
         report["config"]["prompt_id"] = prompt.id
         report["config"]["prompt_suite"] = prompt.suite
+        if prompt.expected_answer is not None:
+            report["config"]["expected_answer"] = prompt.expected_answer
         if not args.no_memory:
             _attach_memory_summary(report)
         prompt_reports.append(report)
@@ -1137,8 +1383,8 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         default="smoke",
         help=(
             "Named benchmark prompt suite. Default: smoke.\n"
-            "humaneval/gsm8k/math500 load HF datasets for runtime measurement, "
-            "not official accuracy scores."
+            "humaneval/gsm8k/math500/aime25 load HF datasets; aime25 also "
+            "records exact-answer score fields."
         ),
     )
     parser.add_argument(
@@ -1146,7 +1392,7 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         metavar="N",
         type=int,
         default=None,
-        help="Number of prompts to run from the selected suite. Default: 1 for smoke/longctx, 10 otherwise.",
+        help="Number of prompts to run from the selected suite. Default: 1 for smoke/longctx, 30 for aime25, 10 otherwise.",
     )
     parser.add_argument(
         "--ctx-tokens",
@@ -1182,8 +1428,8 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         "--max-tokens",
         metavar="INT",
         type=int,
-        default=64,
-        help="Number of tokens to generate. Default: 64.",
+        default=DEFAULT_MAX_TOKENS,
+        help="Number of tokens to generate. Default: 64, or 65536 for --suite aime25.",
     )
     parser.add_argument(
         "--block-tokens",
@@ -1259,6 +1505,11 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         action="store_true",
         help="Suppress EOS so generation reaches --max-tokens. Default: EOS enabled.",
     )
+    parser.add_argument(
+        "--only-dflash",
+        action="store_true",
+        help="Skip the baseline MLX run and measure DFlash only. Default: baseline then DFlash.",
+    )
     add_offline_runtime_arguments(parser, BENCHMARK_RUNTIME_FIELDS)
     parser.add_argument(
         "--out",
@@ -1305,6 +1556,7 @@ def _controlled_flag_values(
         "draft_window_size": int(args.draft_window_size),
         "verify_len_cap": int(args.verify_len_cap),
         "verify_mode": str(args.verify_mode),
+        "only_dflash": bool(args.only_dflash),
         "out": str(output_path),
     }
 
@@ -1340,6 +1592,7 @@ def _explicit_flag_values(
         "--draft-window-size": "draft_window_size",
         "--verify-len-cap": "verify_len_cap",
         "--verify-mode": "verify_mode",
+        "--only-dflash": "only_dflash",
         "--out": "out",
     }
     seen = {option_to_name[token] for token in argv if token in option_to_name}
@@ -1361,8 +1614,8 @@ def _build_invocation(
         "output_dir": str(output_path),
         "explicit_flags": _explicit_flag_values(args, argv[1:], output_path, config),
         "effective": _controlled_flag_values(args, output_path, config),
-        "protocol_order": ["baseline", "dflash"],
-        "same_prompt_token_ids": True,
+        "protocol_order": ["dflash"] if bool(args.only_dflash) else ["baseline", "dflash"],
+        "same_prompt_token_ids": None if bool(args.only_dflash) else True,
         "primary_metric": "post_prefill_generation_tps",
     }
 

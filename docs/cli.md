@@ -89,14 +89,23 @@ Named runtime suites:
 dflash benchmark --suite humaneval --limit 10 --model Qwen/Qwen3.5-4B
 dflash benchmark --suite gsm8k --limit 10 --model Qwen/Qwen3.5-4B
 dflash benchmark --suite math500 --limit 10 --model Qwen/Qwen3.5-4B
+dflash benchmark \
+  --suite aime25 \
+  --limit 30 \
+  --shuffle \
+  --seed 42 \
+  --model mlx-community/Qwen3.6-27B-4bit \
+  --draft z-lab/Qwen3.6-27B-DFlash
 dflash benchmark --suite longctx --ctx-tokens 65536 --model Qwen/Qwen3.5-4B
 ```
 
-`humaneval`, `gsm8k`, and `math500` load real Hugging Face datasets through the
+`humaneval`, `gsm8k`, `math500`, and `aime25` load real Hugging Face datasets through the
 optional `datasets` package (`pip install 'dflash-mlx[bench]'`). They are runtime
-prompt suites, not official accuracy scoring. First use may download/cache
-dataset rows. `smoke` and `longctx` are local/offline; `smoke` is a CLI sanity
-check only, not a performance claim.
+prompt suites. `aime25` also records exact integer score fields for baseline and
+DFlash and defaults to `65536` generated tokens. First use may download/cache dataset rows. `smoke` and `longctx` are
+local/offline; `smoke` is a CLI sanity check only, not a performance claim.
+
+Use `--only-dflash` to skip the baseline MLX leg on expensive dataset runs.
 
 Offline/custom prompts:
 

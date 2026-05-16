@@ -28,6 +28,8 @@ def aggregate_prompt_reports(prompt_reports: list[dict[str, Any]]) -> dict[str, 
         for config in configs
         if config.get("prompt_tokens") is not None
     ]
+    baseline_score_values = _score_values(prompt_reports, "baseline")
+    dflash_score_values = _score_values(prompt_reports, "dflash")
     return {
         "prompt_tok_avg": (sum(prompt_tokens) / len(prompt_tokens)) if prompt_tokens else None,
         "baseline_tps_median": _median([summary.get("baseline_tps_median") for summary in summaries]),
@@ -68,6 +70,11 @@ def aggregate_prompt_reports(prompt_reports: list[dict[str, Any]]) -> dict[str, 
         "acceptance_ratio_median": _median(
             summary.get("acceptance_ratio_median") for summary in summaries
         ),
+        "baseline_score": _accuracy(baseline_score_values),
+        "baseline_correct": _correct_count(baseline_score_values),
+        "dflash_score": _accuracy(dflash_score_values),
+        "dflash_correct": _correct_count(dflash_score_values),
+        "score_count": len(dflash_score_values) or len(baseline_score_values) or None,
         "prefix_saved_tokens": None,
         "prefix_cache_stats": None,
         "prefill_tps_baseline": _median(
@@ -130,6 +137,7 @@ def suite_report(
             "draft_window_size": int(args.draft_window_size),
             "verify_len_cap": int(args.verify_len_cap),
             "verify_mode": str(args.verify_mode),
+            "only_dflash": bool(getattr(args, "only_dflash", False)),
             "prompt_tokenization_mode": "chat_template"
             if not bool(args.no_chat_template)
             else "raw",
@@ -169,6 +177,7 @@ def flatten_prompt_runs(
             row["draft_window_size"] = suite_config.get("draft_window_size")
             row["verify_len_cap"] = suite_config.get("verify_len_cap")
             row["verify_mode"] = suite_config.get("verify_mode")
+            row["only_dflash"] = suite_config.get("only_dflash")
             rows.append(row)
     return rows
 
@@ -181,6 +190,16 @@ def print_summary(result: dict[str, Any], output_path: Path) -> None:
     print(f"  baseline generation_tps median: {summary.get('baseline_tps_median')}")
     print(f"  dflash generation_tps median  : {summary.get('dflash_tps_median')}")
     print(f"  speedup median                : {summary.get('speedup_median')}")
+    if summary.get("dflash_score") is not None or summary.get("baseline_score") is not None:
+        score_count = summary.get("score_count")
+        if summary.get("baseline_correct") is None:
+            score_text = f"{summary.get('dflash_correct')}/{score_count} dflash"
+        else:
+            score_text = (
+                f"{summary.get('baseline_correct')}/{score_count} baseline / "
+                f"{summary.get('dflash_correct')}/{score_count} dflash"
+            )
+        print(f"  AIME25 score                  : {score_text}")
     print(f"  baseline prefill tok/s median : {summary.get('baseline_prefill_tok_s_median')}")
     print(
         "  dflash prefill tok/s median  : "
@@ -215,6 +234,8 @@ def summary_markdown(result: dict[str, Any]) -> str:
     ttft = summary.get("dflash_ttft_ms_median")
     peak_memory = summary.get("dflash_peak_memory_gb_median")
     acceptance = summary.get("acceptance_ratio_median")
+    baseline_score = summary.get("baseline_score")
+    dflash_score = summary.get("dflash_score")
     baseline_prefill = summary.get("baseline_prefill_tok_s_median")
     dflash_prefill_physical = summary.get("dflash_prefill_tok_s_physical_median")
     dflash_prefill_apparent = summary.get("dflash_prefill_tok_s_apparent_median")
@@ -223,7 +244,7 @@ def summary_markdown(result: dict[str, Any]) -> str:
         prompt_config = dict(prompt_report.get("config", {}))
         prompt_summary = dict(prompt_report.get("summary", {}))
         prompt_rows.append(
-            "| {id} | {tokens} | {base} | {dflash} | {speedup} | {acceptance} |".format(
+            "| {id} | {tokens} | {base} | {dflash} | {speedup} | {base_score} | {dflash_score} | {acceptance} |".format(
                 id=prompt_config.get("prompt_id"),
                 tokens=_md_value(prompt_config.get("prompt_tokens"), precision=0),
                 base=_md_value(prompt_summary.get("baseline_tps_median")),
@@ -233,21 +254,25 @@ def summary_markdown(result: dict[str, Any]) -> str:
                     if prompt_summary.get("speedup_median") is None
                     else f"{float(prompt_summary['speedup_median']):.2f}x"
                 ),
+                base_score=_md_value(prompt_summary.get("baseline_score")),
+                dflash_score=_md_value(prompt_summary.get("dflash_score")),
                 acceptance=_md_value(prompt_summary.get("acceptance_ratio_median")),
             )
         )
     lines = [
         "# DFlash Benchmark",
         "",
-        "| suite | prompts | prompt tok avg | baseline tok/s | dflash tok/s | speedup | TTFT | peak memory | acceptance | prefix saved | baseline prefill tok/s | dflash prefill physical tok/s | dflash prefill apparent tok/s |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
-        "| {suite} | {prompts} | {prompt_tok_avg} | {baseline} | {dflash} | {speedup} | {ttft} | {peak} | {acceptance} | {prefix} | {baseline_prefill} | {dflash_prefill_physical} | {dflash_prefill_apparent} |".format(
+        "| suite | prompts | prompt tok avg | baseline tok/s | dflash tok/s | speedup | baseline score | dflash score | TTFT | peak memory | acceptance | prefix saved | baseline prefill tok/s | dflash prefill physical tok/s | dflash prefill apparent tok/s |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| {suite} | {prompts} | {prompt_tok_avg} | {baseline} | {dflash} | {speedup} | {baseline_score} | {dflash_score} | {ttft} | {peak} | {acceptance} | {prefix} | {baseline_prefill} | {dflash_prefill_physical} | {dflash_prefill_apparent} |".format(
             suite=config.get("suite", config.get("benchmark_mode")),
             prompts=_md_value(config.get("prompt_count", 1), precision=0),
             prompt_tok_avg=_md_value(summary.get("prompt_tok_avg")),
             baseline=_md_value(summary.get("baseline_tps_median")),
             dflash=_md_value(summary.get("dflash_tps_median")),
             speedup=speedup_text,
+            baseline_score=_md_value(baseline_score),
+            dflash_score=_md_value(dflash_score),
             ttft=_md_value(ttft, suffix=" ms"),
             peak=_md_value(peak_memory, suffix=" GB"),
             acceptance=_md_value(acceptance),
@@ -276,18 +301,34 @@ def summary_markdown(result: dict[str, Any]) -> str:
         f"- draft_window: {config.get('draft_sink_size')}+{config.get('draft_window_size')}",
         f"- verify_len_cap: {config.get('verify_len_cap')}",
         f"- verify_mode: {config.get('verify_mode')}",
+        f"- only_dflash: {config.get('only_dflash')}",
         "",
         "## Per Prompt",
         "",
-        "| prompt id | prompt tokens | baseline tok/s | dflash tok/s | speedup | acceptance |",
-        "|---|---:|---:|---:|---:|---:|",
+        "| prompt id | prompt tokens | baseline tok/s | dflash tok/s | speedup | baseline score | dflash score | acceptance |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    lines.extend(prompt_rows or ["| n/a | n/a | n/a | n/a | n/a | n/a |"])
+    lines.extend(prompt_rows or ["| n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a |"])
     return "\n".join(lines) + "\n"
 
 def _median(values: Sequence[float | int | None]) -> float | None:
     filtered = [float(value) for value in values if value is not None]
     return statistics.median(filtered) if filtered else None
+
+def _score_values(prompt_reports: list[dict[str, Any]], side: str) -> list[bool]:
+    values: list[bool] = []
+    for report in prompt_reports:
+        for run in report.get("runs", []):
+            score = run.get(side, {}).get("score")
+            if score is not None:
+                values.append(bool(score.get("correct")))
+    return values
+
+def _accuracy(values: list[bool]) -> float | None:
+    return (sum(1 for value in values if value) / len(values)) if values else None
+
+def _correct_count(values: list[bool]) -> int | None:
+    return sum(1 for value in values if value) if values else None
 
 def _md_value(value: Any, *, suffix: str = "", precision: int = 2) -> str:
     if value is None:

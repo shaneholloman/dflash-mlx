@@ -70,6 +70,7 @@ def test_benchmark_parser_exposes_public_flags(capsys):
         "--draft-window-size",
         "--verify-len-cap",
         "--verify-mode",
+        "--only-dflash",
         "--out",
     } <= option_strings
     assert "--matrix" not in out
@@ -355,6 +356,11 @@ def _fake_hf_rows(suite: str, count: int = 5) -> list[dict[str, str]]:
         ]
     if suite == "gsm8k":
         return [{"question": f"question {idx}"} for idx in range(count)]
+    if suite == "aime25":
+        return [
+            {"id": str(idx), "problem": f"aime problem {idx}", "answer": str(idx)}
+            for idx in range(count)
+        ]
     return [
         {"problem_id": f"problem-{idx}", "problem": f"problem text {idx}"}
         for idx in range(count)
@@ -377,6 +383,11 @@ def _fake_hf_rows(suite: str, count: int = 5) -> list[dict[str, str]]:
             "math500",
             ("HuggingFaceH4/MATH-500", None, "test"),
             ["math500:problem-0", "math500:problem-1", "math500:problem-2"],
+        ),
+        (
+            "aime25",
+            ("math-ai/aime25", None, "test"),
+            ["aime25:0", "aime25:1", "aime25:2"],
         ),
     ],
 )
@@ -446,8 +457,47 @@ def test_benchmark_missing_datasets_has_clean_error(monkeypatch):
         ["--suite", "gsm8k", "--limit", "1"],
     )
 
-    with pytest.raises(RuntimeError, match="Install datasets to use --suite humaneval/gsm8k/math500"):
+    with pytest.raises(RuntimeError, match="Install datasets to use --suite humaneval/gsm8k/math500/aime25"):
         benchmark_suites.resolve_benchmark_prompts(args)
+
+def test_benchmark_aime25_prompt_keeps_expected_answer(monkeypatch):
+    monkeypatch.setattr(
+        benchmark_suites,
+        "load_hf_dataset",
+        lambda name, config, split: _fake_hf_rows("aime25", count=2),
+    )
+    parser = benchmark.build_parser()
+    args = benchmark._finalize_benchmark_args(
+        parser.parse_args(["--suite", "aime25", "--limit", "1"]),
+        ["--suite", "aime25", "--limit", "1"],
+    )
+    prompts = benchmark_suites.resolve_benchmark_prompts(args)
+
+    assert args.limit == 1
+    assert prompts[0].id == "aime25:0"
+    assert prompts[0].expected_answer == "0"
+    assert prompts[0].prompt.startswith("Solve this AIME 2025 problem.")
+    assert "aime problem 0" in prompts[0].prompt
+    assert "\\boxed{}" in prompts[0].prompt
+
+def test_benchmark_aime25_defaults_to_full_generation_budget():
+    parser = benchmark.build_parser()
+    args = benchmark._finalize_benchmark_args(
+        parser.parse_args(["--suite", "aime25", "--limit", "1"]),
+        ["--suite", "aime25", "--limit", "1"],
+    )
+    explicit = benchmark._finalize_benchmark_args(
+        parser.parse_args(["--suite", "aime25", "--limit", "1", "--max-tokens", "128"]),
+        ["--suite", "aime25", "--limit", "1", "--max-tokens", "128"],
+    )
+    smoke = benchmark._finalize_benchmark_args(
+        parser.parse_args(["--suite", "smoke"]),
+        ["--suite", "smoke"],
+    )
+
+    assert args.max_tokens == 65536
+    assert explicit.max_tokens == 128
+    assert smoke.max_tokens == 64
 
 def test_benchmark_local_suites_do_not_call_hf(monkeypatch):
     def fail(*args, **kwargs):
@@ -785,6 +835,11 @@ class _BenchmarkTokenizer:
     def encode(self, prompt):
         return [1, 2, 3]
 
+    def decode(self, tokens):
+        if isinstance(tokens, int):
+            return f"T{tokens}"
+        return "".join(f"T{token}" for token in tokens)
+
 
 class _ClosableBenchmarkStream:
     def __init__(self, events):
@@ -844,6 +899,43 @@ def _fake_dflash_result() -> dict:
         "cycles_completed": 1,
         "memory_end": {"phys_footprint_gb": 3.0, "mlx_cache_gb": 0.75},
     }
+
+
+def test_benchmark_aime25_scoring_ignores_unclosed_reasoning():
+    result = {
+        "generated_text": "<think>the answer is \\boxed{60}",
+    }
+
+    benchmark._attach_aime25_score(result, "60")
+
+    assert result["score"]["prediction"] is None
+    assert result["score"]["correct"] is False
+    assert result["scored_text_chars"] == 0
+
+
+def test_benchmark_aime25_scoring_uses_final_content_after_reasoning():
+    result = {
+        "generated_text": "<think>wrong \\boxed{10}</think>\nFinal answer: \\boxed{16}",
+    }
+
+    benchmark._attach_aime25_score(result, "016")
+
+    assert result["score"]["prediction"] == "16"
+    assert result["score"]["expected"] == "16"
+    assert result["score"]["correct"] is True
+    assert result["score"]["answer_source"] == "final_line"
+
+
+def test_benchmark_aime25_scoring_prefers_explicit_final_answer_over_prior_boxed():
+    result = {
+        "generated_text": "A false intermediate claim: \\boxed{10}\nFinal answer: 16",
+    }
+
+    benchmark._attach_aime25_score(result, "16")
+
+    assert result["score"]["prediction"] == "16"
+    assert result["score"]["correct"] is True
+    assert result["score"]["answer_source"] == "final_line"
 
 
 def test_benchmark_omits_baseline_peak_memory_when_reset_fails(monkeypatch, capsys):
@@ -963,6 +1055,76 @@ def test_benchmark_memory_summary_includes_end_breakdown():
     assert result["summary"]["dflash_peak_memory_gb_median"] == 4.0
     assert result["summary"]["baseline_memory_end_phys_footprint_gb_median"] == 2.0
     assert result["summary"]["dflash_memory_end_mlx_cache_gb_median"] == 0.75
+
+
+def test_benchmark_report_aggregates_aime25_scores():
+    parser = benchmark.build_parser()
+    args = benchmark._finalize_benchmark_args(
+        parser.parse_args(["--suite", "aime25", "--model", "m", "--only-dflash"]),
+        ["--suite", "aime25", "--model", "m", "--only-dflash"],
+    )
+    prompts = [
+        benchmark_suites.BenchmarkPrompt(
+            "aime25:0",
+            "aime25",
+            "p0",
+            "hf",
+            expected_answer="70",
+        ),
+        benchmark_suites.BenchmarkPrompt(
+            "aime25:1",
+            "aime25",
+            "p1",
+            "hf",
+            expected_answer="588",
+        ),
+    ]
+    prompt_reports = [
+        {
+            "hardware": {},
+            "config": {"prompt_id": prompts[0].id, "prompt_tokens": 3},
+            "runs": [
+                {
+                    "baseline": {},
+                    "dflash": {"score": {"correct": True}},
+                }
+            ],
+            "summary": {
+                "baseline_tps_median": None,
+                "dflash_tps_median": 10.0,
+                "dflash_score": 1.0,
+            },
+        },
+        {
+            "hardware": {},
+            "config": {"prompt_id": prompts[1].id, "prompt_tokens": 4},
+            "runs": [
+                {
+                    "baseline": {},
+                    "dflash": {"score": {"correct": True}},
+                }
+            ],
+            "summary": {
+                "baseline_tps_median": None,
+                "dflash_tps_median": 20.0,
+                "dflash_score": 1.0,
+            },
+        },
+    ]
+
+    result = benchmark_report.suite_report(
+        prompts=prompts,
+        prompt_reports=prompt_reports,
+        args=args,
+        include_memory=False,
+    )
+
+    assert result["config"]["only_dflash"] is True
+    assert result["summary"]["baseline_score"] is None
+    assert result["summary"]["baseline_correct"] is None
+    assert result["summary"]["dflash_score"] == 1.0
+    assert result["summary"]["dflash_correct"] == 2
+    assert result["summary"]["score_count"] == 2
 
 
 def test_benchmark_rejects_stale_dict_engine_event(monkeypatch):
@@ -1158,7 +1320,50 @@ def test_benchmark_dflash_path_binds_draft_before_generation(monkeypatch):
     assert bundle_calls[0]["verify_config"] is not None
     assert "split_full_attention_sdpa" not in bundle_calls[0]
     assert report["draft_meta"]["resolved_model_ref"] == "auto-draft"
-    assert report["token_match"] is True
+
+
+def test_benchmark_only_dflash_skips_pristine_baseline(monkeypatch):
+    target = object()
+    tokenizer = _BenchmarkTokenizer()
+    draft = object()
+    draft_backend = object()
+    ops = object()
+
+    def fail_pristine(_model_ref):
+        raise AssertionError("baseline should not load in --only-dflash mode")
+
+    def fake_load_runtime_bundle(**kwargs):
+        return SimpleNamespace(
+            target_model=target,
+            tokenizer=tokenizer,
+            target_meta={"resolved_model_ref": kwargs["model_ref"]},
+            draft_model=draft,
+            draft_meta={"resolved_model_ref": "auto-draft"},
+            draft_backend=draft_backend,
+            target_ops=ops,
+        )
+
+    monkeypatch.setattr(benchmark, "_load_pristine_target_bundle", fail_pristine)
+    monkeypatch.setattr(benchmark, "load_runtime_bundle", fake_load_runtime_bundle)
+    monkeypatch.setattr(benchmark, "_generate_dflash_stream_once", lambda **_kwargs: _fake_dflash_result())
+
+    report = benchmark.benchmark_once(
+        prompt="prompt",
+        max_new_tokens=1,
+        block_tokens=16,
+        use_chat_template=False,
+        target_model_ref="target",
+        draft_model_ref=None,
+        no_eos=True,
+        only_dflash=True,
+    )
+
+    assert report["config"]["only_dflash"] is True
+    assert report["runs"][0]["baseline"]["generation_tps"] is None
+    assert report["runs"][0]["baseline"]["prefill_tokens_physical"] is None
+    assert report["runs"][0]["dflash"]["generation_tps"] > 0
+    assert report["runs"][0]["speedup"] is None
+    assert report["summary"]["baseline_tps_median"] is None
 
 
 def test_benchmark_records_draft_load_dtype_in_config(monkeypatch):

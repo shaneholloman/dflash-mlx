@@ -23,12 +23,13 @@ DEFAULT_CONTEXT_SEED = (
     "DFlash benchmark long-context filler. The task is to preserve distant "
     "context while generating a concise answer at the end.\n"
 )
-SUITE_CHOICES = ("smoke", "humaneval", "gsm8k", "math500", "longctx")
+SUITE_CHOICES = ("smoke", "humaneval", "gsm8k", "math500", "aime25", "longctx")
 DEFAULT_SUITE_LIMITS = {
     "smoke": 1,
     "humaneval": 10,
     "gsm8k": 10,
     "math500": 10,
+    "aime25": 30,
     "longctx": 1,
 }
 DEFAULT_CTX_TOKENS = 8192
@@ -48,6 +49,11 @@ HF_DATASET_SUITES = {
         "config": None,
         "split": "test",
     },
+    "aime25": {
+        "name": "math-ai/aime25",
+        "config": None,
+        "split": "test",
+    },
 }
 
 @dataclass(frozen=True)
@@ -60,6 +66,7 @@ class BenchmarkPrompt:
     hf_dataset_name: str | None = None
     hf_dataset_config: str | None = None
     hf_dataset_split: str | None = None
+    expected_answer: str | None = None
 
 def ctx_tokens(args: argparse.Namespace) -> int:
     value = getattr(args, "ctx_tokens", None)
@@ -143,7 +150,7 @@ def datasets_load_dataset():
         from datasets import load_dataset
     except ImportError as exc:
         raise RuntimeError(
-            "Install datasets to use --suite humaneval/gsm8k/math500, "
+            "Install datasets to use --suite humaneval/gsm8k/math500/aime25, "
             "or use --prompt-file PATH."
         ) from exc
     return load_dataset
@@ -153,7 +160,7 @@ def load_hf_dataset(name: str, config: str | None, split: str):
         load_dataset = datasets_load_dataset()
     except ImportError as exc:
         raise RuntimeError(
-            "Install datasets to use --suite humaneval/gsm8k/math500, "
+            "Install datasets to use --suite humaneval/gsm8k/math500/aime25, "
             "or use --prompt-file PATH."
         ) from exc
     if config is None:
@@ -189,6 +196,13 @@ def _format_hf_prompt(suite: str, row_index: int, row: dict[str, Any]) -> Benchm
         stable_id = str(row.get("problem_id") or row_index)
         prompt = f"Problem: {row['problem']}\nSolution: "
         prompt_id = f"math500:{stable_id}"
+    elif suite == "aime25":
+        stable_id = str(row.get("id") or row.get("problem_idx") or row_index)
+        prompt = (
+            "Solve this AIME 2025 problem. Reason carefully, then put only the final "
+            f"integer answer in \\boxed{{}}.\n\nProblem: {row['problem']}"
+        )
+        prompt_id = f"aime25:{stable_id}"
     else:
         raise ValueError(f"unsupported HF benchmark suite: {suite}")
     return BenchmarkPrompt(
@@ -200,6 +214,7 @@ def _format_hf_prompt(suite: str, row_index: int, row: dict[str, Any]) -> Benchm
         hf_dataset_name=str(meta["name"]),
         hf_dataset_config=meta["config"],
         hf_dataset_split=str(meta["split"]),
+        expected_answer=str(row["answer"]) if suite == "aime25" else None,
     )
 
 def slugify_prompt_id(prompt: str) -> str:

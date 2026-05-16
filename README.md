@@ -95,6 +95,15 @@ dflash benchmark \
   --repeat 3 \
   --cooldown 60 \
   --no-eos
+
+# AIME25 dataset run, with baseline-vs-DFlash speed and exact-answer score
+dflash benchmark \
+  --suite aime25 \
+  --limit 30 \
+  --shuffle \
+  --seed 42 \
+  --model mlx-community/Qwen3.6-27B-4bit \
+  --draft z-lab/Qwen3.6-27B-DFlash
 ```
 
 Send a request:

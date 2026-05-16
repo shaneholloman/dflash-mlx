@@ -175,24 +175,25 @@ dflash benchmark \
   --no-eos
 ```
 
-`dflash benchmark` measures runtime behavior only. `humaneval`, `gsm8k`, and
-`math500` load real Hugging Face datasets via the optional `datasets` package,
-but they are not official accuracy evaluations. `smoke` is a local CLI sanity
-check only; `longctx` is local/offline synthetic context stress. Use
-`--prompt-file PATH` for offline/custom prompt JSONL.
+`dflash benchmark` measures runtime behavior. `humaneval`, `gsm8k`, `math500`,
+and `aime25` load real Hugging Face datasets via the optional `datasets`
+package. `aime25` also records exact integer score fields for baseline and
+DFlash and defaults to `65536` generated tokens; the other dataset suites are runtime prompt suites only. `smoke` is a
+local CLI sanity check only; `longctx` is local/offline synthetic context
+stress. Use `--prompt-file PATH` for offline/custom prompt JSONL.
 
 Flags:
 
 | Flag | Meaning |
 | --- | --- |
-| `--suite {smoke,humaneval,gsm8k,math500,longctx}` | named benchmark prompt suite |
+| `--suite {smoke,humaneval,gsm8k,math500,aime25,longctx}` | named benchmark prompt suite |
 | `--limit N` | deterministic prompt count limit |
 | `--ctx-tokens N` | synthetic context target for `longctx` |
 | `--prompt-file PATH` | JSONL prompt override with `id`, `suite`, `prompt` rows |
 | `--shuffle` | shuffle HF dataset rows before applying `--limit` |
 | `--seed INT` | shuffle seed used only with `--shuffle` |
 | `--prompt TEXT` | prompt text |
-| `--max-tokens INT` | generated token count |
+| `--max-tokens INT` | generated token count; default is `65536` for `aime25`, `64` otherwise |
 | `--block-tokens INT` | DFlash verify block size |
 | `--repeat INT` | measured runs |
 | `--cooldown SECONDS` | sleep between runs |
@@ -201,6 +202,7 @@ Flags:
 | `--no-chat-template` | raw prompt mode |
 | `--draft-quant SPEC` | draft quantization override, e.g. `w4:gs64`; use `none` to disable model defaults |
 | `--no-eos` | suppress EOS so generation reaches token cap |
+| `--only-dflash` | skip baseline MLX and run DFlash only |
 Runtime override flags:
 
 | Flag | Meaning |

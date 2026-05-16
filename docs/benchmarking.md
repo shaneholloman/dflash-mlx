@@ -27,8 +27,13 @@ Default protocol:
 6. repeat according to `--repeat`;
 7. write artifacts under `.artifacts/dflash/benchmarks/...`.
 
+Pass `--only-dflash` for long or expensive runs when you only want the DFlash
+leg. Default remains a baseline-vs-DFlash comparison.
+
 This command is for local runtime numbers and regression checks. It is not an
-agentic benchmark and not an accuracy leaderboard.
+agentic benchmark and not a general accuracy leaderboard. The `aime25` suite
+does record exact-answer score fields so speed and score can be inspected in the
+same artifact.
 
 ## Public Runtime Suites
 
@@ -38,14 +43,16 @@ agentic benchmark and not an accuracy leaderboard.
 | `humaneval` | `openai_humaneval`, split `test`, field `prompt` | 10 |
 | `gsm8k` | `gsm8k`, config `main`, split `test`, formatted as question/answer | 10 |
 | `math500` | `HuggingFaceH4/MATH-500`, split `test`, formatted as problem/solution | 10 |
+| `aime25` | `math-ai/aime25`, split `test`, exact integer answer scoring | 30 |
 | `longctx` | synthetic long-context prompt for prefill/memory/cache stress | 1 |
 
-`humaneval`, `gsm8k`, and `math500` use real Hugging Face datasets through the
-optional `datasets` package (`pip install 'dflash-mlx[bench]'`). First use may
-download or populate the local HF cache. They are still runtime prompt suites:
-they measure DFlash speed, memory, acceptance, and cache behavior on familiar
-prompt shapes. They do not report official HumanEval pass@1, GSM8K exact match,
-Math500 accuracy, or any other accuracy score.
+`humaneval`, `gsm8k`, `math500`, and `aime25` use real Hugging Face datasets
+through the optional `datasets` package (`pip install 'dflash-mlx[bench]'`).
+First use may download or populate the local HF cache. They are still runtime
+prompt suites: they measure speed, memory, acceptance, and cache behavior on
+familiar prompt shapes. `aime25` additionally records exact integer score fields
+for baseline and DFlash. The other HF suites do not report official HumanEval
+pass@1, GSM8K exact match, Math500 accuracy, or any other accuracy score.
 
 `smoke` and `longctx` remain local/offline. `smoke` exists to catch broken CLI,
 model loading, tokenizer, and artifact plumbing. Do not use it for published
@@ -56,10 +63,10 @@ performance numbers.
 | Setting | Default |
 | --- | --- |
 | suite | `smoke` |
-| prompt limit | `1` for `smoke`/`longctx`, `10` otherwise |
+| prompt limit | `1` for `smoke`/`longctx`, `30` for `aime25`, `10` otherwise |
 | target model | required via `--model` |
 | chat template | enabled |
-| generated tokens | `64` |
+| generated tokens | `64`, or `65536` for `aime25` |
 | block tokens | `16` |
 | repeat | `1` |
 | cooldown | `10` seconds |
@@ -85,14 +92,14 @@ selected row indices, and selected prompt ids.
 
 | Flag | Meaning |
 | --- | --- |
-| `--suite {smoke,humaneval,gsm8k,math500,longctx}` | named benchmark prompt suite |
+| `--suite {smoke,humaneval,gsm8k,math500,aime25,longctx}` | named benchmark prompt suite |
 | `--limit N` | deterministic prompt count limit |
 | `--ctx-tokens N` | synthetic context target for `longctx` |
 | `--prompt-file PATH` | JSONL prompt override, rows contain `id`, `suite`, `prompt` |
 | `--shuffle` | shuffle HF dataset rows before applying `--limit` |
 | `--seed INT` | shuffle seed used only with `--shuffle` |
 | `--prompt TEXT` | prompt text |
-| `--max-tokens INT` | generation length |
+| `--max-tokens INT` | generation length; default is `65536` for `aime25`, `64` otherwise |
 | `--block-tokens INT` | DFlash verify block size |
 | `--repeat INT` | measured runs |
 | `--cooldown SECONDS` | sleep between runs |
@@ -103,6 +110,7 @@ selected row indices, and selected prompt ids.
 | `--no-chat-template` | raw prompt text |
 | `--draft-quant SPEC` | draft quantization override, e.g. `w4:gs64`; use `none` to disable model defaults |
 | `--no-eos` | suppress EOS for fixed-length runs |
+| `--only-dflash` | skip the baseline MLX leg and run DFlash only |
 | `--prefill-step-size INT` | target prefill chunk size |
 | `--target-fa-window INT` | experimental target FA rotating window |
 | `--draft-sink-size INT` | draft cache sink tokens |
@@ -120,7 +128,8 @@ Each public benchmark run writes:
 - `invocation.json` - command, model refs, prompt token mode, protocol;
 - `results.json` - raw per-prompt metrics plus aggregate metrics, including
   end-of-leg `phys_footprint`, `mlx_active`, and `mlx_cache` memory breakdown
-  when available;
+  when available; `aime25` rows include `score` objects with expected answer,
+  prediction, and correctness;
 - `runs.jsonl` - per-run measurements;
 - `summary.json` - aggregate numbers;
 - `summary.md` - human-readable report.
@@ -197,6 +206,31 @@ Math500-style runtime prompts:
 dflash benchmark --suite math500 --limit 10 --model Qwen/Qwen3.5-4B
 ```
 
+AIME25 speed + score prompts:
+
+```bash
+dflash benchmark \
+  --suite aime25 \
+  --limit 30 \
+  --shuffle \
+  --seed 42 \
+  --model mlx-community/Qwen3.6-27B-4bit \
+  --draft z-lab/Qwen3.6-27B-DFlash
+```
+
+DFlash-only AIME25 run:
+
+```bash
+dflash benchmark \
+  --suite aime25 \
+  --limit 30 \
+  --shuffle \
+  --seed 42 \
+  --model mlx-community/Qwen3.6-27B-4bit \
+  --draft z-lab/Qwen3.6-27B-DFlash \
+  --only-dflash
+```
+
 Fixed-length decode:
 
 ```bash
@@ -241,7 +275,7 @@ dflash benchmark \
 ```
 
 `--prompt-file` is the offline/custom path and bypasses Hugging Face dataset
-loading even when `--suite` is `humaneval`, `gsm8k`, or `math500`.
+loading even when `--suite` is `humaneval`, `gsm8k`, `math500`, or `aime25`.
 
 Low-memory runtime check:
 
