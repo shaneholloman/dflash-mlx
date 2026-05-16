@@ -22,11 +22,8 @@ from dflash_mlx.verify_qmm import (
     _build_kernel_m16_super_tree_fp16_ktmpl,
     _build_kernel_mma2big,
     _build_kernel_mma2big_8bit,
-    _build_kernel_m4_ksplit_np,
     _build_kernel_mma2big_pipe,
     _build_kernel_mma2big_pipe_8bit,
-    _m4_ksplit_np_kparts,
-    _m4_ksplit_np_shape,
     _resolve_m16_ktmpl_variant,
 )
 
@@ -143,9 +140,7 @@ def _build_dispatch(
         ktmpl_variant is not None
         or (N % 32 == 0 and K % 32 == 0)
     )
-    m4_qmm = qmm_enabled and _m4_ksplit_np_shape(K, N, bits)
-
-    if m16_qmm or m4_qmm:
+    if m16_qmm:
         w_c = mx.contiguous(w)
         s_c = mx.contiguous(s)
         b_c = mx.contiguous(b) if b is not None else b
@@ -210,27 +205,6 @@ def _build_dispatch(
                         )
                         return y
 
-        m4_k_parts = _m4_ksplit_np_kparts(N)
-        kern_m4_bf16 = (
-            _build_kernel_m4_ksplit_np(gs, mx.bfloat16, k_parts=m4_k_parts)
-            if m4_qmm else None
-        )
-        kern_m4_fp16 = (
-            _build_kernel_m4_ksplit_np(gs, mx.float16, k_parts=m4_k_parts)
-            if m4_qmm else None
-        )
-
-        def _run_m4(x2: mx.array, kern) -> mx.array:
-            (y,) = kern(
-                inputs=[x2, w_c, s_c, b_c, K, N],
-                template=[("T", x2.dtype)],
-                grid=(32 * m4_k_parts, N // 4, 1),
-                threadgroup=(32 * m4_k_parts, 1, 1),
-                output_shapes=[(4, N)],
-                output_dtypes=[x2.dtype],
-            )
-            return y
-
         if has_bias:
             def call(x: mx.array) -> mx.array:
                 orig = x.shape
@@ -244,17 +218,6 @@ def _build_dispatch(
                         y = _run(x2, kern_bf16)
                     elif dtype == mx.float16:
                         y = _run(x2, kern_fp16)
-                    else:
-                        y = mx.quantized_matmul(x, w_c, scales=s_c, biases=b_c,
-                                                transpose=True, group_size=gs, bits=bits, mode=mode)
-                    return y.reshape(*orig[:-1], N) + bias
-                if m == 4 and m4_qmm:
-                    x2 = mx.contiguous(x.reshape(4, orig[-1]))
-                    dtype = x2.dtype
-                    if dtype == mx.bfloat16:
-                        y = _run_m4(x2, kern_m4_bf16)
-                    elif dtype == mx.float16:
-                        y = _run_m4(x2, kern_m4_fp16)
                     else:
                         y = mx.quantized_matmul(x, w_c, scales=s_c, biases=b_c,
                                                 transpose=True, group_size=gs, bits=bits, mode=mode)
@@ -275,13 +238,6 @@ def _build_dispatch(
                         return _run(x2, kern_bf16).reshape(*orig[:-1], N)
                     if dtype == mx.float16:
                         return _run(x2, kern_fp16).reshape(*orig[:-1], N)
-                if m == 4 and m4_qmm:
-                    x2 = mx.contiguous(x.reshape(4, orig[-1]))
-                    dtype = x2.dtype
-                    if dtype == mx.bfloat16:
-                        return _run_m4(x2, kern_m4_bf16).reshape(*orig[:-1], N)
-                    if dtype == mx.float16:
-                        return _run_m4(x2, kern_m4_fp16).reshape(*orig[:-1], N)
                 return mx.quantized_matmul(x, w_c, scales=s_c, biases=b_c,
                                            transpose=True, group_size=gs, bits=bits, mode=mode)
         return call
@@ -329,10 +285,6 @@ def prewarm_verify_kernels(
         dummy = mx.zeros((1, 16, K), dtype=input_dtype)
         mx.eval(m(dummy))
         warmed += 1
-        if _m4_ksplit_np_shape(K, N, m.bits):
-            dummy_m4 = mx.zeros((1, 4, K), dtype=input_dtype)
-            mx.eval(m(dummy_m4))
-            warmed += 1
     return warmed
 
 def install_verify_linears(

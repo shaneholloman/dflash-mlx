@@ -82,10 +82,10 @@ def test_mlp_real_shapes(name, M, K, N, dtype):
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("name,M,K,N", REAL_MLP_M4_SHAPES)
-def test_mlp_real_shapes_m4_ksplit_np(name, M, K, N, dtype, monkeypatch):
+def test_mlp_real_shapes_m4_stock_fallback(name, M, K, N, dtype, monkeypatch):
     monkeypatch.setenv("DFLASH_VERIFY_QMM", "1")
-    abs_tol = 8e-3 if dtype == mx.bfloat16 else 4e-3
-    rel_tol = 2e-2
+    abs_tol = 0.0
+    rel_tol = 0.0
     max_abs, max_rel, shape = _run_case(name, M, K, N, dtype, GROUP_SIZE)
     assert shape == (M, N)
     assert max_abs <= abs_tol, f"{name}[{dtype}] max_abs={max_abs:.4g} > {abs_tol}"
