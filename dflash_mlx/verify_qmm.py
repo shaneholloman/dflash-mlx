@@ -25,6 +25,12 @@ def _auto_variant(K: int, N: int) -> tuple[str, int]:
 
 _VERIFY_KERNEL_CACHE: dict[tuple, object] = {}
 
+def _m4_ksplit_np_shape(K: int, N: int, bits: int) -> bool:
+    return int(bits) == 4 and int(N) % 4 == 0 and int(K) % 32 == 0
+
+def _m4_ksplit_np_kparts(N: int) -> int:
+    return 2 if int(N) >= 4096 else 4
+
 def _m16_ktmpl_variant(K: int, N: int, bits: int) -> str | None:
     if int(bits) != 4:
         return None
@@ -43,6 +49,149 @@ def _resolve_m16_ktmpl_variant(K: int, N: int, bits: int, variant: str | None = 
     if selected in ("combo_ktmpl", "super_tree_fp16_ktmpl"):
         return selected
     return None
+
+def _build_kernel_m4_ksplit_np(
+    group_size: int,
+    dtype: mx.Dtype,
+    *,
+    k_parts: int = 4,
+):
+    key = ("m4_ksplit_np", group_size, dtype, int(k_parts))
+    if key in _VERIFY_KERNEL_CACHE:
+        return _VERIFY_KERNEL_CACHE[key]
+
+    source = f"""
+        using namespace metal;
+        constexpr int M = 4;
+        constexpr int BN = 4;
+        constexpr int K_PARTS = {int(k_parts)};
+        constexpr int GS = {group_size};
+
+        uint part = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint tg_n = threadgroup_position_in_grid.y;
+
+        int K = int(K_size);
+        int N = int(N_size);
+        int K_by_8 = K / 8;
+        int K_by_gs = K / GS;
+        int n0 = int(tg_n) * BN;
+        int packs_per_part = K_by_8 / K_PARTS;
+        int pack_start = int(part) * packs_per_part;
+        int pack_end = (int(part) == K_PARTS - 1) ? K_by_8 : pack_start + packs_per_part;
+
+        float acc[BN * M];
+        for (int i = 0; i < BN * M; ++i) {{
+            acc[i] = 0.0f;
+        }}
+
+        using Vec8 = vec<T, 8>;
+        const device Vec8 *xv = (const device Vec8*)x;
+
+        for (int pack = pack_start + int(lane); pack < pack_end; pack += 32) {{
+            int k_base = pack * 8;
+            Vec8 v0 = xv[(0 * K + k_base) / 8];
+            Vec8 v1 = xv[(1 * K + k_base) / 8];
+            Vec8 v2 = xv[(2 * K + k_base) / 8];
+            Vec8 v3 = xv[(3 * K + k_base) / 8];
+            uint32_t p0 = w_q[(n0 + 0) * K_by_8 + pack];
+            uint32_t p1 = w_q[(n0 + 1) * K_by_8 + pack];
+            uint32_t p2 = w_q[(n0 + 2) * K_by_8 + pack];
+            uint32_t p3 = w_q[(n0 + 3) * K_by_8 + pack];
+            float s0 = float(scales[(n0 + 0) * K_by_gs + (k_base / GS)]);
+            float s1 = float(scales[(n0 + 1) * K_by_gs + (k_base / GS)]);
+            float s2 = float(scales[(n0 + 2) * K_by_gs + (k_base / GS)]);
+            float s3 = float(scales[(n0 + 3) * K_by_gs + (k_base / GS)]);
+            float b0 = float(biases[(n0 + 0) * K_by_gs + (k_base / GS)]);
+            float b1 = float(biases[(n0 + 1) * K_by_gs + (k_base / GS)]);
+            float b2 = float(biases[(n0 + 2) * K_by_gs + (k_base / GS)]);
+            float b3 = float(biases[(n0 + 3) * K_by_gs + (k_base / GS)]);
+
+            {{
+                uint32_t packed = p0;
+                float s = s0;
+                float b = b0;
+                for (int ki = 0; ki < 8; ++ki) {{
+                    float wv = float((packed >> (ki * 4)) & 0xFu) * s + b;
+                    acc[0 * M + 0] += float(v0[ki]) * wv;
+                    acc[0 * M + 1] += float(v1[ki]) * wv;
+                    acc[0 * M + 2] += float(v2[ki]) * wv;
+                    acc[0 * M + 3] += float(v3[ki]) * wv;
+                }}
+            }}
+            {{
+                uint32_t packed = p1;
+                float s = s1;
+                float b = b1;
+                for (int ki = 0; ki < 8; ++ki) {{
+                    float wv = float((packed >> (ki * 4)) & 0xFu) * s + b;
+                    acc[1 * M + 0] += float(v0[ki]) * wv;
+                    acc[1 * M + 1] += float(v1[ki]) * wv;
+                    acc[1 * M + 2] += float(v2[ki]) * wv;
+                    acc[1 * M + 3] += float(v3[ki]) * wv;
+                }}
+            }}
+            {{
+                uint32_t packed = p2;
+                float s = s2;
+                float b = b2;
+                for (int ki = 0; ki < 8; ++ki) {{
+                    float wv = float((packed >> (ki * 4)) & 0xFu) * s + b;
+                    acc[2 * M + 0] += float(v0[ki]) * wv;
+                    acc[2 * M + 1] += float(v1[ki]) * wv;
+                    acc[2 * M + 2] += float(v2[ki]) * wv;
+                    acc[2 * M + 3] += float(v3[ki]) * wv;
+                }}
+            }}
+            {{
+                uint32_t packed = p3;
+                float s = s3;
+                float b = b3;
+                for (int ki = 0; ki < 8; ++ki) {{
+                    float wv = float((packed >> (ki * 4)) & 0xFu) * s + b;
+                    acc[3 * M + 0] += float(v0[ki]) * wv;
+                    acc[3 * M + 1] += float(v1[ki]) * wv;
+                    acc[3 * M + 2] += float(v2[ki]) * wv;
+                    acc[3 * M + 3] += float(v3[ki]) * wv;
+                }}
+            }}
+        }}
+
+        for (int i = 0; i < BN * M; ++i) {{
+            acc[i] = simd_sum(acc[i]);
+        }}
+
+        threadgroup float partial[K_PARTS * BN * M];
+        if (lane == 0) {{
+            for (int i = 0; i < BN * M; ++i) {{
+                partial[int(part) * BN * M + i] = acc[i];
+            }}
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (part == 0 && lane < BN * M) {{
+            float total = 0.0f;
+            for (int p = 0; p < K_PARTS; ++p) {{
+                total += partial[p * BN * M + int(lane)];
+            }}
+            int j = int(lane) / M;
+            int row = int(lane) - j * M;
+            int n_global = n0 + j;
+            if (n_global < N) {{
+                y[row * N + n_global] = T(total);
+            }}
+        }}
+    """
+
+    dtype_tag = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
+    kernel = mx.fast.metal_kernel(
+        name=f"verify_m4_ksplit_np_kp{int(k_parts)}_gs{group_size}_{dtype_tag}",
+        input_names=["x", "w_q", "scales", "biases", "K_size", "N_size"],
+        output_names=["y"],
+        source=source,
+    )
+    _VERIFY_KERNEL_CACHE[key] = kernel
+    return kernel
 
 def _build_kernel_m16_combo_ktmpl(k_val: int, group_size: int, dtype: mx.Dtype):
     key = ("m16_combo_ktmpl", int(k_val), group_size, dtype)
@@ -773,11 +922,6 @@ def verify_matmul(
     m = 1
     for d in orig_shape[:-1]:
         m *= d
-    if int(m) == 4:
-        return mx.quantized_matmul(
-            x, w, scales=scales, biases=biases,
-            transpose=transpose, group_size=group_size, bits=bits,
-        )
     x2 = mx.contiguous(x.reshape(m, orig_shape[-1]))
     w_q = mx.contiguous(w)
     scales = mx.contiguous(scales)
@@ -786,6 +930,24 @@ def verify_matmul(
     M = int(m)
     K = int(x2.shape[-1])
     N = int(w_q.shape[0])
+
+    if M == 4:
+        if not _m4_ksplit_np_shape(K, N, bits):
+            return mx.quantized_matmul(
+                x, w, scales=scales, biases=biases,
+                transpose=transpose, group_size=group_size, bits=bits,
+            )
+        k_parts = _m4_ksplit_np_kparts(N)
+        kernel = _build_kernel_m4_ksplit_np(group_size, x.dtype, k_parts=k_parts)
+        (y,) = kernel(
+            inputs=[x2, w_q, scales, biases, K, N],
+            template=[("T", x.dtype)],
+            grid=(32 * k_parts, N // 4, 1),
+            threadgroup=(32 * k_parts, 1, 1),
+            output_shapes=[(M, N)],
+            output_dtypes=[x.dtype],
+        )
+        return y.reshape(*orig_shape[:-1], N)
 
     variant = _variant()
     ktmpl_variant = _resolve_m16_ktmpl_variant(K, N, bits, variant)
