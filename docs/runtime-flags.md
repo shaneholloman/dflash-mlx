@@ -105,8 +105,8 @@ Notes:
 - L2 prefill frontiers are stored at a coarser internal stride, currently at
   least `8192` tokens, to avoid writing every prefill chunk as a large snapshot.
 - For chat-template requests with a stable assistant/model boundary, DFlash
-  stores the reusable prefill boundary and skips raw end-of-generation snapshots
-  because the next request retokenizes assistant text through the chat template.
+  stores reusable prefill snapshots and may also publish end-of-generation
+  snapshots so later agentic turns can restore deeper tool/result prefixes.
 - L2 persists admitted prefill snapshots and stores snapshots spilled from L1.
   It helps revisits after process restart or L1 eviction. It does not reduce the
   active request KV bucket.
@@ -196,7 +196,7 @@ Flags:
 | `--max-tokens INT` | generated token count; default is `65536` for `aime25`, `64` otherwise |
 | `--block-tokens INT` | DFlash verify block size |
 | `--repeat INT` | measured runs |
-| `--cooldown SECONDS` | sleep between runs |
+| `--cooldown SECONDS` | sleep between baseline/DFlash legs and repeated runs |
 | `--model REF_OR_PATH` | target model |
 | `--draft REF_OR_PATH` | draft override |
 | `--no-chat-template` | raw prompt mode |

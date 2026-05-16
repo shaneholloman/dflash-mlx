@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -32,10 +33,12 @@ from dflash_mlx.runtime.context import build_runtime_context
 
 
 class _FakeTargetOps:
-    def __init__(self) -> None:
+    def __init__(self, *, restore_delay_s: float = 0.0, restore_ns: int = 0) -> None:
         self.forward_lengths: list[int] = []
         self.logits_last_only_flags: list[bool] = []
         self.cleanup_calls = 0
+        self.restore_delay_s = float(restore_delay_s)
+        self.restore_ns = int(restore_ns)
 
     def capabilities_for(self, _target_model):
         return SimpleNamespace(supports_prefix_snapshot=True, supports_tree_verify=False)
@@ -89,7 +92,9 @@ class _FakeTargetOps:
         return logits, hidden
 
     def restore_after_acceptance(self, *_args, **_kwargs) -> int:
-        return 0
+        if self.restore_delay_s > 0:
+            time.sleep(self.restore_delay_s)
+        return self.restore_ns
 
 
 class _FakeDraftBackend:
@@ -333,7 +338,9 @@ def test_dflash_stream_tokenizes_plain_prompt_without_override():
         )
     )
 
-    prefill_event = next(event for event in events if isinstance(event, PrefillCompleteEvent))
+    prefill_event = next(
+        event for event in events if isinstance(event, PrefillCompleteEvent)
+    )
     assert tokenizer.encode_calls == ["plain"]
     assert tokenizer.template_calls == []
     assert prefill_event.prompt_token_count == 2
@@ -459,7 +466,14 @@ def test_dflash_max_ctx_fallback_accounts_for_requested_generation(monkeypatch):
     assert "projected_ctx=4" in summary_event.fallback_reason
 
 
-def _prefix_snapshot(*, token_ids=(1, 2), fa_states=(), gdn_states=(), last_logits=None):
+def _prefix_snapshot(
+    *,
+    token_ids=(1, 2),
+    fa_states=(),
+    gdn_states=(),
+    last_logits=None,
+    kind="prefill",
+):
     return DFlashPrefixSnapshot(
         token_ids=tuple(token_ids),
         fa_states=fa_states,
@@ -469,6 +483,7 @@ def _prefix_snapshot(*, token_ids=(1, 2), fa_states=(), gdn_states=(), last_logi
         target_hidden_total_len=len(token_ids),
         last_logits=last_logits,
         key=_prefix_key(),
+        kind=kind,
     )
 
 
@@ -754,6 +769,47 @@ def test_runtime_prefill_accounting_reports_warm_restore():
     assert prefill_event.physical_prefill_tokens == 4
     assert prefill_event.prefill_tokens_restored == 6
     assert prefill_event.prefill_tokens_computed == 4
+
+
+def test_generation_snapshot_restore_computes_only_prompt_tail():
+    target_ops = _FakeTargetOps()
+    draft_backend = _FakeDraftBackend()
+    draft_model = _draft_model()
+    prefix_snapshot = _prefix_snapshot(
+        token_ids=(1, 2, 0, 0, 0),
+        kind="generation",
+    )
+    snapshot_service = _snapshot_service(draft_model)
+    context = build_runtime_context(
+        runtime_config_from_defaults(
+            prefill_step_size=4,
+            prefix_cache=True,
+            prefix_cache_l2=False,
+        )
+    )
+
+    events = list(
+        spec_epoch.stream_dflash_generate_impl(
+            target_model=object(),
+            target_ops=target_ops,
+            tokenizer=object(),
+            draft_model=draft_model,
+            draft_backend=draft_backend,
+            prompt="unused",
+            max_new_tokens=0,
+            prompt_tokens_override=[1, 2, 0, 0, 0, 88, 89],
+            prefix_snapshot=prefix_snapshot,
+            snapshot_service=snapshot_service,
+            stable_prefix_len=7,
+            prefix_cache_active=True,
+            runtime_context=context,
+        )
+    )
+
+    prefill_event = next(event for event in events if isinstance(event, PrefillCompleteEvent))
+    assert target_ops.forward_lengths == [1, 1]
+    assert prefill_event.prefill_tokens_restored == 5
+    assert prefill_event.prefill_tokens_computed == 2
 
 
 def test_warm_exact_hit_skips_prefill_republish():
@@ -1221,7 +1277,7 @@ def test_request_state_preserves_decode_summary_and_generation_snapshot():
     assert snapshot.token_ids == (1, 2, 0, 0, 0)
 
 
-def test_generation_snapshot_skipped_for_truncated_stable_prefix():
+def test_generation_snapshot_published_for_truncated_stable_prefix():
     target_ops = _FakeTargetOps()
     draft_backend = _FakeDraftBackend()
     draft_model = _draft_model()
@@ -1266,14 +1322,15 @@ def test_generation_snapshot_skipped_for_truncated_stable_prefix():
         for event in events
         if isinstance(event, SnapshotPublishedEvent) and event.kind == "generation"
     ]
-    matched, snapshot = cache.lookup([1, 2, 3, 0, 0, 0, 99], key)
+    matched, snapshot = cache.lookup([1, 2, 3, 0, 0, 0, 0, 0, 0, 99], key)
 
     assert prefill_snapshot.prefix_len == 2
-    assert generation_snapshots == []
-    assert matched == 2
+    assert len(generation_snapshots) == 1
+    assert generation_snapshots[0].kind == "generation"
+    assert generation_snapshots[0].prefix_len == 9
+    assert matched == 9
     assert snapshot is not None
-    assert snapshot.kind == "prefill"
-    _assert_no_generation_chunks_retained(events)
+    assert snapshot.kind == "generation"
 
 
 def test_generation_snapshot_skipped_when_request_policy_disallows_it():
@@ -1643,7 +1700,7 @@ def test_copyspec_disables_after_full_rejection():
 
 
 def test_profile_cycle_events_disable_async_prefetch_and_match_summary():
-    target_ops = _FakeTargetOps()
+    target_ops = _FakeTargetOps(restore_delay_s=0.002, restore_ns=2_000_000)
     draft_model = _draft_model()
     draft_backend = _RecordingDraftBackend()
 
@@ -1673,6 +1730,35 @@ def test_profile_cycle_events_disable_async_prefetch_and_match_summary():
         (1, 4, 4, 3),
         (2, 2, 2, 1),
     ]
+    first_payload = cycle_events[0].to_payload()
+    assert first_payload["prefix_len"] == 2
+    assert first_payload["verify_token_count"] == 4
+    assert first_payload["draft_source"] == "dflash"
+    assert first_payload["candidate_count"] == 1
+    assert first_payload["cycle_wall_us"] >= first_payload["cycle_engine_us"]
+    assert first_payload["cycle_engine_us"] == first_payload["cycle_total_us"]
+    assert first_payload["commit_us"] >= 0.0
+    assert first_payload["rollback_us"] == pytest.approx(2_000.0)
+    assert first_payload["commit_us"] < first_payload["rollback_us"]
+    assert first_payload["yield_pause_us"] >= 0.0
+    for event in cycle_events:
+        payload = event.to_payload()
+        named_without_other = sum(
+            float(payload[key])
+            for key in (
+                "draft_us",
+                "verify_us",
+                "acceptance_us",
+                "hidden_extraction_us",
+                "commit_us",
+                "rollback_us",
+            )
+        )
+        assert named_without_other <= payload["cycle_total_us"] + 250.0
+        assert named_without_other + payload["other_us"] == pytest.approx(
+            payload["cycle_total_us"],
+            abs=250.0,
+        )
     assert summary.cycle_profile_us == tuple(cycle_events)
     assert summary.cycle_profile_totals_us is not None
     assert set(summary.cycle_profile_totals_us) == {
@@ -1680,9 +1766,12 @@ def test_profile_cycle_events_disable_async_prefetch_and_match_summary():
         "verify",
         "acceptance",
         "hidden_extraction",
+        "commit",
         "rollback",
         "other",
         "cycle_total",
+        "cycle_wall",
+        "yield_pause",
     }
 
 
@@ -1736,14 +1825,17 @@ def test_adaptive_verify_mode_drops_and_recovers_block_len():
 
     summary = next(event for event in events if isinstance(event, SummaryEvent))
 
-    assert draft_backend.calls[:76] == [(8, True)] * 4 + [(4, True)] * 64 + [(8, True)] * 8
-    assert target_ops.verify_lengths[:76] == [8] * 4 + [4] * 64 + [8] * 8
+    assert draft_backend.calls[:24] == [(8, True)] * 4 + [(4, True)] * 16 + [(8, True)] * 4
+    assert target_ops.verify_lengths[:24] == [8] * 4 + [4] * 16 + [8] * 4
     assert summary.block_tokens == 8
     assert summary.verify_len_cap == 8
-    assert summary.acceptance_history[:76] == (0,) * 4 + (3,) * 64 + (7,) * 8
+    assert summary.acceptance_history[:24] == (0,) * 4 + (3,) * 16 + (7,) * 4
     assert summary.adaptive_block_reductions == 1
-    assert summary.adaptive_block_cycles == 64
+    assert summary.adaptive_block_cycles == 16
     assert summary.adaptive_block_min == 4
+    assert summary.adaptive_metrics is not None
+    assert summary.adaptive_metrics["tokens_per_second_by_block"]["4"] > 1.0
+    assert summary.adaptive_metrics["tokens_per_second_by_block"]["8"] > 1.0
 
 
 def test_adaptive_verify_mode_starts_reduced_for_long_context():
@@ -1781,7 +1873,7 @@ def test_adaptive_verify_mode_long_context_burst_is_initial_only():
     )
     assert policy is not None
 
-    for _ in range(63):
+    for _ in range(15):
         policy.record(block_len=4, acceptance_len=3)
 
     assert policy.mode == "reduced"
@@ -1790,7 +1882,7 @@ def test_adaptive_verify_mode_long_context_burst_is_initial_only():
     assert policy.mode == "probe"
     assert policy.reduced_burst_cycles == 64
 
-    for _ in range(7):
+    for _ in range(3):
         policy.record(block_len=8, acceptance_len=4)
         assert policy.mode == "probe"
 
@@ -1805,6 +1897,36 @@ def test_adaptive_verify_mode_long_context_burst_is_initial_only():
     assert policy.reduced_burst_cycles == 64
 
 
+def test_adaptive_verify_mode_failed_early_probe_uses_full_burst_before_retry():
+    policy = spec_epoch._AdaptiveBlockPolicy.from_runtime(
+        runtime_config=_runtime_context(verify_mode="adaptive").runtime,
+        effective_block_tokens=8,
+        verify_len_cap=8,
+        prompt_len=2,
+    )
+    assert policy is not None
+
+    policy._enter_reduced()
+    for _ in range(16):
+        policy.record(block_len=4, acceptance_len=3)
+
+    assert policy.mode == "probe"
+
+    for _ in range(4):
+        policy.record(block_len=8, acceptance_len=0)
+
+    assert policy.mode == "reduced"
+    assert policy.early_probe_lockout is True
+
+    for _ in range(63):
+        policy.record(block_len=4, acceptance_len=3)
+        assert policy.mode == "reduced"
+
+    policy.record(block_len=4, acceptance_len=3)
+    assert policy.mode == "probe"
+    assert policy.probe_cycles_remaining == 8
+
+
 def test_adaptive_verify_mode_probe_falls_back_to_reduced_after_eight_low_full_cycles():
     policy = spec_epoch._AdaptiveBlockPolicy.from_runtime(
         runtime_config=_runtime_context(verify_mode="adaptive").runtime,
@@ -1814,12 +1936,12 @@ def test_adaptive_verify_mode_probe_falls_back_to_reduced_after_eight_low_full_c
     )
     assert policy is not None
 
-    for _ in range(64):
+    for _ in range(16):
         policy.record(block_len=4, acceptance_len=3)
 
     assert policy.mode == "probe"
 
-    for _ in range(7):
+    for _ in range(3):
         policy.record(block_len=8, acceptance_len=0)
         assert policy.mode == "probe"
 
@@ -1951,12 +2073,12 @@ def test_adaptive_verify_mode_probe_resumes_at_acceptance_boundary():
     )
     assert policy is not None
 
-    for _ in range(64):
+    for _ in range(16):
         policy.record(block_len=4, acceptance_len=3)
 
     assert policy.mode == "probe"
 
-    for _ in range(7):
+    for _ in range(3):
         policy.record(block_len=8, acceptance_len=4)
         assert policy.mode == "probe"
 

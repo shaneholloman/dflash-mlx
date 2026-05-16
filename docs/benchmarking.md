@@ -102,7 +102,7 @@ selected row indices, and selected prompt ids.
 | `--max-tokens INT` | generation length; default is `65536` for `aime25`, `64` otherwise |
 | `--block-tokens INT` | DFlash verify block size |
 | `--repeat INT` | measured runs |
-| `--cooldown SECONDS` | sleep between runs |
+| `--cooldown SECONDS` | sleep between baseline/DFlash legs and repeated runs |
 | `--wired-limit auto\|none\|BYTES` | MLX wired memory limit for reproducible memory runs |
 | `--cache-limit auto\|none\|BYTES` | MLX allocator cache limit; default is `4GB` for `longctx`, `auto` otherwise |
 | `--model REF_OR_PATH` | target model; required |

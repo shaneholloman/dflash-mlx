@@ -74,6 +74,14 @@ _DDTREE_MAX_BRANCH_POSITIONS = 2
 _ADAPTIVE_REDUCED_BURST_CYCLES = 64
 _ADAPTIVE_LONG_CONTEXT_REDUCED_BURST_CYCLES = 64
 _ADAPTIVE_PROBE_CYCLES = 8
+_ADAPTIVE_EARLY_PROBE_CYCLES = 4
+_ADAPTIVE_EARLY_PROBE_MIN_CYCLES = 16
+_ADAPTIVE_EARLY_PROBE_WINDOW = 8
+_ADAPTIVE_EARLY_PROBE_FULL_ACCEPTANCE = 0.75
+_ADAPTIVE_DROP_ACCEPTANCE_THRESHOLD = 0.75
+_ADAPTIVE_RESUME_ACCEPTANCE_THRESHOLD = 0.80
+_ADAPTIVE_TPC_THRESHOLD = 3.5
+_ADAPTIVE_RESUME_SPEED_RATIO = 1.0
 
 
 @dataclass(frozen=True)
@@ -146,11 +154,6 @@ class _SessionRequest:
             return False
         if self.snapshot_service is None or not self.snapshot_service.active:
             return False
-        if (
-            self.stable_prefix_len is not None
-            and 0 < int(self.stable_prefix_len) < int(self.prompt_len)
-        ):
-            return False
         return True
 
 
@@ -180,6 +183,7 @@ class _DecodeResult:
     profile_totals_ns: dict[str, int]
     copyspec_hits: int
     copyspec_tokens: int
+    adaptive_totals: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -191,9 +195,14 @@ class _AdaptiveBlockPolicy:
     long_context_prompt_tokens: int = 32768
     long_context_burst_cycles: int = _ADAPTIVE_LONG_CONTEXT_REDUCED_BURST_CYCLES
     probe_cycles: int = _ADAPTIVE_PROBE_CYCLES
-    drop_acceptance_threshold: float = 0.75
-    resume_acceptance_threshold: float = 0.80
-    tpc_threshold: float = 3.5
+    early_probe_cycles: int = _ADAPTIVE_EARLY_PROBE_CYCLES
+    early_probe_min_cycles: int = _ADAPTIVE_EARLY_PROBE_MIN_CYCLES
+    early_probe_window: int = _ADAPTIVE_EARLY_PROBE_WINDOW
+    early_probe_full_acceptance: float = _ADAPTIVE_EARLY_PROBE_FULL_ACCEPTANCE
+    drop_acceptance_threshold: float = _ADAPTIVE_DROP_ACCEPTANCE_THRESHOLD
+    resume_acceptance_threshold: float = _ADAPTIVE_RESUME_ACCEPTANCE_THRESHOLD
+    tpc_threshold: float = _ADAPTIVE_TPC_THRESHOLD
+    resume_speed_ratio: float = _ADAPTIVE_RESUME_SPEED_RATIO
     mode: Literal["full", "reduced", "probe"] = "full"
     reduced_cycles_since_probe: int = 0
     probe_cycles_remaining: int = 0
@@ -202,6 +211,22 @@ class _AdaptiveBlockPolicy:
     min_seen: int | None = None
     full_commits: deque[int] = field(default_factory=lambda: deque(maxlen=12))
     probe_commits: list[int] = field(default_factory=list)
+    probe_cost_ns: list[int] = field(default_factory=list)
+    probe_is_early: bool = False
+    early_probe_lockout: bool = False
+    reduced_commits: deque[int] = field(default_factory=lambda: deque(maxlen=32))
+    reduced_cost_ns: deque[int] = field(default_factory=lambda: deque(maxlen=32))
+    reduced_full_accepts: deque[int] = field(
+        default_factory=lambda: deque(maxlen=max(1, _ADAPTIVE_EARLY_PROBE_WINDOW))
+    )
+    stats_mode_cycles: dict[str, int] = field(default_factory=dict)
+    stats_mode_commit_tokens: dict[str, int] = field(default_factory=dict)
+    stats_mode_cost_ns: dict[str, int] = field(default_factory=dict)
+    stats_block_cycles: dict[int, int] = field(default_factory=dict)
+    stats_block_accept_tokens: dict[int, int] = field(default_factory=dict)
+    stats_block_commit_tokens: dict[int, int] = field(default_factory=dict)
+    stats_block_cost_ns: dict[int, int] = field(default_factory=dict)
+    stats_block_full_accepts: dict[int, int] = field(default_factory=dict)
 
     @classmethod
     def from_runtime(
@@ -244,32 +269,194 @@ class _AdaptiveBlockPolicy:
         tokens_per_cycle = total_commits / cycles
         return float(acceptance), float(tokens_per_cycle)
 
-    def _enter_reduced(self) -> None:
+    @staticmethod
+    def _draft_capacity(block_len: int) -> int:
+        return max(0, int(block_len) - 1)
+
+    def _enter_reduced(self, *, early_probe_lockout: bool = False) -> None:
         self.mode = "reduced"
         self.reduced_cycles_since_probe = 0
         self.reduced_burst_cycles = _ADAPTIVE_REDUCED_BURST_CYCLES
         self.probe_cycles_remaining = 0
+        self.probe_is_early = False
+        self.early_probe_lockout = bool(early_probe_lockout)
         self.probe_commits.clear()
+        self.probe_cost_ns.clear()
+        self.reduced_commits.clear()
+        self.reduced_cost_ns.clear()
+        self.reduced_full_accepts.clear()
         self.full_commits.clear()
         self.reductions += 1
 
-    def record(self, *, block_len: int, acceptance_len: int) -> None:
+    def _enter_probe(self, *, early: bool = False) -> None:
+        self.mode = "probe"
+        self.probe_is_early = bool(early)
+        if not early:
+            self.early_probe_lockout = False
+        self.probe_cycles_remaining = max(
+            1,
+            int(self.early_probe_cycles if early else self.probe_cycles),
+        )
+        self.probe_commits.clear()
+        self.probe_cost_ns.clear()
+        self.reduced_burst_cycles = _ADAPTIVE_REDUCED_BURST_CYCLES
+        self.reduced_full_accepts.clear()
+
+    def _should_probe_reduced_early(self) -> bool:
+        if self.early_probe_min_cycles <= 0:
+            return False
+        if self.early_probe_lockout:
+            return False
+        if self.reduced_cycles_since_probe < self.early_probe_min_cycles:
+            return False
+        window = max(1, int(self.early_probe_window))
+        if len(self.reduced_full_accepts) < window:
+            return False
+        full_accept_rate = sum(self.reduced_full_accepts) / float(
+            len(self.reduced_full_accepts)
+        )
+        return full_accept_rate >= self.early_probe_full_acceptance
+
+    @staticmethod
+    def _tokens_per_second(commits: Sequence[int], costs_ns: Sequence[int]) -> float:
+        cost_total = sum(int(value) for value in costs_ns)
+        if cost_total <= 0:
+            return 0.0
+        return sum(int(value) for value in commits) / (cost_total / 1_000_000_000.0)
+
+    def _record_stats(
+        self,
+        *,
+        mode: str,
+        block_len: int,
+        acceptance_len: int,
+        commit_count: int,
+        cycle_cost_ns: int | None,
+    ) -> None:
+        self.stats_mode_cycles[mode] = self.stats_mode_cycles.get(mode, 0) + 1
+        self.stats_mode_commit_tokens[mode] = (
+            self.stats_mode_commit_tokens.get(mode, 0) + int(commit_count)
+        )
+        self.stats_block_cycles[block_len] = self.stats_block_cycles.get(block_len, 0) + 1
+        self.stats_block_accept_tokens[block_len] = (
+            self.stats_block_accept_tokens.get(block_len, 0) + int(acceptance_len)
+        )
+        self.stats_block_commit_tokens[block_len] = (
+            self.stats_block_commit_tokens.get(block_len, 0) + int(commit_count)
+        )
+        if cycle_cost_ns is not None and cycle_cost_ns > 0:
+            self.stats_mode_cost_ns[mode] = (
+                self.stats_mode_cost_ns.get(mode, 0) + int(cycle_cost_ns)
+            )
+            self.stats_block_cost_ns[block_len] = (
+                self.stats_block_cost_ns.get(block_len, 0) + int(cycle_cost_ns)
+            )
+        draft_capacity = self._draft_capacity(block_len)
+        if draft_capacity > 0 and acceptance_len >= draft_capacity:
+            self.stats_block_full_accepts[block_len] = (
+                self.stats_block_full_accepts.get(block_len, 0) + 1
+            )
+
+    def metrics(self) -> dict[str, Any]:
+        mode_tpc = {
+            mode: self.stats_mode_commit_tokens.get(mode, 0) / float(cycles)
+            for mode, cycles in self.stats_mode_cycles.items()
+            if cycles
+        }
+        mode_speed = {
+            mode: (
+                self.stats_mode_commit_tokens.get(mode, 0)
+                / (self.stats_mode_cost_ns.get(mode, 0) / 1_000_000_000.0)
+                if self.stats_mode_cost_ns.get(mode, 0) > 0
+                else 0.0
+            )
+            for mode in self.stats_mode_cycles
+        }
+        block_tpc = {
+            str(block): self.stats_block_commit_tokens.get(block, 0) / float(cycles)
+            for block, cycles in self.stats_block_cycles.items()
+            if cycles
+        }
+        block_speed = {
+            str(block): (
+                self.stats_block_commit_tokens.get(block, 0)
+                / (self.stats_block_cost_ns.get(block, 0) / 1_000_000_000.0)
+                if self.stats_block_cost_ns.get(block, 0) > 0
+                else 0.0
+            )
+            for block in self.stats_block_cycles
+        }
+        block_accept = {
+            str(block): (
+                self.stats_block_accept_tokens.get(block, 0)
+                / float(self._draft_capacity(int(block)) * cycles)
+                if self._draft_capacity(int(block)) > 0 and cycles
+                else 0.0
+            )
+            for block, cycles in self.stats_block_cycles.items()
+        }
+        block_full_accept = {
+            str(block): self.stats_block_full_accepts.get(block, 0) / float(cycles)
+            for block, cycles in self.stats_block_cycles.items()
+            if cycles
+        }
+        return {
+            "reduced_burst_cycles": int(self.reduced_burst_cycles),
+            "probe_cycles": int(self.probe_cycles),
+            "early_probe_cycles": int(self.early_probe_cycles),
+            "early_probe_min_cycles": int(self.early_probe_min_cycles),
+            "early_probe_window": int(self.early_probe_window),
+            "early_probe_full_acceptance": float(self.early_probe_full_acceptance),
+            "resume_speed_ratio": float(self.resume_speed_ratio),
+            "cycles_by_mode": dict(self.stats_mode_cycles),
+            "tokens_per_cycle_by_mode": mode_tpc,
+            "tokens_per_second_by_mode": mode_speed,
+            "cycles_by_block": {str(k): int(v) for k, v in self.stats_block_cycles.items()},
+            "tokens_per_cycle_by_block": block_tpc,
+            "tokens_per_second_by_block": block_speed,
+            "acceptance_by_block": block_accept,
+            "full_accept_rate_by_block": block_full_accept,
+            "full_accepts_by_block": {
+                str(k): int(v) for k, v in self.stats_block_full_accepts.items()
+            },
+        }
+
+    def record(
+        self,
+        *,
+        block_len: int,
+        acceptance_len: int,
+        cycle_cost_ns: int | None = None,
+    ) -> None:
         block_len = int(block_len)
         acceptance_len = int(acceptance_len)
         commit_count = 1 + acceptance_len
+        self._record_stats(
+            mode=str(self.mode),
+            block_len=block_len,
+            acceptance_len=acceptance_len,
+            commit_count=commit_count,
+            cycle_cost_ns=cycle_cost_ns,
+        )
         if self.mode == "reduced" and block_len < self.full_block_tokens:
             self.reduced_cycles += 1
             self.reduced_cycles_since_probe += 1
+            self.reduced_commits.append(commit_count)
+            if cycle_cost_ns is not None and cycle_cost_ns > 0:
+                self.reduced_cost_ns.append(int(cycle_cost_ns))
             self.min_seen = (
                 block_len
                 if self.min_seen is None
                 else min(int(self.min_seen), block_len)
             )
-            if self.reduced_cycles_since_probe >= self.reduced_burst_cycles:
-                self.mode = "probe"
-                self.probe_cycles_remaining = self.probe_cycles
-                self.probe_commits.clear()
-                self.reduced_burst_cycles = _ADAPTIVE_REDUCED_BURST_CYCLES
+            draft_capacity = self._draft_capacity(block_len)
+            self.reduced_full_accepts.append(
+                1 if draft_capacity > 0 and acceptance_len >= draft_capacity else 0
+            )
+            if self._should_probe_reduced_early():
+                self._enter_probe(early=True)
+            elif self.reduced_cycles_since_probe >= self.reduced_burst_cycles:
+                self._enter_probe()
             return
 
         if block_len < self.full_block_tokens:
@@ -280,22 +467,40 @@ class _AdaptiveBlockPolicy:
             self.full_commits.popleft()
         if self.mode == "probe":
             self.probe_commits.append(commit_count)
+            if cycle_cost_ns is not None and cycle_cost_ns > 0:
+                self.probe_cost_ns.append(int(cycle_cost_ns))
             self.probe_cycles_remaining = max(0, self.probe_cycles_remaining - 1)
             if self.probe_cycles_remaining > 0:
                 return
             probe_acceptance, probe_tpc = self._window_stats(self.probe_commits)
+            reduced_speed = self._tokens_per_second(
+                tuple(self.reduced_commits),
+                tuple(self.reduced_cost_ns),
+            )
+            probe_speed = self._tokens_per_second(
+                tuple(self.probe_commits),
+                tuple(self.probe_cost_ns),
+            )
+            speed_ok = (
+                self.resume_speed_ratio <= 0.0
+                or reduced_speed <= 0.0
+                or probe_speed >= reduced_speed * self.resume_speed_ratio
+            )
             if (
                 probe_acceptance >= self.resume_acceptance_threshold
                 and probe_tpc >= self.tpc_threshold
+                and speed_ok
             ):
                 self.mode = "full"
                 self.reduced_cycles_since_probe = 0
                 self.reduced_burst_cycles = _ADAPTIVE_REDUCED_BURST_CYCLES
                 self.probe_commits.clear()
+                self.probe_cost_ns.clear()
+                self.reduced_full_accepts.clear()
                 self.full_commits.clear()
                 self.probe_cycles_remaining = 0
             else:
-                self._enter_reduced()
+                self._enter_reduced(early_probe_lockout=True)
             return
 
         if len(self.full_commits) < self.window_size:
@@ -483,7 +688,9 @@ class SpeculativeSession:
         if supports_prefix_snapshot and snapshot_service is None:
             if prefix_cache_active:
                 raise ValueError("snapshot_service is required when prefix cache is active")
-            supports_prefix_snapshot = False
+        publish_prefix_snapshots = bool(
+            supports_prefix_snapshot and snapshot_service is not None
+        )
 
         start_ns = time.perf_counter_ns()
         evt = self.memory_waterfall_event("after_target_cache_create")
@@ -552,7 +759,7 @@ class SpeculativeSession:
             )
             del feat, prefill_hidden_states
             if (
-                supports_prefix_snapshot
+                publish_prefix_snapshots
                 and snapshot_service is not None
                 and snapshot_service.should_publish_frontier(chunk_end)
                 and chunk_end < snapshot_boundary
@@ -660,7 +867,7 @@ class SpeculativeSession:
             and prefix_snapshot.last_logits is None
         ):
             raise ValueError("prefill snapshot requires last_logits")
-        if supports_prefix_snapshot and not exact_snapshot_restore:
+        if publish_prefix_snapshots and not exact_snapshot_restore:
             _snapshot_build = yield_pause.mark()
             snapshot_event = _publish_snapshot_event(
                 token_ids=list(prompt_tokens[:snapshot_boundary]),
@@ -949,9 +1156,12 @@ class SpeculativeSession:
             "verify": 0,
             "acceptance": 0,
             "hidden_extraction": 0,
+            "commit": 0,
             "rollback": 0,
             "other": 0,
             "cycle_total": 0,
+            "cycle_wall": 0,
+            "yield_pause": 0,
         }
         decode_clear_interval = (
             _DECODE_CLEAR_CACHE_INTERVAL_TOKENS if self.clear_cache_boundaries else 0
@@ -960,6 +1170,8 @@ class SpeculativeSession:
 
         while len(state.generated_token_ids) < max_new_tokens:
             cycle_start_ns = time.perf_counter_ns() if profile_cycles else 0
+            cycle_pause_start_ns = yield_pause.pause_ns if profile_cycles else 0
+            cycle_prefix_len = int(state.start)
             if (
                 decode_clear_interval > 0
                 and len(state.generated_token_ids) >= next_decode_clear_at
@@ -973,6 +1185,7 @@ class SpeculativeSession:
             replay_cycle_ns = 0
             acceptance_cycle_ns = 0
             hidden_extract_cycle_ns = 0
+            commit_cycle_ns = 0
             remaining = max_new_tokens - len(state.generated_token_ids)
             block_len = max(1, min(effective_block_tokens, remaining))
             verify_token_count = verify_token_count_for_block(block_len, verify_len_cap)
@@ -1136,6 +1349,7 @@ class SpeculativeSession:
                             collect_snapshot=collect_generation_snapshot_hidden,
                         )
                         state.last_cycle_logits = logits[:, int(accepted_slots[-1]), :]
+                        commit_cycle_ns = time.perf_counter_ns() - commit_start_ns
                         replay_cycle_ns = target_ops.restore_after_tree_acceptance(
                             target_cache,
                             accepted_tree_indices=accepted_slots,
@@ -1158,8 +1372,7 @@ class SpeculativeSession:
                                 yield_pause.done(_pre_yield)
                         replay_ns_total += replay_cycle_ns
                         state.cycles_completed += 1
-                        commit_wall_ns = time.perf_counter_ns() - commit_start_ns
-                        commit_ns_total += commit_wall_ns
+                        commit_ns_total += commit_cycle_ns
 
                         state.accepted_from_draft += acceptance_len
                         staged_first_next = mx.array([int(next_token_id)], dtype=mx.uint32)
@@ -1203,12 +1416,18 @@ class SpeculativeSession:
                         state.staged_first = staged_first_next
 
                         if profile_cycles:
-                            cycle_total_ns = time.perf_counter_ns() - cycle_start_ns
+                            cycle_wall_ns = time.perf_counter_ns() - cycle_start_ns
+                            cycle_pause_ns = max(
+                                0,
+                                yield_pause.pause_ns - cycle_pause_start_ns,
+                            )
+                            cycle_total_ns = max(0, cycle_wall_ns - cycle_pause_ns)
                             named_ns = (
                                 draft_cycle_ns
                                 + verify_cycle_ns
                                 + acceptance_cycle_ns
                                 + hidden_extract_cycle_ns
+                                + commit_cycle_ns
                                 + replay_cycle_ns
                             )
                             other_cycle_ns = max(0, cycle_total_ns - named_ns)
@@ -1217,14 +1436,20 @@ class SpeculativeSession:
                                 block_len=int(block_len),
                                 commit_count=int(commit_count),
                                 acceptance_len=int(acceptance_len),
+                                prefix_len=int(cycle_prefix_len),
                                 draft_us=ns_to_us(draft_cycle_ns),
                                 verify_us=ns_to_us(verify_cycle_ns),
                                 acceptance_us=ns_to_us(acceptance_cycle_ns),
                                 hidden_extraction_us=ns_to_us(hidden_extract_cycle_ns),
+                                commit_us=ns_to_us(commit_cycle_ns),
                                 rollback_us=ns_to_us(replay_cycle_ns),
                                 other_us=ns_to_us(other_cycle_ns),
                                 cycle_total_us=ns_to_us(cycle_total_ns),
+                                cycle_wall_us=ns_to_us(cycle_wall_ns),
+                                yield_pause_us=ns_to_us(cycle_pause_ns),
                                 verify_token_count=int(tree_inputs.size),
+                                draft_source="ddtree_tree",
+                                candidate_count=int(tree_inputs.size),
                             )
                             cycle_profiles.append(cycle_profile_entry)
                             _pre_yield = yield_pause.mark()
@@ -1234,9 +1459,12 @@ class SpeculativeSession:
                             profile_totals_ns["verify"] += verify_cycle_ns
                             profile_totals_ns["acceptance"] += acceptance_cycle_ns
                             profile_totals_ns["hidden_extraction"] += hidden_extract_cycle_ns
+                            profile_totals_ns["commit"] += commit_cycle_ns
                             profile_totals_ns["rollback"] += replay_cycle_ns
                             profile_totals_ns["other"] += other_cycle_ns
                             profile_totals_ns["cycle_total"] += cycle_total_ns
+                            profile_totals_ns["cycle_wall"] += cycle_wall_ns
+                            profile_totals_ns["yield_pause"] += cycle_pause_ns
                         continue
 
                     greedy_ids = ddtree_candidate_token_ids(
@@ -1401,6 +1629,7 @@ class SpeculativeSession:
                 collect_snapshot=collect_generation_snapshot_hidden,
             )
             state.last_cycle_logits = best.logits[:, acceptance_len, :]
+            commit_cycle_ns = time.perf_counter_ns() - commit_start_ns
             replay_cycle_ns = target_ops.restore_after_acceptance(
                 target_cache,
                 target_len=state.start,
@@ -1424,8 +1653,7 @@ class SpeculativeSession:
                     yield_pause.done(_pre_yield)
             replay_ns_total += replay_cycle_ns
             state.cycles_completed += 1
-            commit_wall_ns = time.perf_counter_ns() - commit_start_ns
-            commit_ns_total += commit_wall_ns
+            commit_ns_total += commit_cycle_ns
 
             state.accepted_from_draft += acceptance_len
             staged_first_next = best.posterior[acceptance_len : acceptance_len + 1]
@@ -1469,12 +1697,15 @@ class SpeculativeSession:
             state.staged_first = staged_first_next
 
             if profile_cycles:
-                cycle_total_ns = time.perf_counter_ns() - cycle_start_ns
+                cycle_wall_ns = time.perf_counter_ns() - cycle_start_ns
+                cycle_pause_ns = max(0, yield_pause.pause_ns - cycle_pause_start_ns)
+                cycle_total_ns = max(0, cycle_wall_ns - cycle_pause_ns)
                 named_ns = (
                     draft_cycle_ns
                     + verify_cycle_ns
                     + acceptance_cycle_ns
                     + hidden_extract_cycle_ns
+                    + commit_cycle_ns
                     + replay_cycle_ns
                 )
                 other_cycle_ns = max(0, cycle_total_ns - named_ns)
@@ -1483,14 +1714,20 @@ class SpeculativeSession:
                     block_len=int(block_len),
                     commit_count=int(commit_count),
                     acceptance_len=int(acceptance_len),
+                    prefix_len=int(cycle_prefix_len),
                     draft_us=ns_to_us(draft_cycle_ns),
                     verify_us=ns_to_us(verify_cycle_ns),
                     acceptance_us=ns_to_us(acceptance_cycle_ns),
                     hidden_extraction_us=ns_to_us(hidden_extract_cycle_ns),
+                    commit_us=ns_to_us(commit_cycle_ns),
                     rollback_us=ns_to_us(replay_cycle_ns),
                     other_us=ns_to_us(other_cycle_ns),
                     cycle_total_us=ns_to_us(cycle_total_ns),
+                    cycle_wall_us=ns_to_us(cycle_wall_ns),
+                    yield_pause_us=ns_to_us(cycle_pause_ns),
                     verify_token_count=int(verify_token_count),
+                    draft_source=str(best.source),
+                    candidate_count=len(candidate_ids_list),
                 )
                 cycle_profiles.append(cycle_profile_entry)
                 _pre_yield = yield_pause.mark()
@@ -1500,9 +1737,12 @@ class SpeculativeSession:
                 profile_totals_ns["verify"] += verify_cycle_ns
                 profile_totals_ns["acceptance"] += acceptance_cycle_ns
                 profile_totals_ns["hidden_extraction"] += hidden_extract_cycle_ns
+                profile_totals_ns["commit"] += commit_cycle_ns
                 profile_totals_ns["rollback"] += replay_cycle_ns
                 profile_totals_ns["other"] += other_cycle_ns
                 profile_totals_ns["cycle_total"] += cycle_total_ns
+                profile_totals_ns["cycle_wall"] += cycle_wall_ns
+                profile_totals_ns["yield_pause"] += cycle_pause_ns
 
         return _DecodeResult(
             effective_block_tokens=effective_block_tokens,
@@ -1653,9 +1893,12 @@ class SpeculativeSession:
             "verify": 0,
             "acceptance": 0,
             "hidden_extraction": 0,
+            "commit": 0,
             "rollback": 0,
             "other": 0,
             "cycle_total": 0,
+            "cycle_wall": 0,
+            "yield_pause": 0,
         }
         decode_clear_interval = (
             _DECODE_CLEAR_CACHE_INTERVAL_TOKENS if self.clear_cache_boundaries else 0
@@ -1663,7 +1906,10 @@ class SpeculativeSession:
         next_decode_clear_at = decode_clear_interval
 
         while len(state.generated_token_ids) < max_new_tokens:
-            cycle_start_ns = time.perf_counter_ns() if profile_cycles else 0
+            track_cycle_wall = profile_cycles or adaptive_block_policy is not None
+            cycle_start_ns = time.perf_counter_ns() if track_cycle_wall else 0
+            cycle_pause_start_ns = yield_pause.pause_ns if track_cycle_wall else 0
+            cycle_prefix_len = int(state.start)
             if (
                 decode_clear_interval > 0
                 and len(state.generated_token_ids) >= next_decode_clear_at
@@ -1676,6 +1922,7 @@ class SpeculativeSession:
             replay_cycle_ns = 0
             acceptance_cycle_ns = 0
             hidden_extract_cycle_ns = 0
+            commit_cycle_ns = 0
             remaining = max_new_tokens - len(state.generated_token_ids)
             block_limit = (
                 adaptive_block_policy.block_limit()
@@ -1847,6 +2094,7 @@ class SpeculativeSession:
                 collect_snapshot=collect_generation_snapshot_hidden,
             )
             state.last_cycle_logits = verify_logits[:, acceptance_len, :]
+            commit_cycle_ns = time.perf_counter_ns() - commit_start_ns
             replay_cycle_ns = target_ops.restore_after_acceptance(
                 target_cache,
                 target_len=state.start,
@@ -1870,8 +2118,7 @@ class SpeculativeSession:
                     yield_pause.done(_pre_yield)
             replay_ns_total += replay_cycle_ns
             state.cycles_completed += 1
-            commit_wall_ns = time.perf_counter_ns() - commit_start_ns
-            commit_ns_total += commit_wall_ns
+            commit_ns_total += commit_cycle_ns
 
             state.accepted_from_draft += acceptance_len
             if draft_source == "copyspec":
@@ -1881,9 +2128,22 @@ class SpeculativeSession:
                     state.copyspec_disabled = True
             staged_first_next = posterior[acceptance_len : acceptance_len + 1]
             if adaptive_block_policy is not None:
+                cycle_wall_ns = time.perf_counter_ns() - cycle_start_ns
+                cycle_pause_ns = max(0, yield_pause.pause_ns - cycle_pause_start_ns)
+                adaptive_cycle_cost_ns = max(0, cycle_wall_ns - cycle_pause_ns)
+                if adaptive_cycle_cost_ns <= 0:
+                    adaptive_cycle_cost_ns = (
+                        draft_cycle_ns
+                        + verify_cycle_ns
+                        + acceptance_cycle_ns
+                        + hidden_extract_cycle_ns
+                        + commit_cycle_ns
+                        + replay_cycle_ns
+                    )
                 adaptive_block_policy.record(
                     block_len=block_len,
                     acceptance_len=acceptance_len,
+                    cycle_cost_ns=adaptive_cycle_cost_ns,
                 )
             committed_ids = [int(token_id) for token_id in committed_segment.tolist()]
             self.copyspec_index.append_committed(committed_ids)
@@ -1984,12 +2244,15 @@ class SpeculativeSession:
             state.staged_first = staged_first_next
 
             if profile_cycles:
-                cycle_total_ns = time.perf_counter_ns() - cycle_start_ns
+                cycle_wall_ns = time.perf_counter_ns() - cycle_start_ns
+                cycle_pause_ns = max(0, yield_pause.pause_ns - cycle_pause_start_ns)
+                cycle_total_ns = max(0, cycle_wall_ns - cycle_pause_ns)
                 named_ns = (
                     draft_cycle_ns
                     + verify_cycle_ns
                     + acceptance_cycle_ns
                     + hidden_extract_cycle_ns
+                    + commit_cycle_ns
                     + replay_cycle_ns
                 )
                 other_cycle_ns = max(0, cycle_total_ns - named_ns)
@@ -1998,14 +2261,20 @@ class SpeculativeSession:
                     block_len=int(block_len),
                     commit_count=int(commit_count),
                     acceptance_len=int(acceptance_len),
+                    prefix_len=int(cycle_prefix_len),
                     draft_us=ns_to_us(draft_cycle_ns),
                     verify_us=ns_to_us(verify_cycle_ns),
                     acceptance_us=ns_to_us(acceptance_cycle_ns),
                     hidden_extraction_us=ns_to_us(hidden_extract_cycle_ns),
+                    commit_us=ns_to_us(commit_cycle_ns),
                     rollback_us=ns_to_us(replay_cycle_ns),
                     other_us=ns_to_us(other_cycle_ns),
                     cycle_total_us=ns_to_us(cycle_total_ns),
+                    cycle_wall_us=ns_to_us(cycle_wall_ns),
+                    yield_pause_us=ns_to_us(cycle_pause_ns),
                     verify_token_count=int(verify_token_count),
+                    draft_source=str(draft_source),
+                    candidate_count=1,
                 )
                 cycle_profiles.append(cycle_profile_entry)
                 _pre_yield = yield_pause.mark()
@@ -2015,9 +2284,12 @@ class SpeculativeSession:
                 profile_totals_ns["verify"] += verify_cycle_ns
                 profile_totals_ns["acceptance"] += acceptance_cycle_ns
                 profile_totals_ns["hidden_extraction"] += hidden_extract_cycle_ns
+                profile_totals_ns["commit"] += commit_cycle_ns
                 profile_totals_ns["rollback"] += replay_cycle_ns
                 profile_totals_ns["other"] += other_cycle_ns
                 profile_totals_ns["cycle_total"] += cycle_total_ns
+                profile_totals_ns["cycle_wall"] += cycle_wall_ns
+                profile_totals_ns["yield_pause"] += cycle_pause_ns
 
         return _DecodeResult(
             effective_block_tokens=effective_block_tokens,
@@ -2047,6 +2319,11 @@ class SpeculativeSession:
             profile_totals_ns=profile_totals_ns,
             copyspec_hits=int(state.copyspec_hits),
             copyspec_tokens=int(state.copyspec_tokens),
+            adaptive_totals=(
+                adaptive_block_policy.metrics()
+                if adaptive_block_policy is not None
+                else {}
+            ),
         )
 
     def run_events(self, request: _SessionRequest) -> Iterator[EngineEvent]:
@@ -2149,6 +2426,7 @@ class SpeculativeSession:
                 ),
                 copyspec_hits=int(decode.copyspec_hits),
                 copyspec_tokens=int(decode.copyspec_tokens),
+                adaptive_metrics=decode.adaptive_totals or None,
             )
             yield summary
         finally:

@@ -4,6 +4,7 @@
 
 import argparse
 import gc
+import hashlib
 import platform
 import re
 import shlex
@@ -376,9 +377,6 @@ def _extract_aime25_answer(text: str) -> tuple[str | None, str | None]:
     boxed = _boxed_values(content)
     if boxed:
         return _aime_normalize_answer(boxed[-1]), "boxed"
-    ints = _AIME_INT_RE.findall(content)
-    if ints:
-        return _aime_normalize_answer(ints[-1]), "last_integer"
     return None, None
 
 def _attach_aime25_score(result: dict[str, Any], expected_answer: str) -> None:
@@ -388,6 +386,10 @@ def _attach_aime25_score(result: dict[str, Any], expected_answer: str) -> None:
     expected = _aime_normalize_answer(expected_answer)
     result["generated_text_chars"] = len(generated_text)
     result["scored_text_chars"] = len(scored_text)
+    result["scored_text_sha1"] = hashlib.sha1(
+        scored_text.encode("utf-8")
+    ).hexdigest()
+    result["scored_text_tail"] = scored_text[-1000:]
     result["score"] = {
         "kind": "aime25_exact",
         "expected": expected,
@@ -426,6 +428,7 @@ def _format_run_entry(run: dict[str, Any]) -> dict[str, Any]:
         "prefill_tokens_restored": _int_or_none(dflash.get("prefill_tokens_restored")),
         "prefill_tokens_computed": _int_or_none(dflash.get("prefill_tokens_computed")),
         "logical_ctx_tokens": dflash_logical_prefill_tokens,
+        "accepted_from_draft": _int_or_none(dflash.get("accepted_from_draft")),
         "tokens_per_cycle": float(dflash.get("tokens_per_cycle", 0.0)),
         "cycles": int(dflash.get("cycles_completed", 0)),
         "acceptance_ratio": float(dflash.get("acceptance_ratio", 0.0)),
@@ -445,6 +448,8 @@ def _format_run_entry(run: dict[str, Any]) -> dict[str, Any]:
         baseline["score"] = dict(baseline["score"])
     if dflash.get("score") is not None:
         dflash_entry["score"] = dict(dflash["score"])
+    if dflash.get("adaptive_metrics") is not None:
+        dflash_entry["adaptive_metrics"] = dict(dflash["adaptive_metrics"])
     if baseline.get("generated_text_chars") is not None:
         baseline["generated_text_chars"] = int(baseline["generated_text_chars"])
     if baseline.get("scored_text_chars") is not None:
@@ -1013,6 +1018,7 @@ def _run_once_sequential(
     verify_len_cap: int | None = None,
     verify_mode: str | None = None,
     expected_answer: str | None = None,
+    cooldown: int = 0,
     only_dflash: bool = False,
 ) -> dict[str, Any]:
     capture_text = expected_answer is not None
@@ -1053,6 +1059,8 @@ def _run_once_sequential(
             del pristine_target_model
             del pristine_tokenizer
             _release_loaded_models()
+        if cooldown > 0:
+            time.sleep(cooldown)
 
     target_model = None
     tokenizer = None
@@ -1088,10 +1096,11 @@ def _run_once_sequential(
         if prompt_tokens is None:
             prompt_tokens = dflash_prompt_tokens
         else:
-            assert prompt_tokens == dflash_prompt_tokens, (
-                f"Tokenizer drift between pristine and DFlash bundles: "
-                f"{len(prompt_tokens)} vs {len(dflash_prompt_tokens)} tokens"
-            )
+            if prompt_tokens != dflash_prompt_tokens:
+                raise ValueError(
+                    "Tokenizer drift between pristine and DFlash bundles: "
+                    f"{len(prompt_tokens)} vs {len(dflash_prompt_tokens)} tokens"
+                )
         dflash_eos_token_ids = get_stop_token_ids(tokenizer)
         dflash_stop_token_ids = [] if no_eos else dflash_eos_token_ids
         dflash_suppress_token_ids = dflash_eos_token_ids if no_eos else None
@@ -1205,6 +1214,7 @@ def benchmark_once(
         draft_quant=draft_quant,
         no_eos=no_eos,
         expected_answer=expected_answer,
+        cooldown=cooldown,
         only_dflash=only_dflash,
         **runtime_values,
     )
@@ -1277,6 +1287,7 @@ def benchmark_repeated(
             draft_quant=draft_quant,
             no_eos=no_eos,
             expected_answer=expected_answer,
+            cooldown=cooldown,
             only_dflash=only_dflash,
             **runtime_values,
         )
@@ -1455,7 +1466,7 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         metavar="SECONDS",
         type=int,
         default=10,
-        help="Sleep between measured runs. Default: 10.",
+        help="Sleep between baseline/DFlash legs and repeated measured runs. Default: 10.",
     )
     parser.add_argument(
         "--wired-limit",

@@ -28,7 +28,6 @@ from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
 from dflash_mlx.server.prefix_cache_flow import (
     compute_request_stable_prefix_len,
     compute_stable_prefix_len,
-    publish_generation_snapshots_for_request,
 )
 
 def _make_kv_cache_populated(n_tokens: int = 4, hkv: int = 2, d: int = 8) -> KVCache:
@@ -1237,17 +1236,6 @@ class TestStablePrefixLen:
                 request=request,
             )
             == 5
-        )
-
-    def test_tool_enabled_chat_disables_generation_snapshots(self):
-        assert not publish_generation_snapshots_for_request(
-            SimpleNamespace(request_type="chat", tools=[{"type": "function"}])
-        )
-        assert publish_generation_snapshots_for_request(
-            SimpleNamespace(request_type="chat", tools=[])
-        )
-        assert publish_generation_snapshots_for_request(
-            SimpleNamespace(request_type="completion", tools=[{"type": "function"}])
         )
 
 class TestPrefixPruning:

@@ -1,0 +1,63 @@
+{
+  "argv": [
+    "dflash benchmark",
+    "--model",
+    "mlx-community/Qwen3.6-27B-4bit",
+    "--max-tokens",
+    "1024",
+    "--repeat",
+    "3",
+    "--cooldown",
+    "120",
+    "--no-eos",
+    "--out",
+    "benchmark/results/qwen3-6-27b-4bit-readme-1k-2k-4k-8k-16k-20260517/tokens_1024"
+  ],
+  "command": "dflash benchmark --model mlx-community/Qwen3.6-27B-4bit --max-tokens 1024 --repeat 3 --cooldown 120 --no-eos --out benchmark/results/qwen3-6-27b-4bit-readme-1k-2k-4k-8k-16k-20260517/tokens_1024",
+  "effective": {
+    "block_tokens": 16,
+    "cache_limit": "auto",
+    "cooldown": 120,
+    "ctx_tokens": 0,
+    "draft": "z-lab/Qwen3.6-27B-DFlash",
+    "draft_quant": "w4",
+    "draft_sink_size": 64,
+    "draft_window_size": 1024,
+    "include_memory": true,
+    "limit": 1,
+    "max_tokens": 1024,
+    "model": "mlx-community/Qwen3.6-27B-4bit",
+    "no_eos": true,
+    "no_memory": false,
+    "only_dflash": false,
+    "out": "benchmark/results/qwen3-6-27b-4bit-readme-1k-2k-4k-8k-16k-20260517/tokens_1024",
+    "prefill_step_size": 2048,
+    "prompt": null,
+    "prompt_file": null,
+    "repeat": 3,
+    "seed": 0,
+    "shuffle": false,
+    "suite": "smoke",
+    "target_fa_window": 0,
+    "use_chat_template": true,
+    "verify_len_cap": 0,
+    "verify_mode": "adaptive",
+    "wired_limit": "auto"
+  },
+  "explicit_flags": {
+    "cooldown": 120,
+    "max_tokens": 1024,
+    "model": "mlx-community/Qwen3.6-27B-4bit",
+    "no_eos": true,
+    "out": "benchmark/results/qwen3-6-27b-4bit-readme-1k-2k-4k-8k-16k-20260517/tokens_1024",
+    "repeat": 3
+  },
+  "output_dir": "benchmark/results/qwen3-6-27b-4bit-readme-1k-2k-4k-8k-16k-20260517/tokens_1024",
+  "output_path": "benchmark/results/qwen3-6-27b-4bit-readme-1k-2k-4k-8k-16k-20260517/tokens_1024",
+  "primary_metric": "post_prefill_generation_tps",
+  "protocol_order": [
+    "baseline",
+    "dflash"
+  ],
+  "same_prompt_token_ids": true
+}

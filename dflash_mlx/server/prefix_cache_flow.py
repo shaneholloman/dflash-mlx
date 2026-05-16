@@ -58,13 +58,6 @@ def compute_request_stable_prefix_len(
         boundary_offset=boundary_offset,
     )
 
-def publish_generation_snapshots_for_request(request: Any = None) -> bool:
-    if getattr(request, "request_type", None) != "chat":
-        return True
-    tools = getattr(request, "tools", None)
-    return not bool(tools)
-
-
 def _last_chat_role(request: Any) -> str | None:
     if getattr(request, "request_type", None) != "chat":
         return None
@@ -167,7 +160,7 @@ class PrefixCacheFlow:
             cache_manager=cache_manager,
             key=key,
             stable_prefix_len=stable_prefix_len,
-            publish_generation_snapshot=publish_generation_snapshots_for_request(request),
+            publish_generation_snapshot=True,
             snapshot=lookup.snapshot,
             lookup_ms=lookup.elapsed_ms,
             hit_tokens=hit_tokens,

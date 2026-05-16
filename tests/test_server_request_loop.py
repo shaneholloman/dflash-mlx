@@ -381,7 +381,7 @@ def test_server_runtime_routes_tool_chat_generation_snapshot_policy(monkeypatch)
         snapshot_service=object(),
         stable_prefix_len=3,
         cache_active=True,
-        publish_generation_snapshot=False,
+        publish_generation_snapshot=True,
         insert_ms=0.0,
         prefix_cache_memory_bytes=lambda: None,
     )
@@ -471,7 +471,7 @@ def test_server_runtime_routes_tool_chat_generation_snapshot_policy(monkeypatch)
         ),
     )
 
-    assert captured["publish_generation_snapshot"] is False
+    assert captured["publish_generation_snapshot"] is True
     assert captured["prefix_snapshot"] is prefix_flow.snapshot
     assert captured["snapshot_service"] is prefix_flow.snapshot_service
     assert captured["stable_prefix_len"] == 3

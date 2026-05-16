@@ -96,6 +96,7 @@ class _RequestAccounting:
     adaptive_block_reductions: int = 0
     adaptive_block_cycles: int = 0
     adaptive_block_min: Optional[int] = None
+    adaptive_metrics: Optional[dict[str, Any]] = None
     copyspec_hits: int = 0
     copyspec_tokens: int = 0
     finish_reason: Optional[str] = None
@@ -107,6 +108,7 @@ class _RequestAccounting:
     prefill_accounting: Optional[dict[str, int]] = None
     prefill_phase_timings_us: Optional[dict[str, float]] = None
     phase_timings_us: Optional[dict[str, float]] = None
+    cycle_profile_totals_us: Optional[dict[str, float]] = None
     runtime_config: Optional[dict[str, Any]] = None
     memory_waterfall_peak: Optional[dict[str, Any]] = None
     memory_waterfall_start: Optional[dict[str, Any]] = None
@@ -190,8 +192,19 @@ class _RequestAccounting:
         adaptive_block_min = (
             summary_event.adaptive_block_min if summary_event is not None else None
         )
+        adaptive_metrics = (
+            dict(summary_event.adaptive_metrics)
+            if summary_event is not None and summary_event.adaptive_metrics
+            else {}
+        )
         copyspec_hits = int(summary_event.copyspec_hits if summary_event else 0)
         copyspec_tokens = int(summary_event.copyspec_tokens if summary_event else 0)
+        cycle_profile_totals_us = (
+            dict(summary_event.cycle_profile_totals_us)
+            if summary_event is not None
+            and summary_event.cycle_profile_totals_us is not None
+            else {}
+        )
         prefill_phase_timings_us = _prefill_phase_timings(prefill_event)
         prefill_accounting = _prefill_accounting(prefill_event)
         runtime_config_payload = _runtime_config_payload(runtime_config)
@@ -245,6 +258,7 @@ class _RequestAccounting:
             adaptive_block_reductions=adaptive_block_reductions,
             adaptive_block_cycles=adaptive_block_cycles,
             adaptive_block_min=adaptive_block_min,
+            adaptive_metrics=adaptive_metrics,
             copyspec_hits=copyspec_hits,
             copyspec_tokens=copyspec_tokens,
             finish_reason=finish_reason,
@@ -259,6 +273,7 @@ class _RequestAccounting:
             prefill_accounting=dict(prefill_accounting),
             prefill_phase_timings_us=dict(prefill_phase_timings_us),
             phase_timings_us=dict(summary_event.phase_timings_us if summary_event else {}),
+            cycle_profile_totals_us=cycle_profile_totals_us,
             runtime_config=runtime_config_payload,
             memory_waterfall_peak=dict(memory_waterfall_peak or {}),
             memory_waterfall_start=dict(memory_waterfall_start or {}),
@@ -314,6 +329,10 @@ class _RequestAccounting:
             prefill_phase_timings_us=self.prefill_phase_timings_us,
             phase_timings_us=self.phase_timings_us,
         )
+        if self.cycle_profile_totals_us:
+            payload["cycle_profile_totals_us"] = dict(self.cycle_profile_totals_us)
+        if self.adaptive_metrics:
+            payload["adaptive_metrics"] = dict(self.adaptive_metrics)
         payload["mode_used"] = self.mode_used
         payload["max_tokens"] = int(self.max_tokens)
         return payload
@@ -349,6 +368,7 @@ class _RequestAccounting:
                 "adaptive_block_reductions": int(self.adaptive_block_reductions),
                 "adaptive_block_cycles": int(self.adaptive_block_cycles),
                 "adaptive_block_min": self.adaptive_block_min,
+                "adaptive_metrics": dict(self.adaptive_metrics or {}),
                 "copyspec_hits": int(self.copyspec_hits),
                 "copyspec_tokens": int(self.copyspec_tokens),
                 "finish_reason": self.finish_reason,
@@ -357,6 +377,7 @@ class _RequestAccounting:
                 **dict(self.prefill_accounting or {}),
                 "prefill_phase_timings_us": dict(self.prefill_phase_timings_us or {}),
                 "phase_timings_us": dict(self.phase_timings_us or {}),
+                "cycle_profile_totals_us": dict(self.cycle_profile_totals_us or {}),
                 "runtime_config": dict(self.runtime_config or {}),
                 "memory_waterfall_peak": dict(self.memory_waterfall_peak or {}),
                 "memory_waterfall_start": dict(self.memory_waterfall_start or {}),

@@ -173,7 +173,9 @@ def _summary_event(
     adaptive_block_min: int | None = None,
     copyspec_hits: int = 0,
     copyspec_tokens: int = 0,
+    adaptive_metrics: dict[str, object] | None = None,
     phase_timings_us: dict[str, float] | None = None,
+    cycle_profile_totals_us: dict[str, float] | None = None,
     elapsed_us: float = 0.0,
 ) -> SummaryEvent:
     return SummaryEvent(
@@ -191,6 +193,8 @@ def _summary_event(
         adaptive_block_min=adaptive_block_min,
         copyspec_hits=copyspec_hits,
         copyspec_tokens=copyspec_tokens,
+        adaptive_metrics=adaptive_metrics,
+        cycle_profile_totals_us=cycle_profile_totals_us,
     )
 
 
@@ -844,6 +848,7 @@ def test_metrics_endpoint_reports_last_request_and_prefix_cache(monkeypatch):
             adaptive_block_reductions=2,
             adaptive_block_cycles=19,
             adaptive_block_min=4,
+            adaptive_metrics={"cycles_by_block": {"4": 19, "16": 25}},
             copyspec_hits=3,
             copyspec_tokens=12,
             phase_timings_us={
@@ -851,6 +856,11 @@ def test_metrics_endpoint_reports_last_request_and_prefix_cache(monkeypatch):
                 "draft": 300_000.0,
                 "verify": 400_000.0,
                 "replay": 50_000.0,
+            },
+            cycle_profile_totals_us={
+                "cycle_total": 900_000.0,
+                "cycle_wall": 910_000.0,
+                "yield_pause": 10_000.0,
             },
         ),
         request_start_ns=0,
@@ -898,6 +908,7 @@ def test_metrics_endpoint_reports_last_request_and_prefix_cache(monkeypatch):
     assert last["adaptive_block_reductions"] == 2
     assert last["adaptive_block_cycles"] == 19
     assert last["adaptive_block_min"] == 4
+    assert last["adaptive_metrics"] == {"cycles_by_block": {"4": 19, "16": 25}}
     assert last["copyspec_hits"] == 3
     assert last["copyspec_tokens"] == 12
     assert last["finish_reason"] == "stop"
@@ -906,6 +917,11 @@ def test_metrics_endpoint_reports_last_request_and_prefix_cache(monkeypatch):
         "draft": 300_000.0,
         "verify": 400_000.0,
         "replay": 50_000.0,
+    }
+    assert last["cycle_profile_totals_us"] == {
+        "cycle_total": 900_000.0,
+        "cycle_wall": 910_000.0,
+        "yield_pause": 10_000.0,
     }
     assert last["prefill_phase_timings_us"] == {}
     assert payload["prefix_cache"]["hits"] == 3
@@ -926,6 +942,14 @@ def test_metrics_endpoint_reports_last_request_and_prefix_cache(monkeypatch):
     assert payload["recent_requests"][0]["request_id"] == 12
     assert payload["recent_requests"][0]["cache_status"] == "WARM"
     assert payload["recent_requests"][0]["adaptive_block_cycles"] == 19
+    assert payload["recent_requests"][0]["adaptive_metrics"] == {
+        "cycles_by_block": {"4": 19, "16": 25}
+    }
+    assert payload["recent_requests"][0]["cycle_profile_totals_us"] == {
+        "cycle_total": 900_000.0,
+        "cycle_wall": 910_000.0,
+        "yield_pause": 10_000.0,
+    }
     assert payload["recent_requests"][0]["tokens_per_cycle"] == 2.27
 
 

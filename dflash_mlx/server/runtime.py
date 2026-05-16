@@ -351,7 +351,7 @@ def _print_startup_banner(
     thinking_enabled = bool(
         chat_template_args.get(
             "enable_thinking",
-            getattr(model_provider.tokenizer, "has_thinking", False),
+            getattr(getattr(model_provider, "tokenizer", None), "has_thinking", False),
         )
     )
     fastpath_max_tokens = int(

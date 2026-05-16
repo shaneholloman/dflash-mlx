@@ -1260,6 +1260,40 @@ class TestContextConfigExposedCorrectly:
         assert flow.snapshot is snap
         assert flow.stable_prefix_len == len(prompt)
 
+    def test_prefix_flow_keeps_generation_snapshots_for_tool_chat(self, monkeypatch):
+        import dflash_mlx.server.prefix_cache_flow as flow_mod
+
+        cache = DFlashPrefixCache(max_entries=4)
+        key = _make_key(
+            target_model_id="target/x",
+            draft_model_id="draft/y",
+            capture_layer_ids=(3, 7),
+        )
+        prompt = [11, 12, 13, 14]
+
+        monkeypatch.setattr(
+            flow_mod,
+            "get_runtime_cache_manager",
+            lambda _runtime_context, *, cache_identity=None: _manager(cache),
+        )
+        monkeypatch.setattr(flow_mod, "build_prefix_key", lambda *_args: key)
+
+        flow = flow_mod.PrefixCacheFlow.for_request(
+            model_provider=_FakeLoadedProvider(),
+            draft_model=_FakeDraft(),
+            tokenizer=_FakeTokenizer(),
+            prompt=prompt,
+            request=SimpleNamespace(
+                request_type="chat",
+                messages=[{"role": "tool", "content": "result"}],
+                tools=[{"type": "function"}],
+            ),
+            runtime_context=_runtime_context(prefix_cache=True),
+        )
+
+        assert flow.cache_active
+        assert flow.publish_generation_snapshot is True
+
     def test_prefix_flow_keeps_lookup_hit_when_log_stats_manager_retires(self, monkeypatch):
         import dflash_mlx.server.prefix_cache_flow as flow_mod
 

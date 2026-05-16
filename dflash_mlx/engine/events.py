@@ -102,8 +102,19 @@ class CycleCompleteEvent:
     other_us: float
     cycle_total_us: float
     verify_token_count: int | None = None
+    commit_us: float = 0.0
+    cycle_wall_us: float | None = None
+    yield_pause_us: float = 0.0
+    prefix_len: int | None = None
+    draft_source: str | None = None
+    candidate_count: int | None = None
 
     def to_payload(self) -> dict[str, Any]:
+        cycle_wall_us = (
+            float(self.cycle_wall_us)
+            if self.cycle_wall_us is not None
+            else float(self.cycle_total_us)
+        )
         payload: dict[str, Any] = {
             "cycle": int(self.cycle),
             "block_len": int(self.block_len),
@@ -113,12 +124,22 @@ class CycleCompleteEvent:
             "verify_us": float(self.verify_us),
             "acceptance_us": float(self.acceptance_us),
             "hidden_extraction_us": float(self.hidden_extraction_us),
+            "commit_us": float(self.commit_us),
             "rollback_us": float(self.rollback_us),
             "other_us": float(self.other_us),
             "cycle_total_us": float(self.cycle_total_us),
+            "cycle_engine_us": float(self.cycle_total_us),
+            "cycle_wall_us": cycle_wall_us,
+            "yield_pause_us": float(self.yield_pause_us),
         }
+        if self.prefix_len is not None:
+            payload["prefix_len"] = int(self.prefix_len)
         if self.verify_token_count is not None:
             payload["verify_token_count"] = int(self.verify_token_count)
+        if self.draft_source is not None:
+            payload["draft_source"] = str(self.draft_source)
+        if self.candidate_count is not None:
+            payload["candidate_count"] = int(self.candidate_count)
         return payload
 
 
@@ -158,6 +179,7 @@ class SummaryEvent:
     fallback_reason: str | None = None
     copyspec_hits: int = 0
     copyspec_tokens: int = 0
+    adaptive_metrics: dict[str, Any] | None = None
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -198,6 +220,9 @@ class SummaryEvent:
             ),
             "copyspec_hits": self.copyspec_hits or None,
             "copyspec_tokens": self.copyspec_tokens or None,
+            "adaptive_metrics": (
+                dict(self.adaptive_metrics) if self.adaptive_metrics else None
+            ),
         }
         payload.update({key: value for key, value in optional.items() if value is not None})
         if self.fallback_ar:

@@ -126,8 +126,12 @@ runtime config.
 : Prefix-cache lookup, hit/miss, prune, eviction, and snapshot events.
 
 `cycle_events.jsonl`
-: Per-cycle engine events. In full mode this includes cycle timing and memory
-waterfall samples.
+: Per-cycle engine events. In full mode this includes block length, prefix
+length, committed tokens, acceptance length, verify token count, draft source,
+and timing fields. `cycle_total_us` is engine wall time with stream/yield pause
+removed; `cycle_wall_us` is raw wall time; `yield_pause_us` is the removed
+pause; `other_us` is the non-attributed engine overhead after draft, verify,
+acceptance, hidden extraction, commit, and rollback.
 
 `post_events.jsonl`
 : Per-request summary events. These include request ids, prompt length, token

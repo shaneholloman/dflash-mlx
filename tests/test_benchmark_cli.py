@@ -924,6 +924,8 @@ def test_benchmark_aime25_scoring_uses_final_content_after_reasoning():
     assert result["score"]["expected"] == "16"
     assert result["score"]["correct"] is True
     assert result["score"]["answer_source"] == "final_line"
+    assert result["scored_text_sha1"]
+    assert "Final answer" in result["scored_text_tail"]
 
 
 def test_benchmark_aime25_scoring_prefers_explicit_final_answer_over_prior_boxed():
@@ -936,6 +938,18 @@ def test_benchmark_aime25_scoring_prefers_explicit_final_answer_over_prior_boxed
     assert result["score"]["prediction"] == "16"
     assert result["score"]["correct"] is True
     assert result["score"]["answer_source"] == "final_line"
+
+
+def test_benchmark_aime25_scoring_requires_explicit_answer():
+    result = {
+        "generated_text": "I checked 15 cases and then 16 cases, but did not finalize.",
+    }
+
+    benchmark._attach_aime25_score(result, "16")
+
+    assert result["score"]["prediction"] is None
+    assert result["score"]["correct"] is False
+    assert result["score"]["answer_source"] is None
 
 
 def test_benchmark_omits_baseline_peak_memory_when_reset_fails(monkeypatch, capsys):
@@ -1173,9 +1187,15 @@ def test_summary_event_keeps_cycle_profile_typed_until_serialization():
         verify_us=2.0,
         acceptance_us=3.0,
         hidden_extraction_us=4.0,
+        commit_us=7.0,
         rollback_us=5.0,
         other_us=6.0,
         cycle_total_us=21.0,
+        cycle_wall_us=25.0,
+        yield_pause_us=4.0,
+        prefix_len=128,
+        draft_source="dflash",
+        candidate_count=1,
     )
     summary = SummaryEvent(
         elapsed_us=1_000_000.0,
@@ -1190,7 +1210,13 @@ def test_summary_event_keeps_cycle_profile_typed_until_serialization():
     )
 
     assert summary.cycle_profile_us == (cycle,)
-    assert summary.to_payload()["cycle_profile_us"] == [cycle.to_payload()]
+    payload = summary.to_payload()
+    assert payload["cycle_profile_us"] == [cycle.to_payload()]
+    assert payload["cycle_profile_us"][0]["cycle_engine_us"] == 21.0
+    assert payload["cycle_profile_us"][0]["cycle_wall_us"] == 25.0
+    assert payload["cycle_profile_us"][0]["yield_pause_us"] == 4.0
+    assert payload["cycle_profile_us"][0]["prefix_len"] == 128
+    assert payload["cycle_profile_us"][0]["draft_source"] == "dflash"
 
 
 def test_benchmark_cleanup_failure_is_reported(monkeypatch, capsys):
@@ -1366,6 +1392,145 @@ def test_benchmark_only_dflash_skips_pristine_baseline(monkeypatch):
     assert report["summary"]["baseline_tps_median"] is None
 
 
+def test_benchmark_cooldown_applies_between_baseline_and_dflash(monkeypatch):
+    events: list[str] = []
+    target, tokenizer, target_meta = _patch_benchmark_target(monkeypatch)
+
+    def fake_baseline(**_kwargs):
+        events.append("baseline")
+        return _fake_baseline_result()
+
+    def fake_sleep(seconds):
+        events.append(f"sleep:{seconds}")
+
+    def fake_load_runtime_bundle(**_kwargs):
+        events.append("load_dflash")
+        return SimpleNamespace(
+            target_model=target,
+            tokenizer=tokenizer,
+            target_meta=target_meta,
+            draft_model=_BindableBenchmarkDraft(),
+            draft_meta={"resolved_model_ref": "auto-draft"},
+            draft_backend=object(),
+            target_ops=object(),
+        )
+
+    def fake_dflash(**_kwargs):
+        events.append("dflash")
+        return _fake_dflash_result()
+
+    monkeypatch.setattr(benchmark, "_generate_stock_baseline_once", fake_baseline)
+    monkeypatch.setattr(benchmark.time, "sleep", fake_sleep)
+    monkeypatch.setattr(benchmark, "load_runtime_bundle", fake_load_runtime_bundle)
+    monkeypatch.setattr(benchmark, "_generate_dflash_stream_once", fake_dflash)
+
+    report = benchmark.benchmark_once(
+        prompt="prompt",
+        max_new_tokens=1,
+        block_tokens=16,
+        use_chat_template=False,
+        target_model_ref="target",
+        draft_model_ref=None,
+        no_eos=True,
+        cooldown=60,
+    )
+
+    assert events == ["baseline", "sleep:60", "load_dflash", "dflash"]
+    assert report["config"]["cooldown"] == 60
+
+
+def test_benchmark_cooldown_applies_between_repeats(monkeypatch):
+    events: list[str] = []
+    target, tokenizer, target_meta = _patch_benchmark_target(monkeypatch)
+
+    monkeypatch.setattr(
+        benchmark,
+        "_generate_stock_baseline_once",
+        lambda **_kwargs: events.append("baseline") or _fake_baseline_result(),
+    )
+    monkeypatch.setattr(
+        benchmark.time,
+        "sleep",
+        lambda seconds: events.append(f"sleep:{seconds}"),
+    )
+    monkeypatch.setattr(
+        benchmark,
+        "load_runtime_bundle",
+        lambda **_kwargs: events.append("load_dflash")
+        or SimpleNamespace(
+            target_model=target,
+            tokenizer=tokenizer,
+            target_meta=target_meta,
+            draft_model=_BindableBenchmarkDraft(),
+            draft_meta={"resolved_model_ref": "auto-draft"},
+            draft_backend=object(),
+            target_ops=object(),
+        ),
+    )
+    monkeypatch.setattr(
+        benchmark,
+        "_generate_dflash_stream_once",
+        lambda **_kwargs: events.append("dflash") or _fake_dflash_result(),
+    )
+
+    benchmark.benchmark_repeated(
+        prompt="prompt",
+        max_new_tokens=1,
+        repeat=2,
+        block_tokens=16,
+        use_chat_template=False,
+        target_model_ref="target",
+        draft_model_ref=None,
+        no_eos=True,
+        cooldown=60,
+    )
+
+    assert events == [
+        "baseline",
+        "sleep:60",
+        "load_dflash",
+        "dflash",
+        "sleep:60",
+        "baseline",
+        "sleep:60",
+        "load_dflash",
+        "dflash",
+    ]
+
+
+def test_benchmark_rejects_tokenizer_drift_between_baseline_and_dflash(monkeypatch):
+    target, _tokenizer, target_meta = _patch_benchmark_target(monkeypatch)
+
+    class _DriftTokenizer(_BenchmarkTokenizer):
+        def encode(self, prompt):
+            return [1, 2, 3, 4]
+
+    monkeypatch.setattr(
+        benchmark,
+        "load_runtime_bundle",
+        lambda **_kwargs: SimpleNamespace(
+            target_model=target,
+            tokenizer=_DriftTokenizer(),
+            target_meta=target_meta,
+            draft_model=_BindableBenchmarkDraft(),
+            draft_meta={"resolved_model_ref": "auto-draft"},
+            draft_backend=object(),
+            target_ops=object(),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="Tokenizer drift"):
+        benchmark.benchmark_once(
+            prompt="prompt",
+            max_new_tokens=1,
+            block_tokens=16,
+            use_chat_template=False,
+            target_model_ref="target",
+            draft_model_ref=None,
+            no_eos=True,
+        )
+
+
 def test_benchmark_records_draft_load_dtype_in_config(monkeypatch):
     target, tokenizer, target_meta = _patch_benchmark_target(monkeypatch)
     monkeypatch.setattr(
@@ -1432,6 +1597,7 @@ def test_benchmark_preserves_dflash_phase_timings_in_artifact_entry(monkeypatch)
     )
 
     run = _run_one_fake_benchmark()
+    run["dflash"]["adaptive_metrics"] = {"cycles_by_block": {"4": 1}}
     assert "generated_token_ids" not in run["dflash"]
     assert run["dflash"]["prefill_us"] == 100_000.0
 
@@ -1449,6 +1615,7 @@ def test_benchmark_preserves_dflash_phase_timings_in_artifact_entry(monkeypatch)
         "prefill": 100_000.0,
         "verify": 50_000.0,
     }
+    assert entry["dflash"]["adaptive_metrics"] == {"cycles_by_block": {"4": 1}}
 
 
 def test_benchmark_explicit_draft_wins_over_registry(monkeypatch):

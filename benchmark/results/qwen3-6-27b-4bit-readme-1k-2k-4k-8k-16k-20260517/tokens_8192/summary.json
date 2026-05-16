@@ -1,0 +1,928 @@
+{
+  "config": {
+    "benchmark_mode": "smoke",
+    "block_tokens": 16,
+    "cache_limit": "auto",
+    "cooldown": 120,
+    "ctx_tokens": 0,
+    "draft": "z-lab/Qwen3.6-27B-DFlash",
+    "draft_load_dtype": null,
+    "draft_load_dtype_source": null,
+    "draft_quant": "w4",
+    "draft_sink_size": 64,
+    "draft_window_size": 1024,
+    "git_hash": "e962ea7",
+    "hf_dataset_config": null,
+    "hf_dataset_name": null,
+    "hf_dataset_split": null,
+    "hf_shuffle_seed": null,
+    "include_memory": true,
+    "limit": 1,
+    "max_tokens": 8192,
+    "metal_limits": {
+      "cache_applied": true,
+      "cache_bytes": 13915697152,
+      "cache_request": "auto",
+      "metal_available": true,
+      "recommended_bytes": 55662788608,
+      "warning": null,
+      "wired_applied": true,
+      "wired_bytes": 55662788608,
+      "wired_request": "auto"
+    },
+    "model": "mlx-community/Qwen3.6-27B-4bit",
+    "no_eos": true,
+    "no_memory": false,
+    "only_dflash": false,
+    "prefill_step_size": 2048,
+    "prompt": "The function $f$ satisfies the functional equation \\[ f(x) + f(y) = f(x + y) - xy - 1 \\] for all real numbers $x$ and $y$. If $f(1) = 1$, then find all integers $n$ such that $f(n) = n$. Enter all such integers, separated by commas. Please reason step by step, and put your final answer within \\boxed{}.",
+    "prompt_count": 1,
+    "prompt_file": null,
+    "prompt_id": "smoke-default",
+    "prompt_ids": [
+      "smoke-default"
+    ],
+    "prompt_source": "smoke",
+    "prompt_suite": "smoke",
+    "prompt_tokenization_mode": "chat_template",
+    "prompt_tokens": 102,
+    "repeat": 3,
+    "seed": 0,
+    "selected_row_indices": [
+      null
+    ],
+    "shuffle": false,
+    "suite": "smoke",
+    "target_fa_window": 0,
+    "use_chat_template": true,
+    "verify_len_cap": 0,
+    "verify_mode": "adaptive",
+    "wired_limit": "auto"
+  },
+  "hardware": {
+    "chip": "Apple M5 Max",
+    "dflash_mlx_version": "0.1.6",
+    "memory_gb": "64",
+    "mlx_lm_version": "0.31.3",
+    "mlx_version": "0.31.2",
+    "python": "3.13.5"
+  },
+  "invocation": {
+    "argv": [
+      "dflash benchmark",
+      "--model",
+      "mlx-community/Qwen3.6-27B-4bit",
+      "--max-tokens",
+      "8192",
+      "--repeat",
+      "3",
+      "--cooldown",
+      "120",
+      "--no-eos",
+      "--out",
+      "benchmark/results/qwen3-6-27b-4bit-readme-1k-2k-4k-8k-16k-20260517/tokens_8192"
+    ],
+    "command": "dflash benchmark --model mlx-community/Qwen3.6-27B-4bit --max-tokens 8192 --repeat 3 --cooldown 120 --no-eos --out benchmark/results/qwen3-6-27b-4bit-readme-1k-2k-4k-8k-16k-20260517/tokens_8192",
+    "effective": {
+      "block_tokens": 16,
+      "cache_limit": "auto",
+      "cooldown": 120,
+      "ctx_tokens": 0,
+      "draft": "z-lab/Qwen3.6-27B-DFlash",
+      "draft_quant": "w4",
+      "draft_sink_size": 64,
+      "draft_window_size": 1024,
+      "include_memory": true,
+      "limit": 1,
+      "max_tokens": 8192,
+      "model": "mlx-community/Qwen3.6-27B-4bit",
+      "no_eos": true,
+      "no_memory": false,
+      "only_dflash": false,
+      "out": "benchmark/results/qwen3-6-27b-4bit-readme-1k-2k-4k-8k-16k-20260517/tokens_8192",
+      "prefill_step_size": 2048,
+      "prompt": null,
+      "prompt_file": null,
+      "repeat": 3,
+      "seed": 0,
+      "shuffle": false,
+      "suite": "smoke",
+      "target_fa_window": 0,
+      "use_chat_template": true,
+      "verify_len_cap": 0,
+      "verify_mode": "adaptive",
+      "wired_limit": "auto"
+    },
+    "explicit_flags": {
+      "cooldown": 120,
+      "max_tokens": 8192,
+      "model": "mlx-community/Qwen3.6-27B-4bit",
+      "no_eos": true,
+      "out": "benchmark/results/qwen3-6-27b-4bit-readme-1k-2k-4k-8k-16k-20260517/tokens_8192",
+      "repeat": 3
+    },
+    "output_dir": "benchmark/results/qwen3-6-27b-4bit-readme-1k-2k-4k-8k-16k-20260517/tokens_8192",
+    "output_path": "benchmark/results/qwen3-6-27b-4bit-readme-1k-2k-4k-8k-16k-20260517/tokens_8192",
+    "primary_metric": "post_prefill_generation_tps",
+    "protocol_order": [
+      "baseline",
+      "dflash"
+    ],
+    "same_prompt_token_ids": true
+  },
+  "prompts": [
+    {
+      "config": {
+        "block_tokens": 16,
+        "cooldown": 120,
+        "draft": "z-lab/Qwen3.6-27B-DFlash",
+        "draft_load_dtype": null,
+        "draft_load_dtype_source": null,
+        "draft_quant": "w4",
+        "draft_sink_size": 64,
+        "draft_window_size": 1024,
+        "git_hash": "e962ea7",
+        "max_tokens": 8192,
+        "model": "mlx-community/Qwen3.6-27B-4bit",
+        "no_eos": true,
+        "only_dflash": false,
+        "prefill_step_size": 2048,
+        "prompt": "The function $f$ satisfies the functional equation \\[ f(x) + f(y) = f(x + y) - xy - 1 \\] for all real numbers $x$ and $y$. If $f(1) = 1$, then find all integers $n$ such that $f(n) = n$. Enter all such integers, separated by commas. Please reason step by step, and put your final answer within \\boxed{}.",
+        "prompt_id": "smoke-default",
+        "prompt_suite": "smoke",
+        "prompt_tokens": 102,
+        "repeat": 3,
+        "target_fa_window": 0,
+        "use_chat_template": true,
+        "verify_len_cap": 0,
+        "verify_mode": "adaptive"
+      },
+      "hardware": {
+        "chip": "Apple M5 Max",
+        "dflash_mlx_version": "0.1.6",
+        "memory_gb": "64",
+        "mlx_lm_version": "0.31.3",
+        "mlx_version": "0.31.2",
+        "python": "3.13.5"
+      },
+      "runs": [
+        {
+          "baseline": {
+            "generation_tps": 25.079626529022836,
+            "memory_end": {
+              "mlx_active_gb": 15.134293649,
+              "mlx_cache_gb": 1.29384547,
+              "mlx_peak_gb": 15.978854809,
+              "phys_footprint_gb": 16.927043416,
+              "rss_gb": 15.631826944,
+              "untracked_gb": 0.0
+            },
+            "peak_memory_gb": 15.978854809,
+            "prefill_tok_s": 154.9992773905484,
+            "prefill_tok_s_apparent": 154.9992773905484,
+            "prefill_tok_s_physical": 154.9992773905484,
+            "prefill_tokens_physical": 102,
+            "ttft_ms": 658.0675840377808
+          },
+          "dflash": {
+            "acceptance_first_20_avg": 5.05,
+            "acceptance_last_20_avg": 2.05,
+            "acceptance_ratio": 0.83447265625,
+            "accepted_from_draft": 6836,
+            "adaptive_metrics": {
+              "acceptance_by_block": {
+                "1": 0.0,
+                "16": 0.5519088319088319,
+                "4": 0.8627705627705627
+              },
+              "cycles_by_block": {
+                "1": 1,
+                "16": 585,
+                "4": 770
+              },
+              "cycles_by_mode": {
+                "full": 449,
+                "probe": 136,
+                "reduced": 771
+              },
+              "early_probe_cycles": 4,
+              "early_probe_full_acceptance": 0.75,
+              "early_probe_min_cycles": 16,
+              "early_probe_window": 8,
+              "full_accept_rate_by_block": {
+                "1": 0.0,
+                "16": 0.26495726495726496,
+                "4": 0.7766233766233767
+              },
+              "full_accepts_by_block": {
+                "16": 155,
+                "4": 598
+              },
+              "probe_cycles": 8,
+              "reduced_burst_cycles": 64,
+              "resume_speed_ratio": 1.0,
+              "tokens_per_cycle_by_block": {
+                "1": 1.0,
+                "16": 9.27863247863248,
+                "4": 3.588311688311688
+              },
+              "tokens_per_cycle_by_mode": {
+                "full": 9.443207126948774,
+                "probe": 8.735294117647058,
+                "reduced": 3.5849546044098575
+              },
+              "tokens_per_second_by_block": {
+                "1": 0.0000016830114690463696,
+                "16": 0.000015617613814200337,
+                "4": 0.000006039612932410891
+              },
+              "tokens_per_second_by_mode": {
+                "full": 0.000015894712015798562,
+                "probe": 0.000014702804372619289,
+                "reduced": 0.000006033961932704389
+              }
+            },
+            "cycles": 1356,
+            "generation_tps": 79.39302151637374,
+            "logical_ctx_tokens": 102,
+            "memory_end": {
+              "mlx_active_gb": 16.1085459,
+              "mlx_cache_gb": 0.001304988,
+              "mlx_peak_gb": 17.18838053,
+              "phys_footprint_gb": 20.245393624,
+              "rss_gb": 15.8216192,
+              "untracked_gb": 0.0
+            },
+            "peak_memory_gb": 17.18838053,
+            "phase_timings_us": {
+              "commit": 715567.41,
+              "draft": 1494874.791,
+              "draft_incremental": 1485787.333,
+              "draft_prefill": 9087.458,
+              "prefill": 211803.375,
+              "replay": 323798.364,
+              "verify": 6201698.742
+            },
+            "prefill_tok_s_apparent": 481.5787283842857,
+            "prefill_tok_s_physical": 481.5787283842857,
+            "prefill_tokens_computed": 102,
+            "prefill_tokens_physical": 102,
+            "prefill_tokens_restored": 0,
+            "tokens_per_cycle": 6.041297935103245,
+            "ttft_ms": 223.19695800000002
+          },
+          "run": 1,
+          "speedup": 3.1656381096623565,
+          "thermal_pressure": "unknown"
+        },
+        {
+          "baseline": {
+            "generation_tps": 26.44620136395599,
+            "memory_end": {
+              "mlx_active_gb": 15.135714889,
+              "mlx_cache_gb": 1.29382295,
+              "mlx_peak_gb": 15.980044621,
+              "phys_footprint_gb": 17.111593128,
+              "rss_gb": 15.856943104,
+              "untracked_gb": 0.0
+            },
+            "peak_memory_gb": 15.980044621,
+            "prefill_tok_s": 137.62584289013455,
+            "prefill_tok_s_apparent": 137.62584289013455,
+            "prefill_tok_s_physical": 137.62584289013455,
+            "prefill_tokens_physical": 102,
+            "ttft_ms": 741.1398750264198
+          },
+          "dflash": {
+            "acceptance_first_20_avg": 5.05,
+            "acceptance_last_20_avg": 2.05,
+            "acceptance_ratio": 0.83447265625,
+            "accepted_from_draft": 6836,
+            "adaptive_metrics": {
+              "acceptance_by_block": {
+                "1": 0.0,
+                "16": 0.5519088319088319,
+                "4": 0.8627705627705627
+              },
+              "cycles_by_block": {
+                "1": 1,
+                "16": 585,
+                "4": 770
+              },
+              "cycles_by_mode": {
+                "full": 449,
+                "probe": 136,
+                "reduced": 771
+              },
+              "early_probe_cycles": 4,
+              "early_probe_full_acceptance": 0.75,
+              "early_probe_min_cycles": 16,
+              "early_probe_window": 8,
+              "full_accept_rate_by_block": {
+                "1": 0.0,
+                "16": 0.26495726495726496,
+                "4": 0.7766233766233767
+              },
+              "full_accepts_by_block": {
+                "16": 155,
+                "4": 598
+              },
+              "probe_cycles": 8,
+              "reduced_burst_cycles": 64,
+              "resume_speed_ratio": 1.0,
+              "tokens_per_cycle_by_block": {
+                "1": 1.0,
+                "16": 9.27863247863248,
+                "4": 3.588311688311688
+              },
+              "tokens_per_cycle_by_mode": {
+                "full": 9.443207126948774,
+                "probe": 8.735294117647058,
+                "reduced": 3.5849546044098575
+              },
+              "tokens_per_second_by_block": {
+                "1": 0.0000016811447825864391,
+                "16": 0.000015600333320761176,
+                "4": 0.000006032927859963165
+              },
+              "tokens_per_second_by_mode": {
+                "full": 0.000015877126283618457,
+                "probe": 0.000014686531929065205,
+                "reduced": 0.000006027283097466874
+              }
+            },
+            "cycles": 1356,
+            "generation_tps": 77.70416911109123,
+            "logical_ctx_tokens": 102,
+            "memory_end": {
+              "mlx_active_gb": 16.110151368,
+              "mlx_cache_gb": 0.001304988,
+              "mlx_peak_gb": 17.189822158,
+              "phys_footprint_gb": 20.433711416,
+              "rss_gb": 15.990145024,
+              "untracked_gb": 0.0
+            },
+            "peak_memory_gb": 17.189822158,
+            "phase_timings_us": {
+              "commit": 716673.619,
+              "draft": 1547610.288,
+              "draft_incremental": 1544909.663,
+              "draft_prefill": 2700.625,
+              "prefill": 212814.208,
+              "replay": 334727.694,
+              "verify": 6488415.185
+            },
+            "prefill_tok_s_apparent": 479.29130746759165,
+            "prefill_tok_s_physical": 479.29130746759165,
+            "prefill_tokens_computed": 102,
+            "prefill_tokens_physical": 102,
+            "prefill_tokens_restored": 0,
+            "tokens_per_cycle": 6.041297935103245,
+            "ttft_ms": 214.256333
+          },
+          "run": 2,
+          "speedup": 2.938197741207388,
+          "thermal_pressure": "unknown"
+        },
+        {
+          "baseline": {
+            "generation_tps": 26.031923836052545,
+            "memory_end": {
+              "mlx_active_gb": 15.137328997,
+              "mlx_cache_gb": 1.293827038,
+              "mlx_peak_gb": 15.981658729,
+              "phys_footprint_gb": 17.335218488,
+              "rss_gb": 16.016326656,
+              "untracked_gb": 0.0
+            },
+            "peak_memory_gb": 15.981658729,
+            "prefill_tok_s": 139.92015856567198,
+            "prefill_tok_s_apparent": 139.92015856567198,
+            "prefill_tok_s_physical": 139.92015856567198,
+            "prefill_tokens_physical": 102,
+            "ttft_ms": 728.9871670072898
+          },
+          "dflash": {
+            "acceptance_first_20_avg": 5.05,
+            "acceptance_last_20_avg": 2.05,
+            "acceptance_ratio": 0.83447265625,
+            "accepted_from_draft": 6836,
+            "adaptive_metrics": {
+              "acceptance_by_block": {
+                "1": 0.0,
+                "16": 0.5519088319088319,
+                "4": 0.8627705627705627
+              },
+              "cycles_by_block": {
+                "1": 1,
+                "16": 585,
+                "4": 770
+              },
+              "cycles_by_mode": {
+                "full": 449,
+                "probe": 136,
+                "reduced": 771
+              },
+              "early_probe_cycles": 4,
+              "early_probe_full_acceptance": 0.75,
+              "early_probe_min_cycles": 16,
+              "early_probe_window": 8,
+              "full_accept_rate_by_block": {
+                "1": 0.0,
+                "16": 0.26495726495726496,
+                "4": 0.7766233766233767
+              },
+              "full_accepts_by_block": {
+                "16": 155,
+                "4": 598
+              },
+              "probe_cycles": 8,
+              "reduced_burst_cycles": 64,
+              "resume_speed_ratio": 1.0,
+              "tokens_per_cycle_by_block": {
+                "1": 1.0,
+                "16": 9.27863247863248,
+                "4": 3.588311688311688
+              },
+              "tokens_per_cycle_by_mode": {
+                "full": 9.443207126948774,
+                "probe": 8.735294117647058,
+                "reduced": 3.5849546044098575
+              },
+              "tokens_per_second_by_block": {
+                "1": 0.000001679273928538676,
+                "16": 0.000015582943822391147,
+                "4": 0.000006026204936771837
+              },
+              "tokens_per_second_by_mode": {
+                "full": 0.000015859427260406825,
+                "probe": 0.00001467016404838537,
+                "reduced": 0.000006020566476570753
+              }
+            },
+            "cycles": 1356,
+            "generation_tps": 79.11540937240152,
+            "logical_ctx_tokens": 102,
+            "memory_end": {
+              "mlx_active_gb": 16.111757468,
+              "mlx_cache_gb": 0.001304988,
+              "mlx_peak_gb": 17.189262166,
+              "phys_footprint_gb": 20.590096816,
+              "rss_gb": 15.9649792,
+              "untracked_gb": 0.0
+            },
+            "peak_memory_gb": 17.189262166,
+            "phase_timings_us": {
+              "commit": 712020.403,
+              "draft": 1499894.167,
+              "draft_incremental": 1497080.501,
+              "draft_prefill": 2813.666,
+              "prefill": 208783.959,
+              "replay": 328352.542,
+              "verify": 6409280.259
+            },
+            "prefill_tok_s_apparent": 488.54327932348485,
+            "prefill_tok_s_physical": 488.54327932348485,
+            "prefill_tokens_computed": 102,
+            "prefill_tokens_physical": 102,
+            "prefill_tokens_restored": 0,
+            "tokens_per_cycle": 6.041297935103245,
+            "ttft_ms": 210.18141699999998
+          },
+          "run": 3,
+          "speedup": 3.0391687479828806,
+          "thermal_pressure": "unknown"
+        }
+      ],
+      "summary": {
+        "acceptance_ratio_median": 0.83447265625,
+        "baseline_correct": null,
+        "baseline_memory_end_mlx_cache_gb_median": 1.293827038,
+        "baseline_memory_end_phys_footprint_gb_median": 17.111593128,
+        "baseline_peak_memory_gb_median": 15.980044621,
+        "baseline_prefill_tok_s_median": 139.92015856567198,
+        "baseline_score": null,
+        "baseline_tps_median": 26.031923836052545,
+        "dflash_correct": null,
+        "dflash_memory_end_mlx_cache_gb_median": 0.001304988,
+        "dflash_memory_end_phys_footprint_gb_median": 20.433711416,
+        "dflash_peak_memory_gb_median": 17.189262166,
+        "dflash_prefill_tok_s_apparent_median": 481.5787283842857,
+        "dflash_prefill_tok_s_physical_median": 481.5787283842857,
+        "dflash_score": null,
+        "dflash_tps_max": 79.39302151637374,
+        "dflash_tps_median": 79.11540937240152,
+        "dflash_tps_min": 77.70416911109123,
+        "score_count": null,
+        "speedup_median": 3.0391687479828806
+      }
+    }
+  ],
+  "runs": [
+    {
+      "baseline": {
+        "generation_tps": 25.079626529022836,
+        "memory_end": {
+          "mlx_active_gb": 15.134293649,
+          "mlx_cache_gb": 1.29384547,
+          "mlx_peak_gb": 15.978854809,
+          "phys_footprint_gb": 16.927043416,
+          "rss_gb": 15.631826944,
+          "untracked_gb": 0.0
+        },
+        "peak_memory_gb": 15.978854809,
+        "prefill_tok_s": 154.9992773905484,
+        "prefill_tok_s_apparent": 154.9992773905484,
+        "prefill_tok_s_physical": 154.9992773905484,
+        "prefill_tokens_physical": 102,
+        "ttft_ms": 658.0675840377808
+      },
+      "block_tokens": 16,
+      "dflash": {
+        "acceptance_first_20_avg": 5.05,
+        "acceptance_last_20_avg": 2.05,
+        "acceptance_ratio": 0.83447265625,
+        "accepted_from_draft": 6836,
+        "adaptive_metrics": {
+          "acceptance_by_block": {
+            "1": 0.0,
+            "16": 0.5519088319088319,
+            "4": 0.8627705627705627
+          },
+          "cycles_by_block": {
+            "1": 1,
+            "16": 585,
+            "4": 770
+          },
+          "cycles_by_mode": {
+            "full": 449,
+            "probe": 136,
+            "reduced": 771
+          },
+          "early_probe_cycles": 4,
+          "early_probe_full_acceptance": 0.75,
+          "early_probe_min_cycles": 16,
+          "early_probe_window": 8,
+          "full_accept_rate_by_block": {
+            "1": 0.0,
+            "16": 0.26495726495726496,
+            "4": 0.7766233766233767
+          },
+          "full_accepts_by_block": {
+            "16": 155,
+            "4": 598
+          },
+          "probe_cycles": 8,
+          "reduced_burst_cycles": 64,
+          "resume_speed_ratio": 1.0,
+          "tokens_per_cycle_by_block": {
+            "1": 1.0,
+            "16": 9.27863247863248,
+            "4": 3.588311688311688
+          },
+          "tokens_per_cycle_by_mode": {
+            "full": 9.443207126948774,
+            "probe": 8.735294117647058,
+            "reduced": 3.5849546044098575
+          },
+          "tokens_per_second_by_block": {
+            "1": 0.0000016830114690463696,
+            "16": 0.000015617613814200337,
+            "4": 0.000006039612932410891
+          },
+          "tokens_per_second_by_mode": {
+            "full": 0.000015894712015798562,
+            "probe": 0.000014702804372619289,
+            "reduced": 0.000006033961932704389
+          }
+        },
+        "cycles": 1356,
+        "generation_tps": 79.39302151637374,
+        "logical_ctx_tokens": 102,
+        "memory_end": {
+          "mlx_active_gb": 16.1085459,
+          "mlx_cache_gb": 0.001304988,
+          "mlx_peak_gb": 17.18838053,
+          "phys_footprint_gb": 20.245393624,
+          "rss_gb": 15.8216192,
+          "untracked_gb": 0.0
+        },
+        "peak_memory_gb": 17.18838053,
+        "phase_timings_us": {
+          "commit": 715567.41,
+          "draft": 1494874.791,
+          "draft_incremental": 1485787.333,
+          "draft_prefill": 9087.458,
+          "prefill": 211803.375,
+          "replay": 323798.364,
+          "verify": 6201698.742
+        },
+        "prefill_tok_s_apparent": 481.5787283842857,
+        "prefill_tok_s_physical": 481.5787283842857,
+        "prefill_tokens_computed": 102,
+        "prefill_tokens_physical": 102,
+        "prefill_tokens_restored": 0,
+        "tokens_per_cycle": 6.041297935103245,
+        "ttft_ms": 223.19695800000002
+      },
+      "draft": "z-lab/Qwen3.6-27B-DFlash",
+      "draft_quant": "w4",
+      "draft_sink_size": 64,
+      "draft_window_size": 1024,
+      "git_hash": "e962ea7",
+      "max_tokens": 8192,
+      "model": "mlx-community/Qwen3.6-27B-4bit",
+      "only_dflash": false,
+      "prompt_id": "smoke-default",
+      "prompt_suite": "smoke",
+      "prompt_tokenization_mode": "chat_template",
+      "run": 1,
+      "speedup": 3.1656381096623565,
+      "suite": "smoke",
+      "target_fa_window": 0,
+      "thermal_pressure": "unknown",
+      "use_chat_template": true,
+      "verify_len_cap": 0,
+      "verify_mode": "adaptive"
+    },
+    {
+      "baseline": {
+        "generation_tps": 26.44620136395599,
+        "memory_end": {
+          "mlx_active_gb": 15.135714889,
+          "mlx_cache_gb": 1.29382295,
+          "mlx_peak_gb": 15.980044621,
+          "phys_footprint_gb": 17.111593128,
+          "rss_gb": 15.856943104,
+          "untracked_gb": 0.0
+        },
+        "peak_memory_gb": 15.980044621,
+        "prefill_tok_s": 137.62584289013455,
+        "prefill_tok_s_apparent": 137.62584289013455,
+        "prefill_tok_s_physical": 137.62584289013455,
+        "prefill_tokens_physical": 102,
+        "ttft_ms": 741.1398750264198
+      },
+      "block_tokens": 16,
+      "dflash": {
+        "acceptance_first_20_avg": 5.05,
+        "acceptance_last_20_avg": 2.05,
+        "acceptance_ratio": 0.83447265625,
+        "accepted_from_draft": 6836,
+        "adaptive_metrics": {
+          "acceptance_by_block": {
+            "1": 0.0,
+            "16": 0.5519088319088319,
+            "4": 0.8627705627705627
+          },
+          "cycles_by_block": {
+            "1": 1,
+            "16": 585,
+            "4": 770
+          },
+          "cycles_by_mode": {
+            "full": 449,
+            "probe": 136,
+            "reduced": 771
+          },
+          "early_probe_cycles": 4,
+          "early_probe_full_acceptance": 0.75,
+          "early_probe_min_cycles": 16,
+          "early_probe_window": 8,
+          "full_accept_rate_by_block": {
+            "1": 0.0,
+            "16": 0.26495726495726496,
+            "4": 0.7766233766233767
+          },
+          "full_accepts_by_block": {
+            "16": 155,
+            "4": 598
+          },
+          "probe_cycles": 8,
+          "reduced_burst_cycles": 64,
+          "resume_speed_ratio": 1.0,
+          "tokens_per_cycle_by_block": {
+            "1": 1.0,
+            "16": 9.27863247863248,
+            "4": 3.588311688311688
+          },
+          "tokens_per_cycle_by_mode": {
+            "full": 9.443207126948774,
+            "probe": 8.735294117647058,
+            "reduced": 3.5849546044098575
+          },
+          "tokens_per_second_by_block": {
+            "1": 0.0000016811447825864391,
+            "16": 0.000015600333320761176,
+            "4": 0.000006032927859963165
+          },
+          "tokens_per_second_by_mode": {
+            "full": 0.000015877126283618457,
+            "probe": 0.000014686531929065205,
+            "reduced": 0.000006027283097466874
+          }
+        },
+        "cycles": 1356,
+        "generation_tps": 77.70416911109123,
+        "logical_ctx_tokens": 102,
+        "memory_end": {
+          "mlx_active_gb": 16.110151368,
+          "mlx_cache_gb": 0.001304988,
+          "mlx_peak_gb": 17.189822158,
+          "phys_footprint_gb": 20.433711416,
+          "rss_gb": 15.990145024,
+          "untracked_gb": 0.0
+        },
+        "peak_memory_gb": 17.189822158,
+        "phase_timings_us": {
+          "commit": 716673.619,
+          "draft": 1547610.288,
+          "draft_incremental": 1544909.663,
+          "draft_prefill": 2700.625,
+          "prefill": 212814.208,
+          "replay": 334727.694,
+          "verify": 6488415.185
+        },
+        "prefill_tok_s_apparent": 479.29130746759165,
+        "prefill_tok_s_physical": 479.29130746759165,
+        "prefill_tokens_computed": 102,
+        "prefill_tokens_physical": 102,
+        "prefill_tokens_restored": 0,
+        "tokens_per_cycle": 6.041297935103245,
+        "ttft_ms": 214.256333
+      },
+      "draft": "z-lab/Qwen3.6-27B-DFlash",
+      "draft_quant": "w4",
+      "draft_sink_size": 64,
+      "draft_window_size": 1024,
+      "git_hash": "e962ea7",
+      "max_tokens": 8192,
+      "model": "mlx-community/Qwen3.6-27B-4bit",
+      "only_dflash": false,
+      "prompt_id": "smoke-default",
+      "prompt_suite": "smoke",
+      "prompt_tokenization_mode": "chat_template",
+      "run": 2,
+      "speedup": 2.938197741207388,
+      "suite": "smoke",
+      "target_fa_window": 0,
+      "thermal_pressure": "unknown",
+      "use_chat_template": true,
+      "verify_len_cap": 0,
+      "verify_mode": "adaptive"
+    },
+    {
+      "baseline": {
+        "generation_tps": 26.031923836052545,
+        "memory_end": {
+          "mlx_active_gb": 15.137328997,
+          "mlx_cache_gb": 1.293827038,
+          "mlx_peak_gb": 15.981658729,
+          "phys_footprint_gb": 17.335218488,
+          "rss_gb": 16.016326656,
+          "untracked_gb": 0.0
+        },
+        "peak_memory_gb": 15.981658729,
+        "prefill_tok_s": 139.92015856567198,
+        "prefill_tok_s_apparent": 139.92015856567198,
+        "prefill_tok_s_physical": 139.92015856567198,
+        "prefill_tokens_physical": 102,
+        "ttft_ms": 728.9871670072898
+      },
+      "block_tokens": 16,
+      "dflash": {
+        "acceptance_first_20_avg": 5.05,
+        "acceptance_last_20_avg": 2.05,
+        "acceptance_ratio": 0.83447265625,
+        "accepted_from_draft": 6836,
+        "adaptive_metrics": {
+          "acceptance_by_block": {
+            "1": 0.0,
+            "16": 0.5519088319088319,
+            "4": 0.8627705627705627
+          },
+          "cycles_by_block": {
+            "1": 1,
+            "16": 585,
+            "4": 770
+          },
+          "cycles_by_mode": {
+            "full": 449,
+            "probe": 136,
+            "reduced": 771
+          },
+          "early_probe_cycles": 4,
+          "early_probe_full_acceptance": 0.75,
+          "early_probe_min_cycles": 16,
+          "early_probe_window": 8,
+          "full_accept_rate_by_block": {
+            "1": 0.0,
+            "16": 0.26495726495726496,
+            "4": 0.7766233766233767
+          },
+          "full_accepts_by_block": {
+            "16": 155,
+            "4": 598
+          },
+          "probe_cycles": 8,
+          "reduced_burst_cycles": 64,
+          "resume_speed_ratio": 1.0,
+          "tokens_per_cycle_by_block": {
+            "1": 1.0,
+            "16": 9.27863247863248,
+            "4": 3.588311688311688
+          },
+          "tokens_per_cycle_by_mode": {
+            "full": 9.443207126948774,
+            "probe": 8.735294117647058,
+            "reduced": 3.5849546044098575
+          },
+          "tokens_per_second_by_block": {
+            "1": 0.000001679273928538676,
+            "16": 0.000015582943822391147,
+            "4": 0.000006026204936771837
+          },
+          "tokens_per_second_by_mode": {
+            "full": 0.000015859427260406825,
+            "probe": 0.00001467016404838537,
+            "reduced": 0.000006020566476570753
+          }
+        },
+        "cycles": 1356,
+        "generation_tps": 79.11540937240152,
+        "logical_ctx_tokens": 102,
+        "memory_end": {
+          "mlx_active_gb": 16.111757468,
+          "mlx_cache_gb": 0.001304988,
+          "mlx_peak_gb": 17.189262166,
+          "phys_footprint_gb": 20.590096816,
+          "rss_gb": 15.9649792,
+          "untracked_gb": 0.0
+        },
+        "peak_memory_gb": 17.189262166,
+        "phase_timings_us": {
+          "commit": 712020.403,
+          "draft": 1499894.167,
+          "draft_incremental": 1497080.501,
+          "draft_prefill": 2813.666,
+          "prefill": 208783.959,
+          "replay": 328352.542,
+          "verify": 6409280.259
+        },
+        "prefill_tok_s_apparent": 488.54327932348485,
+        "prefill_tok_s_physical": 488.54327932348485,
+        "prefill_tokens_computed": 102,
+        "prefill_tokens_physical": 102,
+        "prefill_tokens_restored": 0,
+        "tokens_per_cycle": 6.041297935103245,
+        "ttft_ms": 210.18141699999998
+      },
+      "draft": "z-lab/Qwen3.6-27B-DFlash",
+      "draft_quant": "w4",
+      "draft_sink_size": 64,
+      "draft_window_size": 1024,
+      "git_hash": "e962ea7",
+      "max_tokens": 8192,
+      "model": "mlx-community/Qwen3.6-27B-4bit",
+      "only_dflash": false,
+      "prompt_id": "smoke-default",
+      "prompt_suite": "smoke",
+      "prompt_tokenization_mode": "chat_template",
+      "run": 3,
+      "speedup": 3.0391687479828806,
+      "suite": "smoke",
+      "target_fa_window": 0,
+      "thermal_pressure": "unknown",
+      "use_chat_template": true,
+      "verify_len_cap": 0,
+      "verify_mode": "adaptive"
+    }
+  ],
+  "summary": {
+    "acceptance_ratio_median": 0.83447265625,
+    "baseline_correct": null,
+    "baseline_memory_end_mlx_cache_gb_median": 1.293827038,
+    "baseline_memory_end_phys_footprint_gb_median": 17.111593128,
+    "baseline_peak_memory_gb_median": 15.980044621,
+    "baseline_prefill_tok_s_median": 139.92015856567198,
+    "baseline_score": null,
+    "baseline_tps_median": 26.031923836052545,
+    "baseline_ttft_ms_median": 728.9871670072898,
+    "dflash_correct": null,
+    "dflash_memory_end_mlx_cache_gb_median": 0.001304988,
+    "dflash_memory_end_phys_footprint_gb_median": 20.433711416,
+    "dflash_peak_memory_gb_median": 17.189262166,
+    "dflash_prefill_tok_s_apparent_median": 481.5787283842857,
+    "dflash_prefill_tok_s_physical_median": 481.5787283842857,
+    "dflash_score": null,
+    "dflash_tps_median": 79.11540937240152,
+    "dflash_ttft_ms_median": 214.256333,
+    "prefill_tps_baseline": 139.92015856567198,
+    "prefill_tps_dflash": 481.5787283842857,
+    "prefix_cache_stats": null,
+    "prefix_saved_tokens": null,
+    "prompt_tok_avg": 102.0,
+    "score_count": null,
+    "speedup_median": 3.0391687479828806
+  }
+}
