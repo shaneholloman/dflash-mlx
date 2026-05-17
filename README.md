@@ -50,6 +50,11 @@ Apple M5 Max, 64 GB unified memory, MLX 0.31.1. Protocol: stock `mlx_lm.stream_g
 | Qwen3.5-27B-4bit | 2048 | 33.10 tok/s | 70.21 tok/s | 2.12x | 89.60% |
 | Qwen3.5-27B-4bit | 4096 | 31.47 tok/s | 55.68 tok/s | 1.77x | 88.38% |
 | Qwen3.5-27B-4bit | 8192 | 33.88 tok/s | 45.29 tok/s | 1.34x | 85.97% |
+| Qwen3.6-27B-4bit | 1024 | 33.26 tok/s | 98.05 tok/s | 2.95x | 84.67% |
+| Qwen3.6-27B-4bit | 2048 | 32.34 tok/s | 90.67 tok/s | 2.81x | 84.62% |
+| Qwen3.6-27B-4bit | 4096 | 30.58 tok/s | 93.55 tok/s | 3.06x | 87.04% |
+| Qwen3.6-27B-4bit | 8192 | 26.03 tok/s | 79.12 tok/s | 3.04x | 83.45% |
+| Qwen3.6-27B-4bit | 16384 | 21.50 tok/s | 60.77 tok/s | 2.78x | 84.40% |
 | Qwen3.5-35B-A3B-4bit | 1024 | 143.03 tok/s | 248.85 tok/s | 1.76x | 89.26% |
 | Qwen3.5-35B-A3B-4bit | 2048 | 141.43 tok/s | 255.01 tok/s | 1.81x | 89.75% |
 | Qwen3.5-35B-A3B-4bit | 4096 | 141.49 tok/s | 216.47 tok/s | 1.53x | 88.50% |
